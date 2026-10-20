@@ -269,7 +269,8 @@ if [ -f "$NODE_HOME/config/seed-peer" ]; then
   as_node "sed -i -E 's/^persistent_peers = .*/persistent_peers = \"$peer\"/' '$C'"
 fi
 # Public: EVM JSON-RPC 8545 (read + send signed txs) and P2P 26656.
-# Local only: CometBFT RPC 26657, REST 1317, gRPC 9090 (defaults).
+# Local only: CometBFT RPC 26657, REST 1317, gRPC 9090 (defaults). Cosmos
+# wallets (Keplr, Leap, Cosmostation) reach RPC and REST through Caddy (https).
 as_node "python3 - '$A' <<'PY'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
@@ -292,7 +293,12 @@ limits = {
 }
 for k, v in limits.items():
     new = re.sub(r'(?m)^' + re.escape(k) + r' = .*', k + ' = ' + v, new)
-open(p, 'w').write(s.replace(sec, new))
+s = s.replace(sec, new)
+api = re.search(r'(?ms)^\[api\].*?(?=^\[|\Z)', s).group(0)
+new = re.sub(r'(?m)^enable = .*', 'enable = true', api)
+new = re.sub(r'(?m)^address = .*', 'address = \"tcp://127.0.0.1:1317\"', new)
+new = re.sub(r'(?m)^enabled-unsafe-cors = .*', 'enabled-unsafe-cors = false', new)  # Caddy adds CORS
+open(p, 'w').write(s.replace(api, new))
 PY"
 
 step "7/8 service"
@@ -353,9 +359,48 @@ host="${ip//./-}.sslip.io"
 pub=/var/lib/zetaphy-public
 mkdir -p $pub && install -m 644 "$NODE_HOME/config/genesis.json" $pub/ && install -m 644 "$0" $pub/setup-node.sh
 echo "$(z comet show-node-id --home "$NODE_HOME")@$ip:26656" > $pub/peer
+# Wallet settings for this node, for one-click "add network" buttons.
+jq -n --arg h "https://$host" --arg c "$CHAIN_ID" --arg d "$DENOM" '
+  {denom: $d, cur: {coinDenom: "ZETAPHY", coinMinimalDenom: $d, coinDecimals: 18}} as $x |
+  {chainId: $c, chainName: "ZETAPHY Testnet", rpc: ($h + "/rpc"), rest: ($h + "/rest"), bip44: {coinType: 60},
+   bech32Config: {bech32PrefixAccAddr: "zetaphy", bech32PrefixAccPub: "zetaphypub", bech32PrefixValAddr: "zetaphyvaloper",
+     bech32PrefixValPub: "zetaphyvaloperpub", bech32PrefixConsAddr: "zetaphyvalcons", bech32PrefixConsPub: "zetaphyvalconspub"},
+   currencies: [$x.cur], stakeCurrency: $x.cur,
+   feeCurrencies: [$x.cur + {gasPriceStep: {low: 1000000000, average: 2000000000, high: 4000000000}}],
+   features: ["eth-address-gen", "eth-key-sign"], evm: {chainId: '"$EVM_CHAIN_ID"', rpc: $h}}' > $pub/keplr.json
+jq -n --arg h "https://$host" --arg id "$(printf '0x%x' "$EVM_CHAIN_ID")" \
+  '{chainId: $id, chainName: "ZETAPHY Testnet", nativeCurrency: {name: "ZETAPHY", symbol: "ZETAPHY", decimals: 18}, rpcUrls: [$h]}' > $pub/evm-chain.json
+chmod 644 $pub/keplr.json $pub/evm-chain.json
 if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]]; then
-  { apt-get install -y caddy >/dev/null && printf '%s {\n\thandle_path /zetaphy/* {\n\t\troot * %s\n\t\tfile_server\n\t}\n\thandle {\n\t\treverse_proxy 127.0.0.1:8545\n\t}\n}\n' "$host" $pub > /etc/caddy/Caddyfile \
-    && systemctl restart caddy; } || echo "https setup failed; the RPC still works over http"
+  # https://$host/        EVM JSON-RPC (MetaMask and other EVM wallets)
+  # https://$host/rpc/    CometBFT RPC   } Keplr, Leap, Cosmostation
+  # https://$host/rest/   Cosmos REST    }
+  # https://$host/zetaphy/  files: genesis, peer, setup script, wallet configs
+  { apt-get install -y caddy >/dev/null && cat > /etc/caddy/Caddyfile <<CADDY
+$host {
+	header ?Access-Control-Allow-Origin *
+	header ?Access-Control-Allow-Headers "Content-Type"
+	header ?Access-Control-Allow-Methods "GET, POST, OPTIONS"
+	route {
+		@preflight method OPTIONS
+		respond @preflight 204
+		@heavy path /rpc/dump_consensus_state* /rpc/unsafe* /rpc/genesis*
+		respond @heavy 403
+		handle_path /zetaphy/* {
+			root * $pub
+			file_server
+		}
+		handle_path /rest/* {
+			reverse_proxy 127.0.0.1:1317
+		}
+		handle_path /rpc/* {
+			reverse_proxy 127.0.0.1:26657
+		}
+		reverse_proxy 127.0.0.1:8545
+	}
+}
+CADDY
+    systemctl restart caddy; } || echo "https setup failed; the RPC still works over http"
 fi
 # A joined node asks the faucet of the node it joined for 10 ZETAPHY.
 if [ -n "$JOIN" ]; then
@@ -370,6 +415,8 @@ ZETAPHY testnet node is starting.
   Chain ID (EVM):      $EVM_CHAIN_ID
   MetaMask RPC URL:    http://$ip:8545
   HTTPS RPC (wallet):  https://$host  (needs ports 80 and 443 open)
+  Keplr / Leap:        RPC https://$host/rpc  REST https://$host/rest
+                       (chain settings: https://$host/zetaphy/keplr.json)
   Others join with:    JOIN=$host in setup-node.sh, then --become-validator 9
   Currency symbol:     ZETAPHY
   Genesis keys:        $KEYS_DIR (testnet only; MNEMONICS-KEEP-SECRET.txt)
