@@ -839,7 +839,7 @@ index 0000000..62d63ad
 +	return pk.UnmarshalBinary(bytes.Clone(m.Key)) == nil
 +}
 diff --git a/evmd/app.go b/evmd/app.go
-index 204345c..7496dcb 100644
+index 204345c..5996614 100644
 --- a/evmd/app.go
 +++ b/evmd/app.go
 @@ -36,6 +36,10 @@ import (
@@ -976,6 +976,19 @@ index 204345c..7496dcb 100644
  }
  
  // EndBlocker application updates every end block
+@@ -869,6 +909,12 @@ func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci
+ 		panic(err)
+ 	}
+ 
++	if raw, ok := genesisState[pqStoreKey]; ok { // ZETAPHY: quantum locks and vote keys
++		if err := app.pqInitGenesis(ctx, raw); err != nil {
++			panic(err)
++		}
++		delete(genesisState, pqStoreKey)
++	}
+ 	return app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState)
+ }
+ 
 diff --git a/evmd/cmd/evmd/cmd/root.go b/evmd/cmd/evmd/cmd/root.go
 index 4da3349..4731e81 100644
 --- a/evmd/cmd/evmd/cmd/root.go
@@ -988,6 +1001,20 @@ index 4da3349..4731e81 100644
  	)
  
  	cmd.PersistentFlags().String(flags.FlagChainID, "", "The network chain ID")
+diff --git a/evmd/export.go b/evmd/export.go
+index 9fdd8ef..e6ff55d 100644
+--- a/evmd/export.go
++++ b/evmd/export.go
+@@ -36,6 +36,9 @@ func (app *EVMD) ExportAppStateAndValidators(forZeroHeight bool, jailAllowedAddr
+ 		return servertypes.ExportedApp{}, err
+ 	}
+ 
++	if genState[pqStoreKey], err = app.pqExportGenesis(ctx); err != nil { // ZETAPHY
++		return servertypes.ExportedApp{}, err
++	}
+ 	appState, err := json.MarshalIndent(genState, "", "  ")
+ 	if err != nil {
+ 		return servertypes.ExportedApp{}, err
 diff --git a/evmd/go.mod b/evmd/go.mod
 index e503386..dc04366 100644
 --- a/evmd/go.mod
@@ -1064,10 +1091,10 @@ index 0000000..96d0ea8
 +}
 diff --git a/evmd/zetaphy_pqcall.go b/evmd/zetaphy_pqcall.go
 new file mode 100644
-index 0000000..131c042
+index 0000000..123fcb7
 --- /dev/null
 +++ b/evmd/zetaphy_pqcall.go
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,321 @@
 +package evmd
 +
 +// ZETAPHY post-quantum messages (zetaphy/pq/v1/tx.proto, built in code below):
@@ -1104,6 +1131,7 @@ index 0000000..131c042
 +
 +	msgv1 "cosmossdk.io/api/cosmos/msg/v1"
 +	errorsmod "cosmossdk.io/errors"
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 +
 +	sdk "github.com/cosmos/cosmos-sdk/types"
 +	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
@@ -1137,10 +1165,11 @@ index 0000000..131c042
 +type MsgQuantumLock struct{ Signer, Owner, Controller string }
 +
 +type MsgPQVoteKey struct {
-+	Operator  string
-+	PubKey    []byte
-+	Proof     []byte
-+	OldKeySig []byte
++	Operator       string
++	PubKey         []byte
++	Proof          []byte
++	OldKeySig      []byte
++	ValidatorOwner string
 +}
 +
 +type MsgPQResponse struct{}
@@ -1214,7 +1243,7 @@ index 0000000..131c042
 +	{"MsgEVMCall", "sender", "sender:S to:S value:S data:B gas_limit:U as_owner:S"},
 +	{"MsgEVMCallResponse", "", "ret:B gas_used:U created:S"},
 +	{"MsgQuantumLock", "signer", "signer:S owner:S controller:S"},
-+	{"MsgPQVoteKey", "operator", "operator:S pub_key:B proof:B old_key_sig:B"},
++	{"MsgPQVoteKey", "operator", "operator:S pub_key:B proof:B old_key_sig:B validator_owner:S"},
 +	{"MsgPQResponse", "", ""},
 +}
 +
@@ -1353,9 +1382,15 @@ index 0000000..131c042
 +	if err != nil {
 +		return nil, err
 +	}
++	// A creation uses the current sequence and consumes it (the EVM bumps the
++	// nonce), so each creation, in any tx, gets a fresh nonce.
 +	sender := common.BytesToAddress(from)
-+	stateDB := statedb.New(ctx, app.EVMKeeper, statedb.NewEmptyTxConfig())
-+	res, err := app.EVMKeeper.ApplyMessage(ctx, stateDB, core.Message{
++	// As in an EVM tx: storage is priced by EVM gas, and the EVM's gas is
++	// charged to the tx's meter once, below.
++	evmCtx := ctx.WithGasMeter(storetypes.NewInfiniteGasMeter()).
++		WithKVGasConfig(storetypes.GasConfig{}).WithTransientKVGasConfig(storetypes.GasConfig{})
++	stateDB := statedb.New(evmCtx, app.EVMKeeper, statedb.NewEmptyTxConfig())
++	res, err := app.EVMKeeper.ApplyMessage(evmCtx, stateDB, core.Message{
 +		From: sender, To: to, Nonce: nonce, Value: value, GasLimit: gas, Data: m.Data,
 +		GasPrice: new(big.Int), GasFeeCap: new(big.Int), GasTipCap: new(big.Int), AccessList: ethtypes.AccessList{},
 +	}, nil, true, false, false) // not internal: normal refund cap and minimum gas, like an EVM tx
@@ -1369,15 +1404,6 @@ index 0000000..131c042
 +	out := &MsgEVMCallResponse{Ret: res.Ret, GasUsed: res.GasUsed}
 +	if to == nil {
 +		out.Created = crypto.CreateAddress(sender, nonce).Hex()
-+		// The create bumped the EVM nonce, which is the account sequence the
-+		// ante handler already bumped for this tx: undo the second bump.
-+		if m.AsOwner == "" {
-+			acc := app.AccountKeeper.GetAccount(ctx, from)
-+			if err := acc.SetSequence(nonce); err != nil {
-+				return nil, err
-+			}
-+			app.AccountKeeper.SetAccount(ctx, acc)
-+		}
 +	}
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_evm_call", sdk.NewAttribute("from", sender.Hex()),
 +		sdk.NewAttribute("to", m.To), sdk.NewAttribute("created", out.Created), sdk.NewAttribute("value", value.String())))
@@ -1392,10 +1418,10 @@ index 0000000..131c042
 +}
 diff --git a/evmd/zetaphy_pqguard.go b/evmd/zetaphy_pqguard.go
 new file mode 100644
-index 0000000..10fc455
+index 0000000..7308c5b
 --- /dev/null
 +++ b/evmd/zetaphy_pqguard.go
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,400 @@
 +package evmd
 +
 +// ZETAPHY post-quantum guards.
@@ -1439,10 +1465,10 @@ index 0000000..10fc455
 +	"github.com/cosmos/cosmos-sdk/client/tx"
 +	sdk "github.com/cosmos/cosmos-sdk/types"
 +	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
 +	"github.com/cosmos/cosmos-sdk/x/authz"
 +
 +	"github.com/cosmos/evm/crypto/mldsa44"
-+	evmkeeper "github.com/cosmos/evm/x/vm/keeper"
 +	evmtypes "github.com/cosmos/evm/x/vm/types"
 +)
 +
@@ -1471,6 +1497,11 @@ index 0000000..10fc455
 +	ctrl, err := pqAddr(m.Controller)
 +	if err != nil {
 +		return nil, err
++	}
++	if acc := app.AccountKeeper.GetAccount(ctx, owner); acc != nil {
++		if _, ok := acc.GetPubKey().(*mldsa44.PubKey); ok {
++			return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "an ML-DSA-44 account is post-quantum already and cannot be locked")
++		}
 +	}
 +	if cur := app.pqController(ctx, owner); cur == nil && !owner.Equals(signer) {
 +		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only the owner can lock its account")
@@ -1501,7 +1532,7 @@ index 0000000..10fc455
 +
 +// PQLockAddress: an EVM tx (MetaMask) to this address with no value and the
 +// controller's 20-byte address as data locks the sender to that controller.
-+var PQLockAddress = evmkeeper.PQLockAddress
++var PQLockAddress = evmtypes.PQLockAddress
 +
 +type pqHooks struct{ app *EVMD }
 +
@@ -1516,46 +1547,71 @@ index 0000000..10fc455
 +	return err
 +}
 +
-+// pqLockAnte refuses any tx that a quantum-locked account signs, pays for
-+// through a fee grant, authorizes through authz, or delegates code for
-+// (EIP-7702). Signatures that contracts check go through ecrecover, which
-+// refuses locked accounts too (x/vm/keeper/zetaphy_ecrecover.go).
++// pqLockAnte refuses any tx that a quantum-locked account signs (the fee
++// payer included), pays for through a fee grant, authorizes through authz,
++// or delegates code for (EIP-7702). It runs after the normal ante handler has
++// validated the tx; a refusal discards that handler's changes. Signatures
++// that contracts check go through ecrecover, which refuses locked accounts
++// too (x/vm/keeper/zetaphy_ecrecover.go).
 +func (app *EVMD) pqLockAnte(next sdk.AnteHandler) sdk.AnteHandler {
 +	return func(ctx sdk.Context, tx sdk.Tx, sim bool) (sdk.Context, error) {
-+		var signers [][]byte
-+		if ft, ok := tx.(sdk.FeeTx); ok && ft.FeeGranter() != nil {
-+			signers = append(signers, ft.FeeGranter())
++		newCtx, err := next(ctx, tx, sim)
++		if err != nil {
++			return newCtx, err
 +		}
-+		msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
-+		for i := 0; i < len(msgs); i++ {
-+			if ex, ok := msgs[i].(*authz.MsgExec); ok {
-+				inner, err := ex.GetMessages()
-+				if err != nil {
-+					return ctx, err
-+				}
-+				msgs = append(msgs, inner...)
++		signers, err := app.pqTxSigners(tx)
++		if err != nil {
++			return newCtx, err
++		}
++		for _, s := range signers {
++			if app.pqController(ctx, s) != nil {
++				return newCtx, errorsmod.Wrapf(errortypes.ErrUnauthorized, "%s is quantum-locked: only its ML-DSA-44 controller can act for it", sdk.AccAddress(s))
 +			}
-+			// EIP-7702: an authorization signed by a locked key, carried in someone else's tx.
-+			if et, ok := msgs[i].(*evmtypes.MsgEthereumTx); ok {
-+				for _, auth := range et.AsTransaction().SetCodeAuthorizations() {
++		}
++		return newCtx, nil
++	}
++}
++
++func (app *EVMD) pqTxSigners(tx sdk.Tx) (signers [][]byte, err error) {
++	defer func() {
++		if r := recover(); r != nil {
++			err = errorsmod.Wrapf(errortypes.ErrTxDecode, "malformed tx: %v", r)
++		}
++	}()
++	if st, ok := tx.(authsigning.SigVerifiableTx); ok { // the fee payer is one of these
++		if signers, err = st.GetSigners(); err != nil {
++			return nil, err
++		}
++	}
++	if ft, ok := tx.(sdk.FeeTx); ok && ft.FeeGranter() != nil {
++		signers = append(signers, ft.FeeGranter())
++	}
++	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
++	for i := 0; i < len(msgs); i++ {
++		if ex, ok := msgs[i].(*authz.MsgExec); ok {
++			inner, err := ex.GetMessages()
++			if err != nil {
++				return nil, err
++			}
++			msgs = append(msgs, inner...)
++		}
++		// EIP-7702: an authorization signed by a locked key, carried in someone else's tx.
++		if et, ok := msgs[i].(*evmtypes.MsgEthereumTx); ok {
++			if t := et.AsTransaction(); t != nil {
++				for _, auth := range t.SetCodeAuthorizations() {
 +					if a, err := auth.Authority(); err == nil {
 +						signers = append(signers, a.Bytes())
 +					}
 +				}
 +			}
-+			s, _, err := app.appCodec.GetMsgV1Signers(msgs[i])
-+			if err != nil {
-+				return ctx, err
-+			}
-+			signers = append(signers, s...)
 +		}
-+		for _, s := range signers {
-+			if app.pqController(ctx, s) != nil {
-+				return ctx, errorsmod.Wrapf(errortypes.ErrUnauthorized, "%s is quantum-locked: only its ML-DSA-44 controller can act for it", sdk.AccAddress(s))
-+			}
++		s, _, err := app.appCodec.GetMsgV1Signers(msgs[i])
++		if err != nil {
++			return nil, err
 +		}
-+		return next(ctx, tx, sim)
++		signers = append(signers, s...)
 +	}
++	return signers, nil
 +}
 +
 +func pqVoteMsg(chainID string, height int64, hash []byte) []byte {
@@ -1571,6 +1627,16 @@ index 0000000..10fc455
 +	if err != nil {
 +		return nil, err
 +	}
++	if m.ValidatorOwner != "" { // the operator account is quantum-locked to the signer
++		owner, err := pqAddr(m.ValidatorOwner)
++		if err != nil {
++			return nil, err
++		}
++		if !bytes.Equal(app.pqController(ctx, owner), op) {
++			return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "validator_owner: the signer does not control this account")
++		}
++		op = owner
++	}
 +	val, err := app.StakingKeeper.GetValidator(ctx, sdk.ValAddress(op))
 +	if err != nil {
 +		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "the signer does not operate a validator")
@@ -1584,8 +1650,9 @@ index 0000000..10fc455
 +		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "proof: not signed by the new key")
 +	}
 +	st := ctx.KVStore(app.GetKey(pqStoreKey))
-+	if old := st.Get(pqVoteKeyOf(cons)); old != nil && !(&mldsa44.PubKey{Key: old}).VerifySignature(msg, m.OldKeySig) {
-+		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "replacing a vote key needs a signature by the current one")
++	// A jailed validator (e.g. down because its key was lost) may start over.
++	if old := st.Get(pqVoteKeyOf(cons)); old != nil && !val.IsJailed() && !(&mldsa44.PubKey{Key: old}).VerifySignature(msg, m.OldKeySig) {
++		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "replacing a vote key needs a signature by the current one (or the validator jailed)")
 +	}
 +	st.Set(pqVoteKeyOf(cons), m.PubKey)
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_pq_vote_key", sdk.NewAttribute("validator", sdk.ValAddress(op).String())))
@@ -1627,8 +1694,10 @@ index 0000000..10fc455
 +// setPQVoteHandlers signs this node's precommits and checks everyone else's.
 +// The node signs with config/pq_vote_key.seed or, while a replacement is
 +// being registered, config/pq_vote_key.seed.old: whichever the chain has.
-+// With neither it stops instead of sending a vote the others would reject
-+// (a rejected precommit can stall the chain; a missing one is just downtime).
++// With neither it stops instead of sending a vote the others would reject:
++// this node counts its own precommit (it does not check its own extension)
++// and may commit a block the others cannot, which stalls them for good (seen
++// on a devnet); a node that is down is ordinary downtime.
 +func (app *EVMD) setPQVoteHandlers(home string) {
 +	seedFile := filepath.Join(home, "config", pqVoteSeedFn)
 +	app.SetExtendVoteHandler(func(ctx sdk.Context, req *abci.RequestExtendVote) (*abci.ResponseExtendVote, error) {
@@ -1652,7 +1721,7 @@ index 0000000..10fc455
 +		return nil, nil
 +	})
 +	app.SetVerifyVoteExtensionHandler(func(ctx sdk.Context, req *abci.RequestVerifyVoteExtension) (*abci.ResponseVerifyVoteExtension, error) {
-+		ok := true
++		ok := len(req.VoteExtension) == 0 || len(req.VoteExtension) == circl.SignatureSize
 +		if pk := ctx.KVStore(app.GetKey(pqStoreKey)).Get(pqVoteKeyOf(req.ValidatorAddress)); pk != nil {
 +			ok = (&mldsa44.PubKey{Key: pk}).VerifySignature(pqVoteMsg(ctx.ChainID(), req.Height, req.Hash), req.VoteExtension)
 +		}
@@ -1718,6 +1787,40 @@ index 0000000..10fc455
 +	}
 +	flags.AddTxFlagsToCmd(cmd)
 +	return cmd
++}
++
++type pqGenesisEntry struct {
++	Key   string `json:"key"`
++	Value string `json:"value"`
++}
++
++// pqExportGenesis / pqInitGenesis carry the zetaphypq store (quantum locks
++// and vote keys) through a genesis export, under app_state.zetaphypq.
++func (app *EVMD) pqExportGenesis(ctx sdk.Context) (json.RawMessage, error) {
++	out := []pqGenesisEntry{}
++	it := ctx.KVStore(app.GetKey(pqStoreKey)).Iterator(nil, nil)
++	defer it.Close()
++	for ; it.Valid(); it.Next() {
++		out = append(out, pqGenesisEntry{hex.EncodeToString(it.Key()), hex.EncodeToString(it.Value())})
++	}
++	return json.Marshal(out)
++}
++
++func (app *EVMD) pqInitGenesis(ctx sdk.Context, raw json.RawMessage) error {
++	var in []pqGenesisEntry
++	if err := json.Unmarshal(raw, &in); err != nil {
++		return err
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	for _, e := range in {
++		k, err1 := hex.DecodeString(e.Key)
++		v, err2 := hex.DecodeString(e.Value)
++		if err1 != nil || err2 != nil || len(k) == 0 || (k[0] != 1 && k[0] != 2) {
++			return fmt.Errorf("zetaphypq genesis: bad entry %q", e.Key)
++		}
++		st.Set(k, v)
++	}
++	return nil
 +}
 diff --git a/evmd/zetaphy_rpc.go b/evmd/zetaphy_rpc.go
 new file mode 100644
@@ -2011,6 +2114,94 @@ index 11f8f59..bbea7b7 100644
  github.com/cloudwego/base64x v0.1.6 h1:t11wG9AECkCDk5fMSoxmufanudBtJ+/HemLstXDLI2M=
  github.com/cloudwego/base64x v0.1.6/go.mod h1:OFcloc187FXDaYHvrNIjxSe8ncn0OOM8gEHfghB2IPU=
  github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGXZJjfX53e64911xZQV5JYwmTeXPW+k8Sc=
+diff --git a/mempool/mempool.go b/mempool/mempool.go
+index 74c2f89..61f856c 100644
+--- a/mempool/mempool.go
++++ b/mempool/mempool.go
+@@ -333,6 +333,9 @@ func (m *Mempool) insert(tx sdk.Tx) (<-chan error, error) {
+ 	switch {
+ 	case err == nil:
+ 		ethTx := ethMsg.AsTransaction()
++		if ethTx == nil {
++			return nil, errors.New("empty ethereum transaction")
++		}
+ 
+ 		// Reject txs below base fee up-front, which can never be included.
+ 		if baseFee := m.blockchain.CurrentBlock().BaseFee; baseFee != nil && ethTx.GasFeeCapIntCmp(baseFee) < 0 {
+@@ -341,6 +344,9 @@ func (m *Mempool) insert(tx sdk.Tx) (<-chan error, error) {
+ 				ethTx.GasFeeCap(), baseFee,
+ 			)
+ 		}
++		if err := m.pqLockCheck(ethTx); err != nil { // ZETAPHY
++			return nil, err
++		}
+ 
+ 		// we push the tx onto the evm insert queue so the tx will be inserted
+ 		// at a later point. We get back a subscription that the insert queue
+diff --git a/mempool/recheck_pool.go b/mempool/recheck_pool.go
+index 5a38319..508ebac 100644
+--- a/mempool/recheck_pool.go
++++ b/mempool/recheck_pool.go
+@@ -176,6 +176,13 @@ func (m *RecheckMempool) Close() error {
+ // Insert adds a transaction to the pool after running the ante handler.
+ // This is the main entry point for new cosmos transactions.
+ func (m *RecheckMempool) Insert(_ context.Context, tx sdk.Tx) (err error) {
++	// ZETAPHY: this runs outside baseapp's panic recovery; a malformed tx must
++	// be an error, not a crash of the node.
++	defer func() {
++		if r := recover(); r != nil {
++			err = fmt.Errorf("invalid transaction: %v", r)
++		}
++	}()
+ 	// Reserve addresses to prevent conflicts with EVM pool
+ 	addrs, err := m.reserveTx(tx)
+ 	if err != nil {
+@@ -183,6 +190,9 @@ func (m *RecheckMempool) Insert(_ context.Context, tx sdk.Tx) (err error) {
+ 	}
+ 
+ 	defer func() {
++		if r := recover(); r != nil {
++			err = fmt.Errorf("invalid transaction: %v", r)
++		}
+ 		if err == nil {
+ 			return
+ 		}
+diff --git a/mempool/zetaphy_lock.go b/mempool/zetaphy_lock.go
+new file mode 100644
+index 0000000..4e016ba
+--- /dev/null
++++ b/mempool/zetaphy_lock.go
+@@ -0,0 +1,30 @@
++package mempool
++
++import (
++	"fmt"
++
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++
++	evmtypes "github.com/cosmos/evm/x/vm/types"
++)
++
++// pqLockCheck (ZETAPHY) refuses, at submission, an EVM tx sent by a
++// quantum-locked account or carrying its EIP-7702 authorization, so the
++// wallet gets an error instead of a tx that stays pending. The ante handler
++// refuses them as well.
++func (m *Mempool) pqLockCheck(tx *ethtypes.Transaction) error {
++	st, err := m.blockchain.StateAt(m.blockchain.CurrentBlock().Hash())
++	if err != nil || st == nil {
++		return nil
++	}
++	from, err := ethtypes.Sender(ethtypes.LatestSignerForChainID(tx.ChainId()), tx)
++	if err == nil && evmtypes.PQLocked(st.GetState, from) {
++		return fmt.Errorf("%s is quantum-locked: only its ML-DSA-44 controller can act for it", from.Hex())
++	}
++	for _, a := range tx.SetCodeAuthorizations() {
++		if au, err := a.Authority(); err == nil && evmtypes.PQLocked(st.GetState, au) {
++			return fmt.Errorf("authorization signed by %s, which is quantum-locked", au.Hex())
++		}
++	}
++	return nil
++}
 diff --git a/precompiles/mldsa/mldsa.go b/precompiles/mldsa/mldsa.go
 new file mode 100644
 index 0000000..a291984
@@ -2167,27 +2358,37 @@ index ee26a8e..bd19281 100644
  	params := k.GetParams(ctx)
  	// Get the precompile from the static precompiles
  	if precompile, found, err := k.GetStaticPrecompileInstance(&params, address); err != nil {
+diff --git a/x/vm/keeper/state_transition.go b/x/vm/keeper/state_transition.go
+index 0c160b4..b9abfd8 100644
+--- a/x/vm/keeper/state_transition.go
++++ b/x/vm/keeper/state_transition.go
+@@ -422,6 +422,7 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context, stateDB *statedb.StateD
+ 				precompiles[address] = precompile
+ 			}
+ 		}
++		precompiles[ecrecoverAddress] = pqEcrecover{} // ZETAPHY
+ 		if err := overrides.Apply(stateDB, precompiles); err != nil {
+ 			return nil, errorsmod.Wrap(err, "failed to apply state override")
+ 		}
 diff --git a/x/vm/keeper/zetaphy_ecrecover.go b/x/vm/keeper/zetaphy_ecrecover.go
 new file mode 100644
-index 0000000..04743d3
+index 0000000..f078923
 --- /dev/null
 +++ b/x/vm/keeper/zetaphy_ecrecover.go
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,31 @@
 +package keeper
 +
 +import (
 +	"github.com/ethereum/go-ethereum/common"
 +	"github.com/ethereum/go-ethereum/core/vm"
++
++	"github.com/cosmos/evm/x/vm/types"
 +)
 +
 +// ZETAPHY: an ECDSA account handed to an ML-DSA-44 controller (quantum lock,
-+// evmd/zetaphy_pqguard.go) is marked in the storage of PQLockAddress (key =
-+// the account, value = its controller). Contracts check ECDSA signatures with
++// evmd/zetaphy_pqguard.go) is marked in the storage of types.PQLockAddress. Contracts check ECDSA signatures with
 +// ecrecover (0x01), so permits, Permit2 and meta-transactions signed by a
 +// locked account are treated as invalid signatures: ecrecover returns nothing.
-+
-+// PQLockAddress has no code; only the quantum lock writes its storage.
-+var PQLockAddress = common.HexToAddress("0x0000000000000000000000000000000000005051")
 +
 +var (
 +	ecrecoverAddress = common.BytesToAddress([]byte{1})
@@ -2201,7 +2402,7 @@ index 0000000..04743d3
 +func (pqEcrecover) Name() string                    { return gethEcrecover.Name() }
 +func (pqEcrecover) Run(evm *vm.EVM, c *vm.Contract, ro bool) ([]byte, error) {
 +	out, err := gethEcrecover.Run(evm, c, ro)
-+	if err == nil && len(out) == 32 && evm.StateDB.GetState(PQLockAddress, common.BytesToHash(out)) != (common.Hash{}) {
++	if err == nil && len(out) == 32 && types.PQLocked(evm.StateDB.GetState, common.BytesToAddress(out)) {
 +		return nil, nil
 +	}
 +	return out, err
@@ -2225,4 +2426,23 @@ index a7e058a..e64b909 100644
  	ICS02PrecompileAddress,
 +	MLDSAPrecompileAddress, // 0x…0900, last: the list must stay sorted
  }
+diff --git a/x/vm/types/zetaphy.go b/x/vm/types/zetaphy.go
+new file mode 100644
+index 0000000..8f5ded9
+--- /dev/null
++++ b/x/vm/types/zetaphy.go
+@@ -0,0 +1,13 @@
++package types
++
++import "github.com/ethereum/go-ethereum/common"
++
++// PQLockAddress (ZETAPHY): an EVM tx to it, with the controller's address as
++// data, quantum-locks the sender; its storage marks locked accounts (key =
++// account, value = controller). It has no code, so only the lock writes there.
++var PQLockAddress = common.HexToAddress("0x0000000000000000000000000000000000005051")
++
++// PQLocked reports whether a StateDB marks the account as quantum-locked.
++func PQLocked(get func(common.Address, common.Hash) common.Hash, account common.Address) bool {
++	return get(PQLockAddress, common.BytesToHash(account.Bytes())) != (common.Hash{})
++}
 ZETAPHY_PQ_PATCH
