@@ -373,7 +373,7 @@ jq -n --arg h "https://$host" --arg c "$CHAIN_ID" --arg d "$DENOM" '
    feeCurrencies: [$x.cur + {gasPriceStep: {low: 1000000000, average: 2000000000, high: 4000000000}}],
    features: ["eth-address-gen", "eth-key-sign", "eth-secp256k1-cosmos", "force-enable-evm-ledger"], isTestnet: true, evm: {chainId: '"$EVM_CHAIN_ID"', rpc: $h}}' > $pub/keplr.json
 jq -n --arg h "https://$host" --arg id "$(printf '0x%x' "$EVM_CHAIN_ID")" \
-  '{chainId: $id, chainName: "ZETAPHY Testnet", nativeCurrency: {name: "ZETAPHY", symbol: "ZPHY", decimals: 18}, rpcUrls: [$h]}' > $pub/evm-chain.json
+  '{chainId: $id, chainName: "ZETAPHY Testnet", nativeCurrency: {name: "ZETAPHY", symbol: "ZTPHY", decimals: 18}, rpcUrls: [$h]}' > $pub/evm-chain.json
 chmod 644 $pub/keplr.json $pub/evm-chain.json
 if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]]; then
   # https://$host/        EVM JSON-RPC (MetaMask and other EVM wallets)
