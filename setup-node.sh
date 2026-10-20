@@ -18,7 +18,7 @@ JOIN="${JOIN:-}"
 set -euo pipefail
 
 # ---- Fixed parameters (decided 19 Oct 2026) --------------------------------
-CHAIN_ID="zetaphy-testnet-1"
+CHAIN_ID="zetaphy_77390-1"
 EVM_CHAIN_ID=77390                 # free in ethereum-lists/chains as of 19 Oct 2026
 DENOM="azetaphy"                   # 1 ZETAPHY = 10^18 azetaphy
 MONIKER="${MONIKER:-zetaphy-validator-0}"
@@ -211,6 +211,10 @@ elif [ ! -f "$NODE_HOME/config/genesis.json" ]; then
   jqg '.app_state.evm.params.active_static_precompiles=["0x0000000000000000000000000000000000000100","0x0000000000000000000000000000000000000400","0x0000000000000000000000000000000000000800","0x0000000000000000000000000000000000000801","0x0000000000000000000000000000000000000802","0x0000000000000000000000000000000000000803","0x0000000000000000000000000000000000000804","0x0000000000000000000000000000000000000805","0x0000000000000000000000000000000000000806","0x0000000000000000000000000000000000000807","0x0000000000000000000000000000000000000900"]'
   jqg ".app_state.erc20.native_precompiles=[\"0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE\"] | .app_state.erc20.token_pairs=[{contract_owner:1,erc20_address:\"0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE\",denom:\"$DENOM\",enabled:true}]"
   jqg '.consensus.params.block.max_gas="30000000" | .consensus.params.abci.vote_extensions_enable_height="1"'
+  # Price a signature in simulate the same as the real check (eth_secp256k1
+  # costs 21000). With the SDK default of 1000, wallets that simulate before
+  # the account has a public key (Keplr) under-estimate gas by ~20000.
+  jqg '.app_state.auth.params.sig_verify_cost_secp256k1="21000"'
   # Testnet: short votes so upgrade proposals can be tried quickly.
   jqg '.app_state.gov.params.voting_period="600s" | .app_state.gov.params.expedited_voting_period="300s" | .app_state.gov.params.max_deposit_period="600s"'
 
@@ -367,9 +371,9 @@ jq -n --arg h "https://$host" --arg c "$CHAIN_ID" --arg d "$DENOM" '
      bech32PrefixValPub: "zetaphyvaloperpub", bech32PrefixConsAddr: "zetaphyvalcons", bech32PrefixConsPub: "zetaphyvalconspub"},
    currencies: [$x.cur], stakeCurrency: $x.cur,
    feeCurrencies: [$x.cur + {gasPriceStep: {low: 1000000000, average: 2000000000, high: 4000000000}}],
-   features: ["eth-address-gen", "eth-key-sign"], evm: {chainId: '"$EVM_CHAIN_ID"', rpc: $h}}' > $pub/keplr.json
+   features: ["eth-address-gen", "eth-key-sign", "eth-secp256k1-cosmos", "force-enable-evm-ledger"], isTestnet: true, evm: {chainId: '"$EVM_CHAIN_ID"', rpc: $h}}' > $pub/keplr.json
 jq -n --arg h "https://$host" --arg id "$(printf '0x%x' "$EVM_CHAIN_ID")" \
-  '{chainId: $id, chainName: "ZETAPHY Testnet", nativeCurrency: {name: "ZETAPHY", symbol: "ZETAPHY", decimals: 18}, rpcUrls: [$h]}' > $pub/evm-chain.json
+  '{chainId: $id, chainName: "ZETAPHY Testnet", nativeCurrency: {name: "ZETAPHY", symbol: "ZPHY", decimals: 18}, rpcUrls: [$h]}' > $pub/evm-chain.json
 chmod 644 $pub/keplr.json $pub/evm-chain.json
 if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]]; then
   # https://$host/        EVM JSON-RPC (MetaMask and other EVM wallets)
@@ -2629,6 +2633,30 @@ index 74c2f89..61f856c 100644
  
  		// we push the tx onto the evm insert queue so the tx will be inserted
  		// at a later point. We get back a subscription that the insert queue
+diff --git a/mempool/mempool_handlers.go b/mempool/mempool_handlers.go
+index 2484d04..cfc6fbb 100644
+--- a/mempool/mempool_handlers.go
++++ b/mempool/mempool_handlers.go
+@@ -11,6 +11,7 @@ import (
+ 	errorsmod "cosmossdk.io/errors"
+ 
+ 	sdk "github.com/cosmos/cosmos-sdk/types"
++	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+ )
+ 
+ const (
+@@ -77,7 +78,10 @@ func (m *Mempool) NewCheckTxHandler(txDecoder sdk.TxDecoder, timeout time.Durati
+ 
+ 		tx, err := txDecoder(req.GetTx())
+ 		if err != nil {
+-			return nil, fmt.Errorf("decoding tx: %w", err)
++			// ZETAPHY: answer with an error code. Returning a Go error makes
++			// CometBFT's AppMempool drop the request without calling the RPC
++			// callback, so broadcast_tx_sync and REST would hang forever.
++			return ErrAsCheckTxResponse(errorsmod.Wrap(sdkerrors.ErrTxDecode, err.Error())), nil
+ 		}
+ 
+ 		err = m.Insert(ctx, tx)
 diff --git a/mempool/recheck_pool.go b/mempool/recheck_pool.go
 index 5a38319..508ebac 100644
 --- a/mempool/recheck_pool.go
