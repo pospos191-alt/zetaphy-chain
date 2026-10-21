@@ -1365,10 +1365,10 @@ index 0000000..a68e4a1
 +}
 diff --git a/evmd/zetaphy_ibchold.go b/evmd/zetaphy_ibchold.go
 new file mode 100644
-index 0000000..4ec30cd
+index 0000000..20a1db1
 --- /dev/null
 +++ b/evmd/zetaphy_ibchold.go
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,516 @@
 +package evmd
 +
 +// ZETAPHY IBC large-transfer hold.
@@ -1376,20 +1376,29 @@ index 0000000..4ec30cd
 +// The top of the ICS-20 stack (above the rate limit). An inbound transfer of
 +// a denom at or over its governance threshold (MsgSetIBCHoldRule: a minimum
 +// amount, and/or a share of the denom's supply in basis points; "*" covers
-+// denoms without a rule) is not delivered at once: the packet is received
++// denoms without a rule: a share of the supply, applied only from its
++// minimum amount up, so that small transfers of a denom with little or no
++// supply here are not all held) is not delivered at once: the packet is received
 +// (so it cannot time out on the source chain) but its acknowledgement is
 +// left open, and the packet waits in the zetaphypq store for the hold delay
 +// (MsgSetIBCHold, default 6 h). Nothing is minted or unescrowed meanwhile.
 +//   - After the delay, BeginBlock delivers it through the rest of the stack
 +//     (rate limit, callbacks, ERC-20, transfer) as if it had just arrived,
 +//     and writes the acknowledgement that stack gives. Over the rate limit
-+//     at that moment, or any other failure: an error acknowledgement, and
-+//     the source chain refunds the sender.
++//     at that moment, or any other failure (a panic, or running out of the
++//     IBCHoldReleaseGas each delivery gets): an error acknowledgement, and
++//     the source chain refunds the sender. A block stops releasing after
++//     ibcReleasesPerBlock transfers or ibcReleaseBlockGas gas.
 +//   - Before that, the guardian (a governance-set account or contract, e.g.
 +//     a multisig; governance itself can too) may cancel it: an error
 +//     acknowledgement is written and the source chain refunds the sender.
 +//     The guardian can only return a transfer to where it came from; it can
 +//     never take it.
++// At most IBCHoldMaxOpen transfers wait at once, and IBCHoldMaxPerDenom of
++// one denom: a transfer over the threshold that would go beyond either is
++// refused at once (an error acknowledgement, refunded on the source chain),
++// so the waiting list and the state it takes stay bounded. Releases stay in
++// order of release time.
 +// Every hold, release and cancellation is an event; zetaphy_ibcHolds lists
 +// the waiting ones. IBC v2 (Eureka) packets cannot wait like this here: one
 +// over the threshold is refused at once (refunded on the source chain).
@@ -1406,6 +1415,7 @@ index 0000000..4ec30cd
 +	errorsmod "cosmossdk.io/errors"
 +	sdkmath "cosmossdk.io/math"
 +
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 +	sdk "github.com/cosmos/cosmos-sdk/types"
 +	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
 +	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
@@ -1425,6 +1435,24 @@ index 0000000..4ec30cd
 +	IBCHoldMinDelay     = 60
 +	IBCHoldMaxDelay     = 7 * 86400
 +	ibcReleasesPerBlock = 20
++	// ibcReleaseBlockGas: BeginBlock stops releasing once the deliveries of
++	// this block used this much gas; the rest wait for the next block.
++	ibcReleaseBlockGas = 10_000_000
++)
++
++// IBCHoldReleaseGas caps the gas of one delivery in BeginBlock (whose own
++// gas meter is infinite): a transfer whose delivery runs out (e.g. an
++// ERC-20 conversion into a contract that burns gas) gets an error
++// acknowledgement and is refunded on the source chain. A variable only so
++// the fork tests can lower it.
++var IBCHoldReleaseGas uint64 = 3_000_000
++
++// IBCHoldMaxOpen and IBCHoldMaxPerDenom bound the transfers waiting at once
++// (all denoms, and one denom as named here). Variables only so the fork
++// tests can lower them.
++var (
++	IBCHoldMaxOpen     uint64 = 2000
++	IBCHoldMaxPerDenom uint64 = 100
 +)
 +
 +// ibcHold is a held inbound transfer.
@@ -1447,7 +1475,27 @@ index 0000000..4ec30cd
 +func holdQueueKey(at int64, id uint64) []byte {
 +	return append(append([]byte{holdQueuePfx}, u64(uint64(at))...), u64(id)...) // #nosec G115 -- unix seconds
 +}
-+func holdRuleKey(denom string) []byte { return append([]byte{holdRulePfx}, denom...) }
++func holdRuleKey(denom string) []byte  { return append([]byte{holdRulePfx}, denom...) }
++func holdDenomKey(denom string) []byte { return append([]byte{holdDenomPfx}, denom...) }
++
++// ibcHoldCount adds delta (+1 or -1) to the open-hold counters of denom and
++// of all denoms (never below 0).
++func ibcHoldCount(st storetypes.KVStore, denom string, delta int) {
++	for _, k := range [][]byte{holdCountKey, holdDenomKey(denom)} {
++		n := readU64(st.Get(k))
++		switch {
++		case delta > 0:
++			n++
++		case n > 0:
++			n--
++		}
++		if n == 0 {
++			st.Delete(k)
++		} else {
++			st.Set(k, u64(n))
++		}
++	}
++}
 +
 +// ibcHoldParams: the delay in seconds and the guardian (nil: none).
 +func (app *EVMD) ibcHoldParams(ctx sdk.Context) (int64, []byte) {
@@ -1464,28 +1512,42 @@ index 0000000..4ec30cd
 +
 +// ibcHoldRule: the rule for denom (or "*"): minimum amount and supply share.
 +func (app *EVMD) ibcHoldRule(ctx sdk.Context, denom string) (sdkmath.Int, uint64, bool) {
++	min, bps, ok, _ := app.ibcHoldRuleFor(ctx, denom)
++	return min, bps, ok
++}
++
++// ibcHoldRuleFor also says whether the rule found is the "*" rule.
++func (app *EVMD) ibcHoldRuleFor(ctx sdk.Context, denom string) (sdkmath.Int, uint64, bool, bool) {
 +	st := app.secRaw(ctx)
 +	v := st.Get(holdRuleKey(denom))
++	star := false
 +	if v == nil {
-+		v = st.Get(holdRuleKey("*"))
++		v, star = st.Get(holdRuleKey("*")), true
 +	}
 +	if len(v) < 8 {
-+		return sdkmath.ZeroInt(), 0, false
++		return sdkmath.ZeroInt(), 0, false, false
 +	}
 +	min, ok := sdkmath.NewIntFromString(string(v[8:]))
 +	if !ok {
 +		min = sdkmath.ZeroInt()
 +	}
-+	return min, readU64(v), true
++	return min, readU64(v), true, star
 +}
 +
 +// ibcHoldNeeded: a transfer of amount of denom (as named here) must wait.
++// A denom's own rule: amount >= its minimum, or >= its share of the supply
++// here. The "*" rule: amount >= its share of the supply here, counted only
++// from its minimum amount up (a denom not seen here yet has supply 0, so
++// without that minimum every transfer of it would be held).
 +func (app *EVMD) ibcHoldNeeded(ctx sdk.Context, denom string, amount sdkmath.Int) bool {
-+	min, bps, ok := app.ibcHoldRule(ctx, denom)
++	min, bps, ok, star := app.ibcHoldRuleFor(ctx, denom)
 +	if !ok || !amount.IsPositive() {
 +		return false
 +	}
-+	if min.IsPositive() && amount.GTE(min) {
++	if star && amount.LT(min) {
++		return false
++	}
++	if !star && min.IsPositive() && amount.GTE(min) {
 +		return true
 +	}
 +	if bps > 0 {
@@ -1575,9 +1637,12 @@ index 0000000..4ec30cd
 +			amount, ok := sdkmath.NewIntFromString(data.Token.Amount)
 +			denom := ibcLocalDenom(data.Token.Denom, packet.SourcePort, packet.SourceChannel, packet.DestinationPort, packet.DestinationChannel)
 +			if ok && m.z.ibcHoldNeeded(ctx, denom, amount) {
-+				if err := m.z.ibcHoldStore(ctx, version, packet, relayer, denom, data); err == nil {
-+					return nil // asynchronous: acknowledged on release or cancellation
++				if err := m.z.ibcHoldStore(ctx, version, packet, relayer, denom, data); err != nil {
++					// Not held (the waiting list is full): refused, so the
++					// source chain refunds the sender.
++					return channeltypes.NewErrorAcknowledgement(err)
 +				}
++				return nil // asynchronous: acknowledged on release or cancellation
 +			}
 +		}
 +	}
@@ -1590,6 +1655,9 @@ index 0000000..4ec30cd
 +		return err
 +	}
 +	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if readU64(st.Get(holdCountKey)) >= IBCHoldMaxOpen || readU64(st.Get(holdDenomKey(denom))) >= IBCHoldMaxPerDenom {
++		return errors.New("too many large transfers are waiting on ZETAPHY: this one is refused (refunded); send it again later")
++	}
 +	id := readU64(st.Get(holdSeqKey)) + 1
 +	delay, _ := app.ibcHoldParams(ctx)
 +	h := ibcHold{ID: id, Packet: pb, Version: version, Relayer: relayer, Channel: packet.DestinationChannel, Denom: denom,
@@ -1601,6 +1669,7 @@ index 0000000..4ec30cd
 +	st.Set(holdSeqKey, u64(id))
 +	st.Set(holdKey(id), bz)
 +	st.Set(holdQueueKey(h.ReleaseAt, id), []byte{})
++	ibcHoldCount(st, denom, 1)
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold", sdk.NewAttribute("id", fmt.Sprint(id)),
 +		sdk.NewAttribute("channel", h.Channel), sdk.NewAttribute("sequence", fmt.Sprint(packet.Sequence)), sdk.NewAttribute("denom", denom),
 +		sdk.NewAttribute("amount", h.Amount), sdk.NewAttribute("sender", h.Sender), sdk.NewAttribute("receiver", h.Receiver),
@@ -1635,16 +1704,22 @@ index 0000000..4ec30cd
 +		ids = append(ids, readU64(it.Key()[9:]))
 +	}
 +	_ = it.Close()
++	var used uint64
 +	for i, id := range ids {
++		if used >= ibcReleaseBlockGas {
++			break // the rest stay queued for the next block
++		}
 +		st.Delete(keys[i])
-+		app.ibcHoldRelease(ctx, id)
++		used += app.ibcHoldRelease(ctx, id)
 +	}
 +}
 +
-+func (app *EVMD) ibcHoldRelease(ctx sdk.Context, id uint64) {
++// ibcHoldRelease delivers one held transfer and returns the gas its
++// delivery used (at most IBCHoldReleaseGas).
++func (app *EVMD) ibcHoldRelease(ctx sdk.Context, id uint64) uint64 {
 +	h, packet, err := app.ibcHoldGet(ctx, id)
 +	if err != nil {
-+		return
++		return 0
 +	}
 +	st := ctx.KVStore(app.GetKey(pqStoreKey))
 +	stuck := func(why string) {
@@ -1655,24 +1730,28 @@ index 0000000..4ec30cd
 +		ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_stuck", sdk.NewAttribute("id", fmt.Sprint(id)), sdk.NewAttribute("reason", why)))
 +	}
 +	appCtx, writeApp := ctx.CacheContext()
++	meter := storetypes.NewGasMeter(IBCHoldReleaseGas)
++	appCtx = appCtx.WithGasMeter(meter)
 +	var ack ibcexported.Acknowledgement
 +	if perr := func() (perr error) {
 +		defer func() {
 +			if r := recover(); r != nil {
-+				perr = fmt.Errorf("delivery panicked: %v", r)
++				perr = fmt.Errorf("delivery failed: %v", r)
 +			}
 +		}()
 +		ack = app.ibcHoldStack.app.OnRecvPacket(appCtx, h.Version, packet, h.Relayer)
 +		return nil
 +	}(); perr != nil {
-+		stuck(perr.Error())
-+		return
++		// Out of gas or a panic: nothing of the delivery is kept, the source
++		// chain refunds the sender (only the ABCI code is in the ack bytes).
++		ack = channeltypes.NewErrorAcknowledgement(perr)
 +	}
++	used := meter.GasConsumedToLimit()
 +	if ack != nil {
 +		ackCtx, writeAck := ctx.CacheContext()
 +		if err := app.IBCKeeper.ChannelKeeper.WriteAcknowledgement(ackCtx, packet, ack); err != nil {
 +			stuck(err.Error())
-+			return
++			return used
 +		}
 +		writeAck()
 +	}
@@ -1680,8 +1759,10 @@ index 0000000..4ec30cd
 +		writeApp()
 +	}
 +	st.Delete(holdKey(id))
++	ibcHoldCount(st, h.Denom, -1)
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_released", sdk.NewAttribute("id", fmt.Sprint(id)),
 +		sdk.NewAttribute("success", fmt.Sprint(ack == nil || ack.Success()))))
++	return used
 +}
 +
 +// ibcHoldCancel returns a held transfer to its sender (an error
@@ -1702,6 +1783,7 @@ index 0000000..4ec30cd
 +	st := ctx.KVStore(app.GetKey(pqStoreKey))
 +	st.Delete(holdKey(id))
 +	st.Delete(holdQueueKey(h.ReleaseAt, id))
++	ibcHoldCount(st, h.Denom, -1)
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_cancelled", sdk.NewAttribute("id", fmt.Sprint(id)),
 +		sdk.NewAttribute("by", sdk.AccAddress(by).String()), sdk.NewAttribute("sender", h.Sender), sdk.NewAttribute("amount", h.Amount), sdk.NewAttribute("denom", h.Denom)))
 +	return nil
@@ -1749,8 +1831,8 @@ index 0000000..4ec30cd
 +			return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "min_amount: a whole number of the denom's base unit")
 +		}
 +	}
-+	if m.SupplyBps > 10000 || (m.Denom == "*" && min.IsPositive()) {
-+		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "supply_bps: 0 to 10000; the \"*\" rule takes a supply share only")
++	if m.SupplyBps > 10000 || (m.Denom == "*" && min.IsPositive() && m.SupplyBps == 0) {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "supply_bps: 0 to 10000; the \"*\" rule takes a supply share (its min_amount is the amount from which the share applies)")
 +	}
 +	st := ctx.KVStore(app.GetKey(pqStoreKey))
 +	if min.IsZero() && m.SupplyBps == 0 {
@@ -1805,10 +1887,10 @@ index 0000000..4ec30cd
 +}
 diff --git a/evmd/zetaphy_pqcall.go b/evmd/zetaphy_pqcall.go
 new file mode 100644
-index 0000000..00b9581
+index 0000000..71f9d28
 --- /dev/null
 +++ b/evmd/zetaphy_pqcall.go
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,487 @@
 +package evmd
 +
 +// ZETAPHY post-quantum messages (zetaphy/pq/v1/tx.proto, built in code below):
@@ -2239,6 +2321,9 @@ index 0000000..00b9581
 +		to = &t
 +	}
 +	// ZETAPHY threat gate (zetaphy_threatgate.go); governance's own calls are not checked.
++	if err := threatRefused(ctx); err != nil {
++		return nil, err
++	}
 +	if to != nil && !isGovAddr(m.Sender) {
 +		if err := app.threatCheck(ctx, common.BytesToAddress(from), *to); err != nil {
 +			return nil, err
@@ -2682,10 +2767,10 @@ index 0000000..78fa31b
 +}
 diff --git a/evmd/zetaphy_pqguard.go b/evmd/zetaphy_pqguard.go
 new file mode 100644
-index 0000000..d8ceb6b
+index 0000000..b8c4648
 --- /dev/null
 +++ b/evmd/zetaphy_pqguard.go
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,488 @@
 +package evmd
 +
 +// ZETAPHY post-quantum guards.
@@ -2830,6 +2915,9 @@ index 0000000..d8ceb6b
 +type pqHooks struct{ app *EVMD }
 +
 +func (h pqHooks) PostTxProcessing(ctx sdk.Context, sender common.Address, msg core.Message, r *ethtypes.Receipt) error {
++	if err := threatRefused(ctx); err != nil {
++		return err // the threat gate refused this tx in the ante handler: revert it (the fee stays paid)
++	}
 +	if msg.To == nil || *msg.To != PQLockAddress || r.Status != ethtypes.ReceiptStatusSuccessful {
 +		return nil
 +	}
@@ -2874,7 +2962,13 @@ index 0000000..d8ceb6b
 +			}
 +		}
 +		if err := app.threatGateTx(ctx, tx); err != nil {
-+			return newCtx, err
++			if ctx.ExecMode() != sdk.ExecModeFinalize {
++				return newCtx, err // CheckTx and proposals: refused before inclusion
++			}
++			// In a block the tx stays included and pays its fee (the
++			// handler's fee and nonce changes are kept); what it would do
++			// is refused where it runs (threatRefused).
++			return newCtx.WithValue(threatRefusedKey{}, err), nil
 +		}
 +		return newCtx, nil
 +	}
@@ -4107,10 +4201,10 @@ index 0000000..161572e
 +}
 diff --git a/evmd/zetaphy_seccli.go b/evmd/zetaphy_seccli.go
 new file mode 100644
-index 0000000..e5297ea
+index 0000000..50dd8a8
 --- /dev/null
 +++ b/evmd/zetaphy_seccli.go
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,176 @@
 +package evmd
 +
 +// zetaphyd commands for the security core (gov.sh wraps the proposals):
@@ -4244,7 +4338,11 @@ index 0000000..e5297ea
 +		if min == "0" {
 +			min = ""
 +		}
-+		return &MsgSetIBCHoldRule{Authority: gov, Denom: args[1], MinAmount: min, SupplyBps: bps}, fmt.Sprintf("IBC hold rule for %s: from %s, or %d bps of supply", args[1], args[2], bps), nil
++		title := fmt.Sprintf("IBC hold rule for %s: from %s, or %d bps of supply", args[1], args[2], bps)
++		if args[1] == "*" {
++			title = fmt.Sprintf("IBC hold rule for other denoms: %d bps of supply, from %s", bps, args[2])
++		}
++		return &MsgSetIBCHoldRule{Authority: gov, Denom: args[1], MinAmount: min, SupplyBps: bps}, title, nil
 +	}
 +	return nil, "", fmt.Errorf("unknown proposal %q: qday, threat-gate, ibc-hold or ibc-hold-rule", args[0])
 +}
@@ -4439,10 +4537,10 @@ index 0000000..13386b1
 +}
 diff --git a/evmd/zetaphy_security.go b/evmd/zetaphy_security.go
 new file mode 100644
-index 0000000..7ebcdc5
+index 0000000..069022e
 --- /dev/null
 +++ b/evmd/zetaphy_security.go
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,136 @@
 +package evmd
 +
 +// ZETAPHY security core: three protocol rules, each off until governance
@@ -4494,10 +4592,12 @@ index 0000000..7ebcdc5
 +	holdSeqKey     = []byte{0x19} // next hold id (8)
 +	holdPfx        = byte(0x1A)   // || id (8) -> ibcHold (JSON)
 +	holdQueuePfx   = byte(0x1B)   // || release time (8) || id (8) -> {}
++	holdCountKey   = []byte{0x1C} // number of open holds (8)
++	holdDenomPfx   = byte(0x1D)   // || denom -> number of open holds of that denom (8)
 +)
 +
 +// secKeyKnown: prefixes of the zetaphypq store a genesis may carry.
-+func secKeyKnown(p byte) bool { return p >= 0x0F && p <= 0x1B && p != 0x14 }
++func secKeyKnown(p byte) bool { return p >= 0x0F && p <= 0x1D && p != 0x14 }
 +
 +func u64(v uint64) []byte { return binary.BigEndian.AppendUint64(nil, v) }
 +
@@ -4579,10 +4679,10 @@ index 0000000..7ebcdc5
 +}
 diff --git a/evmd/zetaphy_threatgate.go b/evmd/zetaphy_threatgate.go
 new file mode 100644
-index 0000000..38fee5b
+index 0000000..42ada54
 --- /dev/null
 +++ b/evmd/zetaphy_threatgate.go
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,251 @@
 +package evmd
 +
 +// ZETAPHY threat gate: the Neuro "vaccine" at protocol level, as consent,
@@ -4603,6 +4703,13 @@ index 0000000..38fee5b
 +// The chain adds: system addresses (below 0x10000: precompiles, the lock and
 +// security addresses) and the registry itself are never refused, so appeals
 +// and responses always go through; governance's own calls are not checked.
++//
++// A refused tx is stopped in CheckTx (and when an Ethereum tx is submitted),
++// so it does not enter the mempool. If it is refused only once in a block
++// (e.g. its consent was withdrawn or expired meanwhile), it is still
++// included and pays its fee: the ante handler keeps the fee and nonce, and
++// the refusal fails the tx where it runs (an Ethereum tx is reverted by the
++// EVM hook, with the gas it used charged; a MsgEVMCall fails in evmCall).
 +//
 +// Cost: at most one EVM static call per tx (isContractEnforced, a few
 +// storage reads), capped at threatGateGas. Any failure of that call (no
@@ -4804,6 +4911,15 @@ index 0000000..38fee5b
 +		}
 +	}
 +	return nil
++}
++
++// threatRefusedKey marks, in a block, a tx the gate refused in the ante
++// handler; threatRefused returns that refusal.
++type threatRefusedKey struct{}
++
++func threatRefused(ctx sdk.Context) error {
++	err, _ := ctx.Value(threatRefusedKey{}).(error)
++	return err
 +}
 +
 +// threatMempoolCheck: the same rule when an EVM tx is submitted, on the
@@ -5336,10 +5452,10 @@ index 6b7b956..fc7430b 100644
  
  // NewKeeper generates new evm module keeper
 diff --git a/x/vm/keeper/precompiles.go b/x/vm/keeper/precompiles.go
-index ee26a8e..3c75664 100644
+index ee26a8e..d65c670 100644
 --- a/x/vm/keeper/precompiles.go
 +++ b/x/vm/keeper/precompiles.go
-@@ -27,6 +27,15 @@ func (k *Keeper) GetPrecompileInstance(
+@@ -27,11 +27,23 @@ func (k *Keeper) GetPrecompileInstance(
  		attribute.String("address", address.Hex()),
  	))
  	defer func() { evmtrace.EndSpanErr(span, err) }()
@@ -5355,8 +5471,16 @@ index ee26a8e..3c75664 100644
  	params := k.GetParams(ctx)
  	// Get the precompile from the static precompiles
  	if precompile, found, err := k.GetStaticPrecompileInstance(&params, address); err != nil {
+ 		return nil, false, err
+ 	} else if found {
++		if address == p256Address { // ZETAPHY: P256VERIFY answers nothing from Q-day on (zetaphy_ecrecover.go)
++			precompile = pqP256{precompile}
++		}
+ 		addressMap := make(map[common.Address]vm.PrecompiledContract)
+ 		addressMap[address] = precompile
+ 		return &Precompiles{
 diff --git a/x/vm/keeper/state_transition.go b/x/vm/keeper/state_transition.go
-index 0c160b4..b165687 100644
+index 0c160b4..b6815dc 100644
 --- a/x/vm/keeper/state_transition.go
 +++ b/x/vm/keeper/state_transition.go
 @@ -60,7 +60,7 @@ func (k *Keeper) NewEVMWithOverridePrecompiles(
@@ -5368,20 +5492,23 @@ index 0c160b4..b165687 100644
  	}
  
  	ethCfg := types.GetEthChainConfig()
-@@ -422,6 +422,7 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context, stateDB *statedb.StateD
+@@ -422,6 +422,10 @@ func (k *Keeper) ApplyMessageWithConfig(ctx sdk.Context, stateDB *statedb.StateD
  				precompiles[address] = precompile
  			}
  		}
 +		precompiles[ecrecoverAddress] = pqEcrecover{} // ZETAPHY
++		if p, ok := precompiles[p256Address]; ok {
++			precompiles[p256Address] = pqP256{p} // ZETAPHY
++		}
  		if err := overrides.Apply(stateDB, precompiles); err != nil {
  			return nil, errorsmod.Wrap(err, "failed to apply state override")
  		}
 diff --git a/x/vm/keeper/zetaphy_ecrecover.go b/x/vm/keeper/zetaphy_ecrecover.go
 new file mode 100644
-index 0000000..73cdb39
+index 0000000..bc95e2e
 --- /dev/null
 +++ b/x/vm/keeper/zetaphy_ecrecover.go
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,70 @@
 +package keeper
 +
 +import (
@@ -5399,7 +5526,9 @@ index 0000000..73cdb39
 +//
 +// Security core (evmd/zetaphy_qday.go):
 +//   - from the Q-day height on, ecrecover returns nothing for every
-+//     signature: an ECDSA signature no longer proves anything;
++//     signature: an ECDSA signature no longer proves anything; the same for
++//     P256VERIFY (0x…0100, secp256r1, also ECDSA), which then answers
++//     "invalid" (empty output, as RIP-7212 does for a bad signature);
 +//   - before it, a successful recovery of an account that holds funds but
 +//     never sent a transaction marks it "exposed" (its public key is now on
 +//     chain), so it cannot use the commit–reveal migration meant for keys
@@ -5408,6 +5537,7 @@ index 0000000..73cdb39
 +
 +var (
 +	ecrecoverAddress = common.BytesToAddress([]byte{1})
++	p256Address      = common.HexToAddress(types.P256PrecompileAddress)
 +	gethEcrecover    = vm.PrecompiledContractsPrague[ecrecoverAddress]
 +)
 +
@@ -5438,6 +5568,16 @@ index 0000000..73cdb39
 +		evm.StateDB.SetState(types.PQLockAddress, types.ExposedSlot(who), common.Hash{31: 1})
 +	}
 +	return out, nil
++}
++
++// pqP256 wraps the P256VERIFY precompile: from Q-day on it answers nothing.
++type pqP256 struct{ vm.PrecompiledContract }
++
++func (p pqP256) Run(evm *vm.EVM, c *vm.Contract, ro bool) ([]byte, error) {
++	if types.QDayReached(evm.StateDB.GetState, evm.Context.BlockNumber) {
++		return nil, nil
++	}
++	return p.PrecompiledContract.Run(evm, c, ro)
 +}
 diff --git a/x/vm/keeper/zetaphy_random.go b/x/vm/keeper/zetaphy_random.go
 new file mode 100644
