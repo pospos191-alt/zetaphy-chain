@@ -14,6 +14,12 @@ OWNER_EVM_ADDRESS="${OWNER_EVM_ADDRESS:-}"
 # To JOIN a running ZETAPHY chain instead of starting one: its node's https
 # name, e.g. JOIN="1-2-3-4.sslip.io" (genesis and peer address come from it).
 JOIN="${JOIN:-}"
+# Free Google Cloud e2-micro gives only 1 GB of outgoing traffic a month.
+# LOW_EGRESS=1 keeps the node under it (fewer peers, gzip, a monthly guard
+# that pauses the public RPC near the limit). "auto" turns it on by itself on
+# a Google e2-micro; 0 turns it off. EGRESS_LIMIT_MB: where the guard stops.
+LOW_EGRESS="${LOW_EGRESS:-auto}"
+EGRESS_LIMIT_MB="${EGRESS_LIMIT_MB:-800}"
 
 set -euo pipefail
 
@@ -275,6 +281,13 @@ PY
 fi
 
 # Settings are re-applied on every run, so running the script again repairs them.
+if [ "$LOW_EGRESS" = auto ]; then
+  mt=$(curl -fsS -m 3 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/machine-type 2>/dev/null || true)
+  case "$mt" in */e2-micro) LOW_EGRESS=1 ;; *) LOW_EGRESS=0 ;; esac
+fi
+[[ "$EGRESS_LIMIT_MB" =~ ^[0-9]+$ ]] || EGRESS_LIMIT_MB=800
+[ "$LOW_EGRESS" = 1 ] && echo "low-egress mode: few peers, gzip, public RPC paused above ${EGRESS_LIMIT_MB} MB sent per month"
+
 step "6/8 node settings"
 C="$NODE_HOME/config/config.toml"; A="$NODE_HOME/config/app.toml"
 # ML-DSA-44 vote key (back it up with priv_validator_key.json).
@@ -288,6 +301,10 @@ as_node "sed -i -E 's/^evm-chain-id = .*/evm-chain-id = $EVM_CHAIN_ID/' '$A'"
 # Keep ~6 days of state, not all of it: disk stays small on free VMs.
 as_node "sed -i -E 's/^pruning = .*/pruning = \"custom\"/; s/^pruning-keep-recent = .*/pruning-keep-recent = \"100000\"/; s/^pruning-interval = .*/pruning-interval = \"10\"/' '$A'"
 [ "$mem_kb" -lt 3000000 ] && as_node "sed -i -E 's/^iavl-cache-size = .*/iavl-cache-size = 50000/' '$A'"
+if [ "$LOW_EGRESS" = 1 ]; then
+  # Few peers and a 256 KB/s ceiling per peer: other nodes still sync, slowly.
+  as_node "sed -i -E 's/^max_num_inbound_peers = .*/max_num_inbound_peers = 4/; s/^max_num_outbound_peers = .*/max_num_outbound_peers = 2/; s/^send_rate = .*/send_rate = 262144/' '$C'"
+fi
 # A joined node dials the node it joined.
 if [ -f "$NODE_HOME/config/seed-peer" ]; then
   peer=$(tr -cd 'a-f0-9@.:' < "$NODE_HOME/config/seed-peer")
@@ -296,7 +313,7 @@ fi
 # Public: EVM JSON-RPC 8545 (read + send signed txs) and P2P 26656.
 # Local only: CometBFT RPC 26657, REST 1317, gRPC 9090 (defaults). Cosmos
 # wallets (Keplr, Leap, Cosmostation) reach RPC and REST through Caddy (https).
-as_node "python3 - '$A' <<'PY'
+as_node "python3 - '$A' '$LOW_EGRESS' <<'PY'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
 sec = re.search(r'(?ms)^\[json-rpc\].*?(?=^\[|\Z)', s).group(0)
@@ -316,6 +333,8 @@ limits = {
     'batch-response-max-size': '5000000',
     'http-body-limit': '1048576',             # 1 MB requests
 }
+if sys.argv[2] == '1':   # small replies: the free VM pays for every byte sent
+    limits.update({'logs-cap': '500', 'block-range-cap': '500', 'batch-request-limit': '20', 'batch-response-max-size': '1000000'})
 for k, v in limits.items():
     new = re.sub(r'(?m)^' + re.escape(k) + r' = .*', k + ' = ' + v, new)
 s = s.replace(sec, new)
@@ -406,6 +425,7 @@ $host {
 	header ?Access-Control-Allow-Origin *
 	header ?Access-Control-Allow-Headers "Content-Type"
 	header ?Access-Control-Allow-Methods "GET, POST, OPTIONS"
+	encode zstd gzip
 	route {
 		@preflight method OPTIONS
 		respond @preflight 204
@@ -426,6 +446,53 @@ $host {
 }
 CADDY
     systemctl restart caddy; } || echo "https setup failed; the RPC still works over http"
+fi
+# Low-egress guard: counts bytes sent this month; near the limit it stops
+# Caddy and closes 8545 (the chain keeps running), and reopens next month.
+if [ "$LOW_EGRESS" = 1 ] && [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ]; then
+  cat > /usr/local/bin/zetaphy-egress-guard <<GUARD
+#!/bin/bash
+set -u
+LIMIT=\$(( $EGRESS_LIMIT_MB * 1048576 ))
+S=/var/lib/zetaphy-egress; mkdir -p \$S
+ifc=\$(ip route show default | awk '{print \$5; exit}')
+now=\$(cat /sys/class/net/\$ifc/statistics/tx_bytes)
+month=\$(date -u +%Y-%m)
+read -r m last used 2>/dev/null < \$S/state || { m=\$month; last=\$now; used=0; }
+[[ "\$m\$last\$used" =~ ^[0-9-]+\$ ]] || { m=\$month; last=\$now; used=0; }
+if [ "\$now" -ge "\$last" ]; then used=\$(( used + now - last )); else used=\$(( used + now )); fi  # counter resets on reboot
+if [ "\$m" != "\$month" ]; then m=\$month; used=0; fi
+echo "\$m \$now \$used" > \$S/state
+echo "\$(date -u +%FT%TZ) sent this month: \$(( used / 1048576 )) MB of $EGRESS_LIMIT_MB MB" > \$S/status
+if [ "\$used" -ge "\$LIMIT" ]; then
+  # applied on every run: a reboot drops the iptables rule and starts Caddy again
+  systemctl stop caddy 2>/dev/null
+  iptables -C INPUT -p tcp --dport 8545 -j DROP 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 8545 -j DROP
+  [ -f \$S/paused ] || { touch \$S/paused; logger -t zetaphy-egress "public RPC paused: \$(( used / 1048576 )) MB sent this month"; }
+elif [ -f \$S/paused ]; then
+  iptables -D INPUT -p tcp --dport 8545 -j DROP 2>/dev/null
+  systemctl start caddy 2>/dev/null; rm -f \$S/paused
+  logger -t zetaphy-egress "public RPC reopened for \$month"
+fi
+GUARD
+  chmod 755 /usr/local/bin/zetaphy-egress-guard
+  cat > /etc/systemd/system/zetaphy-egress-guard.service <<UNIT
+[Unit]
+Description=ZETAPHY low-egress guard
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zetaphy-egress-guard
+UNIT
+  cat > /etc/systemd/system/zetaphy-egress-guard.timer <<UNIT
+[Unit]
+Description=ZETAPHY low-egress guard every 10 minutes
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload && systemctl enable --now zetaphy-egress-guard.timer
 fi
 # A joined node asks the faucet of the node it joined for 10 ZETAPHY.
 if [ -n "$JOIN" ]; then
