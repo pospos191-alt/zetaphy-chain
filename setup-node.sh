@@ -60,6 +60,13 @@ NO_SYSTEMD="${NO_SYSTEMD:-}"
 #    denom may cross a channel per window (e.g. USDC from Noble). The code is
 #    the published ibc-apps module (hash pinned above, checked by Go's
 #    checksum database too), ported to ibc-go v11 by ZETAPHY_RL_PATCH.
+#  - security core (evmd/zetaphy_security.go, docs/SECURITY-CORE.md), each
+#    rule off until a governance vote turns it on: Q-day (ECDSA-signed txs
+#    refused from a voted height; migration by quantum lock, or commit–reveal
+#    for keys never used), the threat gate (a tx to a contract with an
+#    enforced Neuro flag needs its sender's consent, precompile 0x…0901), and
+#    the IBC large-transfer hold (big inbound transfers wait, the guardian
+#    can return them to the sender).
 # The patches are at the end of this file. Their tests (zetaphy-chain/fork-tests
 # on GitHub, kept out of this file so it fits Oracle's size limit) run in CI
 # on every change, against this same patching.
@@ -240,7 +247,9 @@ elif [ ! -f "$NODE_HOME/config/genesis.json" ]; then
   # app_state.zetaphypq = activation height (`zetaphyd init` writes it too).
   # A chain already running turns them on with the "zetaphy-v2" upgrade.
   # EIP-2935 serves 8191 blocks; the EVM keeper's ring must match.
-  jqg '.app_state.zetaphypq = (((.app_state.zetaphypq // []) | map(select(.key != "08"))) + [{"key":"08","value":"0000000000000001"}]) | .app_state.evm.params.history_serve_window = "8191"'
+  # Key 0f = the security core (Q-day, threat gate, IBC hold; all off until
+  # voted on) from block 1; a running chain gets it with "zetaphy-v3".
+  jqg '.app_state.zetaphypq = (((.app_state.zetaphypq // []) | map(select(.key != "08" and .key != "0f"))) + [{"key":"08","value":"0000000000000001"},{"key":"0f","value":"0000000000000001"}]) | .app_state.evm.params.history_serve_window = "8191"'
   # Standard contracts (CREATE2 deployer, Multicall3, Permit2, Safe factory).
   pre=$(as_node mktemp) && zetaphy_preinstalls | as_node "cat > '$pre'"
   as_node "jq --slurpfile p '$pre' '.app_state.evm.preinstalls = \$p[0]' '$G' > '$G.tmp' && mv '$G.tmp' '$G' && rm -f '$pre'"
@@ -978,7 +987,7 @@ index 0000000..62d63ad
 +	return pk.UnmarshalBinary(bytes.Clone(m.Key)) == nil
 +}
 diff --git a/evmd/app.go b/evmd/app.go
-index 204345c..dc83c8a 100644
+index 204345c..45c8bad 100644
 --- a/evmd/app.go
 +++ b/evmd/app.go
 @@ -36,6 +36,10 @@ import (
@@ -992,17 +1001,20 @@ index 204345c..dc83c8a 100644
  	"github.com/cosmos/evm/x/vm"
  	evmkeeper "github.com/cosmos/evm/x/vm/keeper"
  	vmrunner "github.com/cosmos/evm/x/vm/runner"
-@@ -179,6 +183,9 @@ type EVMD struct {
+@@ -179,6 +183,12 @@ type EVMD struct {
  	IBCKeeper      *ibckeeper.Keeper // IBC Keeper must be a pointer in the app, so we can SetRouter on it correctly
  	TransferKeeper *transferkeeper.Keeper
  	CallbackKeeper ibccallbackskeeper.ContractKeeper
 +	// ZETAPHY: per-denom, per-channel IBC flow limits set by governance
 +	RateLimitKeeper *ratelimitkeeper.Keeper
 +	pqHome          string // ZETAPHY: node home, for the ML-DSA vote key file
++	// ZETAPHY security core (zetaphy_security.go)
++	secPrecompile *securityPrecompile
++	ibcHoldStack  *ibcHoldMiddleware
  
  	// Cosmos EVM keepers
  	FeeMarketKeeper feemarketkeeper.Keeper
-@@ -238,9 +245,10 @@ func NewExampleApp(
+@@ -238,9 +248,10 @@ func NewExampleApp(
  		govtypes.StoreKey, consensusparamtypes.StoreKey,
  		upgradetypes.StoreKey, feegrant.StoreKey, evidencetypes.StoreKey, authzkeeper.StoreKey,
  		// ibc keys
@@ -1014,15 +1026,18 @@ index 204345c..dc83c8a 100644
  	)
  	oKeys := storetypes.NewObjectStoreKeys(banktypes.ObjectStoreKey, evmtypes.ObjectKey)
  
-@@ -487,6 +495,7 @@ func NewExampleApp(
+@@ -487,6 +498,10 @@ func NewExampleApp(
  
  	// enable virtual fee collection
  	app.EVMKeeper.EnableVirtualFeeCollection()
 +	app.EVMKeeper.SetRandomFn(app.prevRandao) // ZETAPHY: block.prevrandao from the PQ certificate (zetaphy_random.go)
++	// ZETAPHY: the security precompile at 0x…0901 (zetaphy_secprecompile.go)
++	app.secPrecompile = newSecurityPrecompile(app)
++	app.EVMKeeper.SetZetaphyPrecompiles(app.zetaphyPrecompile)
  
  	app.Erc20Keeper = erc20keeper.NewKeeper(
  		keys[erc20types.StoreKey],
-@@ -530,9 +539,29 @@ func NewExampleApp(
+@@ -530,9 +545,34 @@ func NewExampleApp(
  	callbacksMiddleware.SetUnderlyingApplication(transferStack)
  	transferStack = callbacksMiddleware
  
@@ -1043,16 +1058,21 @@ index 204345c..dc83c8a 100644
 +	rateLimitMiddleware := ratelimit.NewIBCMiddleware(app.RateLimitKeeper, transferStack)
 +	app.TransferKeeper.WithICS4Wrapper(rateLimitMiddleware)
 +	transferStack = rateLimitMiddleware
++	// ZETAPHY: large inbound transfers wait (async acknowledgement) on top of
++	// everything else (zetaphy_ibchold.go).
++	app.ibcHoldStack = newIBCHoldMiddleware(app, transferStack)
++	transferStack = app.ibcHoldStack
 +
  	var transferStackV2 ibcapi.IBCModule
  	transferStackV2 = transferv2.NewIBCModule(app.TransferKeeper)
  	transferStackV2 = erc20v2.NewIBCMiddleware(transferStackV2, app.Erc20Keeper)
 +	rateLimitV2 := ratelimitv2.NewIBCMiddleware(*app.RateLimitKeeper, transferStackV2)
 +	transferStackV2 = &rateLimitV2
++	transferStackV2 = &ibcHoldV2{app: transferStackV2, z: app} // ZETAPHY: over the hold threshold is refused on v2
  
  	// Create static IBC router, add transfer route, then set and seal it
  	ibcRouter := porttypes.NewRouter()
-@@ -579,6 +608,7 @@ func NewExampleApp(
+@@ -579,6 +619,7 @@ func NewExampleApp(
  		ibc.NewAppModule(app.IBCKeeper),
  		ibctm.NewAppModule(tmLightClientModule),
  		transferModule,
@@ -1060,7 +1080,7 @@ index 204345c..dc83c8a 100644
  		// Cosmos EVM modules
  		vmModule,
  		feemarket.NewAppModule(app.FeeMarketKeeper),
-@@ -598,6 +628,7 @@ func NewExampleApp(
+@@ -598,6 +639,7 @@ func NewExampleApp(
  			ibctransfertypes.ModuleName: transfer.AppModuleBasic{},
  		},
  	)
@@ -1068,7 +1088,7 @@ index 204345c..dc83c8a 100644
  	app.BasicModuleManager.RegisterLegacyAminoCodec(legacyAmino)
  	app.BasicModuleManager.RegisterInterfaces(interfaceRegistry)
  
-@@ -618,7 +649,7 @@ func NewExampleApp(
+@@ -618,7 +660,7 @@ func NewExampleApp(
  		minttypes.ModuleName,
  
  		// IBC modules
@@ -1077,7 +1097,7 @@ index 204345c..dc83c8a 100644
  
  		// Cosmos EVM BeginBlockers
  		erc20types.ModuleName, feemarkettypes.ModuleName,
-@@ -645,7 +676,7 @@ func NewExampleApp(
+@@ -645,7 +687,7 @@ func NewExampleApp(
  		evmtypes.ModuleName, erc20types.ModuleName, feemarkettypes.ModuleName,
  
  		// no-ops
@@ -1086,7 +1106,7 @@ index 204345c..dc83c8a 100644
  		distrtypes.ModuleName,
  		slashingtypes.ModuleName, minttypes.ModuleName,
  		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,
-@@ -670,7 +701,7 @@ func NewExampleApp(
+@@ -670,7 +712,7 @@ func NewExampleApp(
  		feemarkettypes.ModuleName,
  		erc20types.ModuleName,
  
@@ -1095,7 +1115,7 @@ index 204345c..dc83c8a 100644
  		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,
  		feegrant.ModuleName, upgradetypes.ModuleName, vestingtypes.ModuleName,
  	}
-@@ -684,10 +715,14 @@ func NewExampleApp(
+@@ -684,10 +726,14 @@ func NewExampleApp(
  	if err = app.ModuleManager.RegisterServices(app.configurator); err != nil {
  		panic(fmt.Sprintf("failed to register services in module manager: %s", err.Error()))
  	}
@@ -1110,7 +1130,7 @@ index 204345c..dc83c8a 100644
  
  	autocliv1.RegisterQueryServer(app.GRPCQueryRouter(), runtimeservices.NewAutoCLIQueryService(app.ModuleManager.Modules))
  
-@@ -730,6 +765,10 @@ func NewExampleApp(
+@@ -730,6 +776,10 @@ func NewExampleApp(
  	if err := app.configureEVMMempool(appOpts, logger); err != nil {
  		panic(fmt.Sprintf("failed to configure EVM mempool: %s", err.Error()))
  	}
@@ -1121,7 +1141,7 @@ index 204345c..dc83c8a 100644
  
  	// In v0.46, the SDK introduces _postHandlers_. PostHandlers are like
  	// antehandlers, but are run _after_ the `runMsgs` execution. They are also
-@@ -812,7 +851,7 @@ func (app *EVMD) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
+@@ -812,7 +862,7 @@ func (app *EVMD) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
  		panic(err)
  	}
  
@@ -1130,7 +1150,7 @@ index 204345c..dc83c8a 100644
  }
  
  func (app *EVMD) onPendingTx(hash common.Hash) {
-@@ -842,7 +881,20 @@ func (app *EVMD) Name() string { return app.BaseApp.Name() }
+@@ -842,7 +892,21 @@ func (app *EVMD) Name() string { return app.BaseApp.Name() }
  
  // BeginBlocker application updates every begin block
  func (app *EVMD) BeginBlocker(ctx sdk.Context) (sdk.BeginBlock, error) {
@@ -1140,8 +1160,9 @@ index 204345c..dc83c8a 100644
 +	em := sdk.NewEventManager()
 +	app.burnFees(ctx.WithEventManager(em))
 +	// ZETAPHY v2, from the activation height only (zetaphy_upgrade.go):
-+	app.burnDead(ctx.WithEventManager(em)) // ZETAPHY sent to 0x…dEaD leaves the supply
-+	app.ensureBlockHashHistory(ctx)        // BLOCKHASH needs the EIP-2935 contract (zetaphy_random.go)
++	app.burnDead(ctx.WithEventManager(em))      // ZETAPHY sent to 0x…dEaD leaves the supply
++	app.ensureBlockHashHistory(ctx)             // BLOCKHASH needs the EIP-2935 contract (zetaphy_random.go)
++	app.secBeginBlock(ctx.WithEventManager(em)) // Q-day migrations and held IBC transfers due (zetaphy_security.go)
 +	// ZETAPHY: evidence switch (zetaphy_pqcert.go); its events join the burn's
 +	bb, err := app.ModuleManager.BeginBlock(app.pqFilterEvidence(ctx.WithEventManager(em)))
 +	if err != nil {
@@ -1152,17 +1173,22 @@ index 204345c..dc83c8a 100644
  }
  
  // EndBlocker application updates every end block
-@@ -869,10 +921,19 @@ func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci
+@@ -869,10 +933,23 @@ func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci
  		panic(err)
  	}
  
+-	return app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState)
 +	if raw, ok := genesisState[pqStoreKey]; ok { // ZETAPHY: quantum locks and vote keys
 +		if err := app.pqInitGenesis(ctx, raw); err != nil {
 +			panic(err)
 +		}
 +		delete(genesisState, pqStoreKey)
 +	}
- 	return app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState)
++	res, err := app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState)
++	if err == nil {
++		app.secMirrorAfterGenesis(ctx) // ZETAPHY: security-core heights into EVM storage
++	}
++	return res, err
  }
  
 -func (app *EVMD) PreBlocker(ctx sdk.Context, _ *abci.RequestFinalizeBlock) (*sdk.ResponsePreBlock, error) {
@@ -1174,14 +1200,15 @@ index 204345c..dc83c8a 100644
  }
  
 diff --git a/evmd/cmd/evmd/cmd/root.go b/evmd/cmd/evmd/cmd/root.go
-index 4da3349..a5db229 100644
+index 4da3349..7fe2640 100644
 --- a/evmd/cmd/evmd/cmd/root.go
 +++ b/evmd/cmd/evmd/cmd/root.go
-@@ -249,6 +249,7 @@ func txCommand() *cobra.Command {
+@@ -249,6 +249,8 @@ func txCommand() *cobra.Command {
  		authcmd.GetEncodeCommand(),
  		authcmd.GetDecodeCommand(),
  		authcmd.GetSimulateCmd(),
 +		evmd.PQVoteKeyCmd(), evmd.QuantumLockCmd(), evmd.PQEvidenceProposalCmd(), // ZETAPHY
++		evmd.SecurityProposalCmd(), evmd.QDayCommitCmd(), evmd.QDayRevealCmd(), evmd.IBCHoldCancelCmd(), // ZETAPHY security core
  	)
  
  	cmd.PersistentFlags().String(flags.FlagChainID, "", "The network chain ID")
@@ -1225,10 +1252,18 @@ index 92d6f82..4ce53b3 100644
  github.com/cloudwego/base64x v0.1.6/go.mod h1:OFcloc187FXDaYHvrNIjxSe8ncn0OOM8gEHfghB2IPU=
  github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGXZJjfX53e64911xZQV5JYwmTeXPW+k8Sc=
 diff --git a/evmd/mempool.go b/evmd/mempool.go
-index d6af75f..26d2cbf 100644
+index d6af75f..843b34a 100644
 --- a/evmd/mempool.go
 +++ b/evmd/mempool.go
-@@ -61,8 +61,8 @@ func (app *EVMD) configureEVMMempool(appOpts servertypes.AppOptions, logger log.
+@@ -52,6 +52,7 @@ func (app *EVMD) configureEVMMempool(appOpts servertypes.AppOptions, logger log.
+ 	)
+ 
+ 	app.EVMMempool = mempool
++	mempool.SetZetaphyCheck(app.threatMempoolCheck) // ZETAPHY: the threat gate at submission
+ 
+ 	// create ABCI handlers
+ 	proposalHandler := baseapp.NewDefaultProposalHandler(mempool, NewNoCheckProposalTxVerifier(app.BaseApp))
+@@ -61,8 +62,8 @@ func (app *EVMD) configureEVMMempool(appOpts servertypes.AppOptions, logger log.
  	checkTxHandler := mempool.NewCheckTxHandler(app.TxDecode, checkTxTimeout)
  
  	// set handlers and the mempool
@@ -1328,12 +1363,452 @@ index 0000000..a68e4a1
 +	write()
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_dead_burn", sdk.NewAttribute("amount", coins.String())))
 +}
+diff --git a/evmd/zetaphy_ibchold.go b/evmd/zetaphy_ibchold.go
+new file mode 100644
+index 0000000..4ec30cd
+--- /dev/null
++++ b/evmd/zetaphy_ibchold.go
+@@ -0,0 +1,434 @@
++package evmd
++
++// ZETAPHY IBC large-transfer hold.
++//
++// The top of the ICS-20 stack (above the rate limit). An inbound transfer of
++// a denom at or over its governance threshold (MsgSetIBCHoldRule: a minimum
++// amount, and/or a share of the denom's supply in basis points; "*" covers
++// denoms without a rule) is not delivered at once: the packet is received
++// (so it cannot time out on the source chain) but its acknowledgement is
++// left open, and the packet waits in the zetaphypq store for the hold delay
++// (MsgSetIBCHold, default 6 h). Nothing is minted or unescrowed meanwhile.
++//   - After the delay, BeginBlock delivers it through the rest of the stack
++//     (rate limit, callbacks, ERC-20, transfer) as if it had just arrived,
++//     and writes the acknowledgement that stack gives. Over the rate limit
++//     at that moment, or any other failure: an error acknowledgement, and
++//     the source chain refunds the sender.
++//   - Before that, the guardian (a governance-set account or contract, e.g.
++//     a multisig; governance itself can too) may cancel it: an error
++//     acknowledgement is written and the source chain refunds the sender.
++//     The guardian can only return a transfer to where it came from; it can
++//     never take it.
++// Every hold, release and cancellation is an event; zetaphy_ibcHolds lists
++// the waiting ones. IBC v2 (Eureka) packets cannot wait like this here: one
++// over the threshold is refused at once (refunded on the source chain).
++// x/ratelimit stays as it was.
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++
++	gogoproto "github.com/cosmos/gogoproto/proto"
++
++	errorsmod "cosmossdk.io/errors"
++	sdkmath "cosmossdk.io/math"
++
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
++	govtypes "github.com/cosmos/cosmos-sdk/x/gov/types"
++
++	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
++	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
++	channeltypesv2 "github.com/cosmos/ibc-go/v11/modules/core/04-channel/v2/types"
++	porttypes "github.com/cosmos/ibc-go/v11/modules/core/05-port/types"
++	ibcapi "github.com/cosmos/ibc-go/v11/modules/core/api"
++	ibcexported "github.com/cosmos/ibc-go/v11/modules/core/exported"
++)
++
++const (
++	// IBCHoldDefaultDelay: 6 hours, unless governance sets another.
++	IBCHoldDefaultDelay = 6 * 3600
++	IBCHoldMinDelay     = 60
++	IBCHoldMaxDelay     = 7 * 86400
++	ibcReleasesPerBlock = 20
++)
++
++// ibcHold is a held inbound transfer.
++type ibcHold struct {
++	ID        uint64 `json:"id"`
++	Packet    []byte `json:"packet"` // channeltypes.Packet (protobuf)
++	Version   string `json:"version"`
++	Relayer   []byte `json:"relayer"`
++	Channel   string `json:"channel"` // this chain's channel
++	Denom     string `json:"denom"`   // the denom it becomes here
++	Amount    string `json:"amount"`
++	Sender    string `json:"sender"`
++	Receiver  string `json:"receiver"`
++	HeldAt    int64  `json:"held_at"`
++	ReleaseAt int64  `json:"release_at"`
++	Stuck     string `json:"stuck,omitempty"` // why delivering it failed (e.g. the channel closed)
++}
++
++func holdKey(id uint64) []byte { return append([]byte{holdPfx}, u64(id)...) }
++func holdQueueKey(at int64, id uint64) []byte {
++	return append(append([]byte{holdQueuePfx}, u64(uint64(at))...), u64(id)...) // #nosec G115 -- unix seconds
++}
++func holdRuleKey(denom string) []byte { return append([]byte{holdRulePfx}, denom...) }
++
++// ibcHoldParams: the delay in seconds and the guardian (nil: none).
++func (app *EVMD) ibcHoldParams(ctx sdk.Context) (int64, []byte) {
++	v := app.secRaw(ctx).Get(holdParamsKey)
++	d := int64(readU64(v)) // #nosec G115 -- bounded by IBCHoldMaxDelay
++	if d == 0 {
++		d = IBCHoldDefaultDelay
++	}
++	if len(v) == 28 {
++		return d, v[8:]
++	}
++	return d, nil
++}
++
++// ibcHoldRule: the rule for denom (or "*"): minimum amount and supply share.
++func (app *EVMD) ibcHoldRule(ctx sdk.Context, denom string) (sdkmath.Int, uint64, bool) {
++	st := app.secRaw(ctx)
++	v := st.Get(holdRuleKey(denom))
++	if v == nil {
++		v = st.Get(holdRuleKey("*"))
++	}
++	if len(v) < 8 {
++		return sdkmath.ZeroInt(), 0, false
++	}
++	min, ok := sdkmath.NewIntFromString(string(v[8:]))
++	if !ok {
++		min = sdkmath.ZeroInt()
++	}
++	return min, readU64(v), true
++}
++
++// ibcHoldNeeded: a transfer of amount of denom (as named here) must wait.
++func (app *EVMD) ibcHoldNeeded(ctx sdk.Context, denom string, amount sdkmath.Int) bool {
++	min, bps, ok := app.ibcHoldRule(ctx, denom)
++	if !ok || !amount.IsPositive() {
++		return false
++	}
++	if min.IsPositive() && amount.GTE(min) {
++		return true
++	}
++	if bps > 0 {
++		supply := app.BankKeeper.GetSupply(ctx, denom).Amount
++		return amount.MulRaw(10000).GTE(supply.Mul(sdkmath.NewIntFromUint64(bps)))
++	}
++	return false
++}
++
++// ibcLocalDenom: the denom an inbound ICS-20 token becomes on this chain.
++func ibcLocalDenom(d transfertypes.Denom, srcPort, srcChan, dstPort, dstChan string) string {
++	if d.HasPrefix(srcPort, srcChan) { // it is going home: unescrowed here
++		d.Trace = d.Trace[1:]
++		return d.IBCDenom()
++	}
++	d.Trace = append([]transfertypes.Hop{transfertypes.NewHop(dstPort, dstChan)}, d.Trace...)
++	return d.IBCDenom()
++}
++
++func (app *EVMD) ibcHoldOn(ctx sdk.Context) bool {
++	if !app.secV3(ctx) {
++		return false
++	}
++	it := app.secRaw(ctx).Iterator([]byte{holdRulePfx}, []byte{holdRulePfx + 1})
++	defer it.Close()
++	return it.Valid()
++}
++
++// ---- IBC v1 middleware
++
++type ibcHoldMiddleware struct {
++	app porttypes.IBCModule
++	z   *EVMD
++}
++
++var _ porttypes.IBCModule = (*ibcHoldMiddleware)(nil)
++
++func newIBCHoldMiddleware(z *EVMD, app porttypes.IBCModule) *ibcHoldMiddleware {
++	return &ibcHoldMiddleware{app: app, z: z}
++}
++
++func (m *ibcHoldMiddleware) OnChanOpenInit(ctx sdk.Context, order channeltypes.Order, hops []string, port, ch string, cp channeltypes.Counterparty, v string) (string, error) {
++	return m.app.OnChanOpenInit(ctx, order, hops, port, ch, cp, v)
++}
++
++func (m *ibcHoldMiddleware) OnChanOpenTry(ctx sdk.Context, order channeltypes.Order, hops []string, port, ch string, cp channeltypes.Counterparty, v string) (string, error) {
++	return m.app.OnChanOpenTry(ctx, order, hops, port, ch, cp, v)
++}
++
++func (m *ibcHoldMiddleware) OnChanOpenAck(ctx sdk.Context, port, ch, cpCh, cpV string) error {
++	return m.app.OnChanOpenAck(ctx, port, ch, cpCh, cpV)
++}
++
++func (m *ibcHoldMiddleware) OnChanOpenConfirm(ctx sdk.Context, port, ch string) error {
++	return m.app.OnChanOpenConfirm(ctx, port, ch)
++}
++
++func (m *ibcHoldMiddleware) OnChanCloseInit(ctx sdk.Context, port, ch string) error {
++	return m.app.OnChanCloseInit(ctx, port, ch)
++}
++
++func (m *ibcHoldMiddleware) OnChanCloseConfirm(ctx sdk.Context, port, ch string) error {
++	return m.app.OnChanCloseConfirm(ctx, port, ch)
++}
++
++func (m *ibcHoldMiddleware) OnAcknowledgementPacket(ctx sdk.Context, v string, p channeltypes.Packet, ack []byte, r sdk.AccAddress) error {
++	return m.app.OnAcknowledgementPacket(ctx, v, p, ack, r)
++}
++
++func (m *ibcHoldMiddleware) OnTimeoutPacket(ctx sdk.Context, v string, p channeltypes.Packet, r sdk.AccAddress) error {
++	return m.app.OnTimeoutPacket(ctx, v, p, r)
++}
++
++func (m *ibcHoldMiddleware) SetICS4Wrapper(w porttypes.ICS4Wrapper) { m.app.SetICS4Wrapper(w) }
++
++// UnmarshalPacketData lets middlewares above read the packet (callbacks).
++func (m *ibcHoldMiddleware) UnmarshalPacketData(ctx sdk.Context, port, ch string, bz []byte) (any, string, error) {
++	if u, ok := m.app.(porttypes.PacketDataUnmarshaler); ok {
++		return u.UnmarshalPacketData(ctx, port, ch, bz)
++	}
++	return nil, "", errors.New("the application below does not unmarshal packet data")
++}
++
++func (m *ibcHoldMiddleware) OnRecvPacket(ctx sdk.Context, version string, packet channeltypes.Packet, relayer sdk.AccAddress) ibcexported.Acknowledgement {
++	if m.z.ibcHoldOn(ctx) {
++		if data, err := transfertypes.UnmarshalPacketData(packet.GetData(), version, ""); err == nil {
++			amount, ok := sdkmath.NewIntFromString(data.Token.Amount)
++			denom := ibcLocalDenom(data.Token.Denom, packet.SourcePort, packet.SourceChannel, packet.DestinationPort, packet.DestinationChannel)
++			if ok && m.z.ibcHoldNeeded(ctx, denom, amount) {
++				if err := m.z.ibcHoldStore(ctx, version, packet, relayer, denom, data); err == nil {
++					return nil // asynchronous: acknowledged on release or cancellation
++				}
++			}
++		}
++	}
++	return m.app.OnRecvPacket(ctx, version, packet, relayer)
++}
++
++func (app *EVMD) ibcHoldStore(ctx sdk.Context, version string, packet channeltypes.Packet, relayer sdk.AccAddress, denom string, data transfertypes.InternalTransferRepresentation) error {
++	pb, err := packet.Marshal()
++	if err != nil {
++		return err
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	id := readU64(st.Get(holdSeqKey)) + 1
++	delay, _ := app.ibcHoldParams(ctx)
++	h := ibcHold{ID: id, Packet: pb, Version: version, Relayer: relayer, Channel: packet.DestinationChannel, Denom: denom,
++		Amount: data.Token.Amount, Sender: data.Sender, Receiver: data.Receiver, HeldAt: ctx.BlockTime().Unix(), ReleaseAt: ctx.BlockTime().Unix() + delay}
++	bz, err := json.Marshal(h)
++	if err != nil {
++		return err
++	}
++	st.Set(holdSeqKey, u64(id))
++	st.Set(holdKey(id), bz)
++	st.Set(holdQueueKey(h.ReleaseAt, id), []byte{})
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold", sdk.NewAttribute("id", fmt.Sprint(id)),
++		sdk.NewAttribute("channel", h.Channel), sdk.NewAttribute("sequence", fmt.Sprint(packet.Sequence)), sdk.NewAttribute("denom", denom),
++		sdk.NewAttribute("amount", h.Amount), sdk.NewAttribute("sender", h.Sender), sdk.NewAttribute("receiver", h.Receiver),
++		sdk.NewAttribute("release_at", fmt.Sprint(h.ReleaseAt))))
++	return nil
++}
++
++func (app *EVMD) ibcHoldGet(ctx sdk.Context, id uint64) (*ibcHold, channeltypes.Packet, error) {
++	var h ibcHold
++	var p channeltypes.Packet
++	bz := ctx.KVStore(app.GetKey(pqStoreKey)).Get(holdKey(id))
++	if bz == nil {
++		return nil, p, errorsmod.Wrapf(errortypes.ErrNotFound, "no held transfer %d", id)
++	}
++	if err := json.Unmarshal(bz, &h); err != nil {
++		return nil, p, err
++	}
++	return &h, p, p.Unmarshal(h.Packet)
++}
++
++// ibcHoldReleaseDue delivers the held transfers whose delay is over.
++func (app *EVMD) ibcHoldReleaseDue(ctx sdk.Context) {
++	if app.ibcHoldStack == nil {
++		return
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	it := st.Iterator([]byte{holdQueuePfx}, holdQueueKey(ctx.BlockTime().Unix()+1, 0))
++	var ids []uint64
++	var keys [][]byte
++	for ; it.Valid() && len(ids) < ibcReleasesPerBlock; it.Next() {
++		keys = append(keys, bytes.Clone(it.Key()))
++		ids = append(ids, readU64(it.Key()[9:]))
++	}
++	_ = it.Close()
++	for i, id := range ids {
++		st.Delete(keys[i])
++		app.ibcHoldRelease(ctx, id)
++	}
++}
++
++func (app *EVMD) ibcHoldRelease(ctx sdk.Context, id uint64) {
++	h, packet, err := app.ibcHoldGet(ctx, id)
++	if err != nil {
++		return
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	stuck := func(why string) {
++		h.Stuck = why
++		if bz, err := json.Marshal(h); err == nil {
++			st.Set(holdKey(id), bz)
++		}
++		ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_stuck", sdk.NewAttribute("id", fmt.Sprint(id)), sdk.NewAttribute("reason", why)))
++	}
++	appCtx, writeApp := ctx.CacheContext()
++	var ack ibcexported.Acknowledgement
++	if perr := func() (perr error) {
++		defer func() {
++			if r := recover(); r != nil {
++				perr = fmt.Errorf("delivery panicked: %v", r)
++			}
++		}()
++		ack = app.ibcHoldStack.app.OnRecvPacket(appCtx, h.Version, packet, h.Relayer)
++		return nil
++	}(); perr != nil {
++		stuck(perr.Error())
++		return
++	}
++	if ack != nil {
++		ackCtx, writeAck := ctx.CacheContext()
++		if err := app.IBCKeeper.ChannelKeeper.WriteAcknowledgement(ackCtx, packet, ack); err != nil {
++			stuck(err.Error())
++			return
++		}
++		writeAck()
++	}
++	if ack == nil || ack.Success() {
++		writeApp()
++	}
++	st.Delete(holdKey(id))
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_released", sdk.NewAttribute("id", fmt.Sprint(id)),
++		sdk.NewAttribute("success", fmt.Sprint(ack == nil || ack.Success()))))
++}
++
++// ibcHoldCancel returns a held transfer to its sender (an error
++// acknowledgement); by must be the guardian or governance.
++func (app *EVMD) ibcHoldCancel(ctx sdk.Context, by []byte, id uint64) error {
++	_, guardian := app.ibcHoldParams(ctx)
++	if !(guardian != nil && bytes.Equal(by, guardian)) && !bytes.Equal(by, authtypes.NewModuleAddress(govtypes.ModuleName)) {
++		return errorsmod.Wrap(errortypes.ErrUnauthorized, "only the IBC hold guardian or governance can return a held transfer")
++	}
++	h, packet, err := app.ibcHoldGet(ctx, id)
++	if err != nil {
++		return err
++	}
++	ack := channeltypes.NewErrorAcknowledgement(fmt.Errorf("held transfer %d returned to its sender by the ZETAPHY guardian", id))
++	if err := app.IBCKeeper.ChannelKeeper.WriteAcknowledgement(ctx, packet, ack); err != nil {
++		return err
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	st.Delete(holdKey(id))
++	st.Delete(holdQueueKey(h.ReleaseAt, id))
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_cancelled", sdk.NewAttribute("id", fmt.Sprint(id)),
++		sdk.NewAttribute("by", sdk.AccAddress(by).String()), sdk.NewAttribute("sender", h.Sender), sdk.NewAttribute("amount", h.Amount), sdk.NewAttribute("denom", h.Denom)))
++	return nil
++}
++
++func (app *EVMD) ibcHoldCancelMsg(ctx sdk.Context, m *MsgIBCHoldCancel) (gogoproto.Message, error) {
++	by, err := pqAddr(m.Signer)
++	if err != nil {
++		return nil, err
++	}
++	return &MsgPQResponse{}, app.ibcHoldCancel(ctx, by, m.Id)
++}
++
++func (app *EVMD) setIBCHold(ctx sdk.Context, m *MsgSetIBCHold) (gogoproto.Message, error) {
++	if m.Authority != govAuthority() {
++		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only governance can set the IBC hold")
++	}
++	if m.DelaySeconds < IBCHoldMinDelay || m.DelaySeconds > IBCHoldMaxDelay {
++		return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest, "delay_seconds: %d to %d", IBCHoldMinDelay, IBCHoldMaxDelay)
++	}
++	v := u64(m.DelaySeconds)
++	if m.Guardian != "" {
++		g, err := pqAddr(m.Guardian)
++		if err != nil {
++			return nil, err
++		}
++		v = append(v, g...)
++	}
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(holdParamsKey, v)
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_params", sdk.NewAttribute("delay_seconds", fmt.Sprint(m.DelaySeconds)), sdk.NewAttribute("guardian", m.Guardian)))
++	return &MsgPQResponse{}, nil
++}
++
++func (app *EVMD) setIBCHoldRule(ctx sdk.Context, m *MsgSetIBCHoldRule) (gogoproto.Message, error) {
++	if m.Authority != govAuthority() {
++		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only governance can set IBC hold rules")
++	}
++	if m.Denom == "" || len(m.Denom) > 128 {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "denom: 1 to 128 characters (\"*\" for every denom without its own rule)")
++	}
++	min := sdkmath.ZeroInt()
++	if m.MinAmount != "" {
++		var ok bool
++		if min, ok = sdkmath.NewIntFromString(m.MinAmount); !ok || min.IsNegative() {
++			return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "min_amount: a whole number of the denom's base unit")
++		}
++	}
++	if m.SupplyBps > 10000 || (m.Denom == "*" && min.IsPositive()) {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "supply_bps: 0 to 10000; the \"*\" rule takes a supply share only")
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if min.IsZero() && m.SupplyBps == 0 {
++		st.Delete(holdRuleKey(m.Denom))
++	} else {
++		st.Set(holdRuleKey(m.Denom), append(u64(m.SupplyBps), min.String()...))
++	}
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_rule", sdk.NewAttribute("denom", m.Denom),
++		sdk.NewAttribute("min_amount", min.String()), sdk.NewAttribute("supply_bps", fmt.Sprint(m.SupplyBps))))
++	return &MsgPQResponse{}, nil
++}
++
++// ---- IBC v2: no asynchronous hold; over the threshold is refused
++
++type ibcHoldV2 struct {
++	app ibcapi.IBCModule
++	z   *EVMD
++}
++
++func (m *ibcHoldV2) OnSendPacket(ctx sdk.Context, src, dst string, seq uint64, p channeltypesv2.Payload, signer sdk.AccAddress) error {
++	return m.app.OnSendPacket(ctx, src, dst, seq, p, signer)
++}
++
++func (m *ibcHoldV2) OnTimeoutPacket(ctx sdk.Context, src, dst string, seq uint64, p channeltypesv2.Payload, r sdk.AccAddress) error {
++	return m.app.OnTimeoutPacket(ctx, src, dst, seq, p, r)
++}
++
++func (m *ibcHoldV2) OnAcknowledgementPacket(ctx sdk.Context, src, dst string, seq uint64, ack []byte, p channeltypesv2.Payload, r sdk.AccAddress) error {
++	return m.app.OnAcknowledgementPacket(ctx, src, dst, seq, ack, p, r)
++}
++
++func (m *ibcHoldV2) UnmarshalPacketData(p channeltypesv2.Payload) (any, error) {
++	if u, ok := m.app.(ibcapi.PacketDataUnmarshaler); ok {
++		return u.UnmarshalPacketData(p)
++	}
++	return nil, errors.New("the application below does not unmarshal packet data")
++}
++
++func (m *ibcHoldV2) OnRecvPacket(ctx sdk.Context, src, dst string, seq uint64, p channeltypesv2.Payload, r sdk.AccAddress) channeltypesv2.RecvPacketResult {
++	if m.z.ibcHoldOn(ctx) {
++		if data, err := transfertypes.UnmarshalPacketData(p.Value, p.Version, p.Encoding); err == nil {
++			amount, ok := sdkmath.NewIntFromString(data.Token.Amount)
++			denom := ibcLocalDenom(data.Token.Denom, p.SourcePort, src, p.DestinationPort, dst)
++			if ok && m.z.ibcHoldNeeded(ctx, denom, amount) {
++				err := fmt.Errorf("a transfer this large is held for review on ZETAPHY, which IBC v2 cannot do: send it over an IBC v1 channel")
++				ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_ibc_hold_refused_v2", sdk.NewAttribute("denom", denom), sdk.NewAttribute("amount", data.Token.Amount)))
++				return channeltypesv2.RecvPacketResult{Status: channeltypesv2.PacketStatus_Failure, Acknowledgement: channeltypes.NewErrorAcknowledgement(err).Acknowledgement()}
++			}
++		}
++	}
++	return m.app.OnRecvPacket(ctx, src, dst, seq, p, r)
++}
 diff --git a/evmd/zetaphy_pqcall.go b/evmd/zetaphy_pqcall.go
 new file mode 100644
-index 0000000..d306deb
+index 0000000..00b9581
 --- /dev/null
 +++ b/evmd/zetaphy_pqcall.go
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,484 @@
 +package evmd
 +
 +// ZETAPHY post-quantum messages (zetaphy/pq/v1/tx.proto, built in code below):
@@ -1428,6 +1903,64 @@ index 0000000..d306deb
 +	Attestations []byte
 +}
 +
++// ZETAPHY security core (zetaphy_qday.go, zetaphy_threatgate.go, zetaphy_ibchold.go).
++
++// MsgSetQDay schedules Q-day (governance only): from height on, ECDSA-signed
++// txs are refused. 0 unschedules it. reveal_delay: blocks a commit–reveal
++// migration waits (0: the default).
++type MsgSetQDay struct {
++	Authority   string
++	Height      uint64
++	RevealDelay uint64
++}
++
++// MsgQDayCommit records sha256 of a migration (qdayCommitment) before its reveal.
++type MsgQDayCommit struct {
++	Signer     string
++	Commitment []byte
++}
++
++// MsgQDayReveal migrates an account whose ECDSA key was never shown on chain
++// to an ML-DSA-44 controller, after Q-day: the signature (EIP-191, by the
++// owner's key, over qdayRevealText) and salt open a commitment at least
++// reveal_delay blocks old.
++type MsgQDayReveal struct {
++	Signer     string
++	Owner      string
++	Controller string
++	Salt       []byte
++	Signature  []byte
++}
++
++// MsgSetThreatGate sets the ThreatRegistry the chain asks (governance only).
++type MsgSetThreatGate struct {
++	Authority string
++	Registry  string
++	Enabled   uint64
++}
++
++// MsgSetIBCHold sets the large-transfer hold delay and guardian (governance only).
++type MsgSetIBCHold struct {
++	Authority    string
++	DelaySeconds uint64
++	Guardian     string
++}
++
++// MsgSetIBCHoldRule sets when an inbound transfer of a denom is held
++// (governance only); "*" is the rule for denoms without one.
++type MsgSetIBCHoldRule struct {
++	Authority string
++	Denom     string
++	MinAmount string
++	SupplyBps uint64
++}
++
++// MsgIBCHoldCancel returns a held transfer to its sender (guardian or governance).
++type MsgIBCHoldCancel struct {
++	Signer string
++	Id     uint64
++}
++
 +func (m *MsgEVMCall) Reset()                    { *m = MsgEVMCall{} }
 +func (m *MsgEVMCall) String() string            { return fmt.Sprintf("%+v", *m) }
 +func (*MsgEVMCall) ProtoMessage()               {}
@@ -1480,6 +2013,56 @@ index 0000000..d306deb
 +func (m *MsgSetPQEvidence) Unmarshal(b []byte) error   { return pqUnmarshal(6, b, m) }
 +func (m *MsgSetPQEvidence) Size() int                  { return pqSize(m) }
 +
++func (m *MsgSetQDay) Reset()                           { *m = MsgSetQDay{} }
++func (m *MsgSetQDay) String() string                   { return fmt.Sprintf("%+v", *m) }
++func (*MsgSetQDay) ProtoMessage()                      {}
++func (*MsgSetQDay) Descriptor() ([]byte, []int)        { return pqCallDescriptor, []int{7} }
++func (m *MsgSetQDay) Marshal() ([]byte, error)         { return pqMarshal(7, m) }
++func (m *MsgSetQDay) Unmarshal(b []byte) error         { return pqUnmarshal(7, b, m) }
++func (m *MsgSetQDay) Size() int                        { return pqSize(m) }
++func (m *MsgQDayCommit) Reset()                        { *m = MsgQDayCommit{} }
++func (m *MsgQDayCommit) String() string                { return fmt.Sprintf("%+v", *m) }
++func (*MsgQDayCommit) ProtoMessage()                   {}
++func (*MsgQDayCommit) Descriptor() ([]byte, []int)     { return pqCallDescriptor, []int{8} }
++func (m *MsgQDayCommit) Marshal() ([]byte, error)      { return pqMarshal(8, m) }
++func (m *MsgQDayCommit) Unmarshal(b []byte) error      { return pqUnmarshal(8, b, m) }
++func (m *MsgQDayCommit) Size() int                     { return pqSize(m) }
++func (m *MsgQDayReveal) Reset()                        { *m = MsgQDayReveal{} }
++func (m *MsgQDayReveal) String() string                { return fmt.Sprintf("%+v", *m) }
++func (*MsgQDayReveal) ProtoMessage()                   {}
++func (*MsgQDayReveal) Descriptor() ([]byte, []int)     { return pqCallDescriptor, []int{9} }
++func (m *MsgQDayReveal) Marshal() ([]byte, error)      { return pqMarshal(9, m) }
++func (m *MsgQDayReveal) Unmarshal(b []byte) error      { return pqUnmarshal(9, b, m) }
++func (m *MsgQDayReveal) Size() int                     { return pqSize(m) }
++func (m *MsgSetThreatGate) Reset()                     { *m = MsgSetThreatGate{} }
++func (m *MsgSetThreatGate) String() string             { return fmt.Sprintf("%+v", *m) }
++func (*MsgSetThreatGate) ProtoMessage()                {}
++func (*MsgSetThreatGate) Descriptor() ([]byte, []int)  { return pqCallDescriptor, []int{10} }
++func (m *MsgSetThreatGate) Marshal() ([]byte, error)   { return pqMarshal(10, m) }
++func (m *MsgSetThreatGate) Unmarshal(b []byte) error   { return pqUnmarshal(10, b, m) }
++func (m *MsgSetThreatGate) Size() int                  { return pqSize(m) }
++func (m *MsgSetIBCHold) Reset()                        { *m = MsgSetIBCHold{} }
++func (m *MsgSetIBCHold) String() string                { return fmt.Sprintf("%+v", *m) }
++func (*MsgSetIBCHold) ProtoMessage()                   {}
++func (*MsgSetIBCHold) Descriptor() ([]byte, []int)     { return pqCallDescriptor, []int{11} }
++func (m *MsgSetIBCHold) Marshal() ([]byte, error)      { return pqMarshal(11, m) }
++func (m *MsgSetIBCHold) Unmarshal(b []byte) error      { return pqUnmarshal(11, b, m) }
++func (m *MsgSetIBCHold) Size() int                     { return pqSize(m) }
++func (m *MsgSetIBCHoldRule) Reset()                    { *m = MsgSetIBCHoldRule{} }
++func (m *MsgSetIBCHoldRule) String() string            { return fmt.Sprintf("%+v", *m) }
++func (*MsgSetIBCHoldRule) ProtoMessage()               {}
++func (*MsgSetIBCHoldRule) Descriptor() ([]byte, []int) { return pqCallDescriptor, []int{12} }
++func (m *MsgSetIBCHoldRule) Marshal() ([]byte, error)  { return pqMarshal(12, m) }
++func (m *MsgSetIBCHoldRule) Unmarshal(b []byte) error  { return pqUnmarshal(12, b, m) }
++func (m *MsgSetIBCHoldRule) Size() int                 { return pqSize(m) }
++func (m *MsgIBCHoldCancel) Reset()                     { *m = MsgIBCHoldCancel{} }
++func (m *MsgIBCHoldCancel) String() string             { return fmt.Sprintf("%+v", *m) }
++func (*MsgIBCHoldCancel) ProtoMessage()                {}
++func (*MsgIBCHoldCancel) Descriptor() ([]byte, []int)  { return pqCallDescriptor, []int{13} }
++func (m *MsgIBCHoldCancel) Marshal() ([]byte, error)   { return pqMarshal(13, m) }
++func (m *MsgIBCHoldCancel) Unmarshal(b []byte) error   { return pqUnmarshal(13, b, m) }
++func (m *MsgIBCHoldCancel) Size() int                  { return pqSize(m) }
++
 +func pqSize(m interface{ Marshal() ([]byte, error) }) int { b, _ := m.Marshal(); return len(b) }
 +
 +// The wire format is done by Google's protobuf runtime on a dynamic message
@@ -1515,11 +2098,22 @@ index 0000000..d306deb
 +	{"MsgPQResponse", "", ""},
 +	{"MsgPQCertificate", "signer", "signer:S height:U attestations:B"},
 +	{"MsgSetPQEvidence", "authority", "authority:S enabled:U"},
++	{"MsgSetQDay", "authority", "authority:S height:U reveal_delay:U"},
++	{"MsgQDayCommit", "signer", "signer:S commitment:B"},
++	{"MsgQDayReveal", "signer", "signer:S owner:S controller:S salt:B signature:B"},
++	{"MsgSetThreatGate", "authority", "authority:S registry:S enabled:U"},
++	{"MsgSetIBCHold", "authority", "authority:S delay_seconds:U guardian:S"},
++	{"MsgSetIBCHoldRule", "authority", "authority:S denom:S min_amount:S supply_bps:U"},
++	{"MsgIBCHoldCancel", "signer", "signer:S id:U"},
 +}
 +
 +var pqMethods = [][3]string{{"EVMCall", "MsgEVMCall", "MsgEVMCallResponse"},
 +	{"QuantumLock", "MsgQuantumLock", "MsgPQResponse"}, {"PQVoteKey", "MsgPQVoteKey", "MsgPQResponse"},
-+	{"PQCertificate", "MsgPQCertificate", "MsgPQResponse"}, {"SetPQEvidence", "MsgSetPQEvidence", "MsgPQResponse"}}
++	{"PQCertificate", "MsgPQCertificate", "MsgPQResponse"}, {"SetPQEvidence", "MsgSetPQEvidence", "MsgPQResponse"},
++	{"SetQDay", "MsgSetQDay", "MsgPQResponse"}, {"QDayCommit", "MsgQDayCommit", "MsgPQResponse"},
++	{"QDayReveal", "MsgQDayReveal", "MsgPQResponse"}, {"SetThreatGate", "MsgSetThreatGate", "MsgPQResponse"},
++	{"SetIBCHold", "MsgSetIBCHold", "MsgPQResponse"}, {"SetIBCHoldRule", "MsgSetIBCHoldRule", "MsgPQResponse"},
++	{"IBCHoldCancel", "MsgIBCHoldCancel", "MsgPQResponse"}}
 +
 +var pqCallProto = func() *descriptorpb.FileDescriptorProto {
 +	types := map[byte]descriptorpb.FieldDescriptorProto_Type{'S': descriptorpb.FieldDescriptorProto_TYPE_STRING,
@@ -1571,7 +2165,8 @@ index 0000000..d306deb
 +}()
 +
 +func init() {
-+	for _, m := range []gogoproto.Message{&MsgEVMCall{}, &MsgEVMCallResponse{}, &MsgQuantumLock{}, &MsgPQVoteKey{}, &MsgPQResponse{}, &MsgPQCertificate{}, &MsgSetPQEvidence{}} {
++	for _, m := range []gogoproto.Message{&MsgEVMCall{}, &MsgEVMCallResponse{}, &MsgQuantumLock{}, &MsgPQVoteKey{}, &MsgPQResponse{}, &MsgPQCertificate{}, &MsgSetPQEvidence{},
++		&MsgSetQDay{}, &MsgQDayCommit{}, &MsgQDayReveal{}, &MsgSetThreatGate{}, &MsgSetIBCHold{}, &MsgSetIBCHoldRule{}, &MsgIBCHoldCancel{}} {
 +		gogoproto.RegisterType(m, "zetaphy.pq.v1."+reflect.TypeOf(m).Elem().Name())
 +	}
 +	gogoproto.RegisterFile(pqCallFile, pqCallDescriptor)
@@ -1598,7 +2193,10 @@ index 0000000..d306deb
 +	HandlerType: (*any)(nil),
 +	Methods: []grpc.MethodDesc{pqMethod("EVMCall", (*EVMD).evmCall), pqMethod("QuantumLock", (*EVMD).quantumLock),
 +		pqMethod("PQVoteKey", (*EVMD).pqVoteKey), pqMethod("PQCertificate", (*EVMD).pqCertificateMsg),
-+		pqMethod("SetPQEvidence", (*EVMD).pqSetEvidence)},
++		pqMethod("SetPQEvidence", (*EVMD).pqSetEvidence),
++		pqMethod("SetQDay", (*EVMD).setQDay), pqMethod("QDayCommit", (*EVMD).qdayCommit), pqMethod("QDayReveal", (*EVMD).qdayReveal),
++		pqMethod("SetThreatGate", (*EVMD).setThreatGate), pqMethod("SetIBCHold", (*EVMD).setIBCHold),
++		pqMethod("SetIBCHoldRule", (*EVMD).setIBCHoldRule), pqMethod("IBCHoldCancel", (*EVMD).ibcHoldCancelMsg)},
 +	Metadata: pqCallFile,
 +}
 +
@@ -1639,6 +2237,12 @@ index 0000000..d306deb
 +		}
 +		t := common.HexToAddress(m.To)
 +		to = &t
++	}
++	// ZETAPHY threat gate (zetaphy_threatgate.go); governance's own calls are not checked.
++	if to != nil && !isGovAddr(m.Sender) {
++		if err := app.threatCheck(ctx, common.BytesToAddress(from), *to); err != nil {
++			return nil, err
++		}
 +	}
 +	value := new(big.Int)
 +	if m.Value != "" {
@@ -1684,7 +2288,8 @@ index 0000000..d306deb
 +
 +// registerEVMCall wires the messages into the app (codec and message router).
 +func (app *EVMD) registerEVMCall() {
-+	app.interfaceRegistry.RegisterImplementations((*sdk.Msg)(nil), &MsgEVMCall{}, &MsgQuantumLock{}, &MsgPQVoteKey{}, &MsgPQCertificate{}, &MsgSetPQEvidence{})
++	app.interfaceRegistry.RegisterImplementations((*sdk.Msg)(nil), &MsgEVMCall{}, &MsgQuantumLock{}, &MsgPQVoteKey{}, &MsgPQCertificate{}, &MsgSetPQEvidence{},
++		&MsgSetQDay{}, &MsgQDayCommit{}, &MsgQDayReveal{}, &MsgSetThreatGate{}, &MsgSetIBCHold{}, &MsgSetIBCHoldRule{}, &MsgIBCHoldCancel{})
 +	msgservice.RegisterMsgServiceDesc(app.interfaceRegistry, &pqCallServiceDesc)
 +	app.MsgServiceRouter().RegisterService(&pqCallServiceDesc, app)
 +}
@@ -2077,10 +2682,10 @@ index 0000000..78fa31b
 +}
 diff --git a/evmd/zetaphy_pqguard.go b/evmd/zetaphy_pqguard.go
 new file mode 100644
-index 0000000..d64d23d
+index 0000000..d8ceb6b
 --- /dev/null
 +++ b/evmd/zetaphy_pqguard.go
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,479 @@
 +package evmd
 +
 +// ZETAPHY post-quantum guards.
@@ -2189,26 +2794,33 @@ index 0000000..d64d23d
 +	} else if cur != nil && !bytes.Equal(cur, signer) {
 +		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only the current controller can hand control over")
 +	}
++	if err := app.checkPQController(ctx, owner, ctrl); err != nil {
++		return nil, err
++	}
++	app.applyQuantumLock(ctx, owner, ctrl)
++	return &MsgPQResponse{}, nil
++}
++
++// checkPQController: the controller must be another ML-DSA-44 account that
++// has already sent a tx (its key is on chain) and is not locked itself.
++func (app *EVMD) checkPQController(ctx sdk.Context, owner, ctrl sdk.AccAddress) error {
 +	isPQ := false
 +	if acc := app.AccountKeeper.GetAccount(ctx, ctrl); acc != nil {
 +		_, isPQ = acc.GetPubKey().(*mldsa44.PubKey)
 +	}
 +	if !isPQ || ctrl.Equals(owner) || app.pqController(ctx, ctrl) != nil {
-+		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "the controller must be another ML-DSA-44 account that has already sent a transaction")
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "the controller must be another ML-DSA-44 account that has already sent a transaction")
 +	}
++	return nil
++}
++
++// applyQuantumLock records owner -> controller, in the zetaphypq store and
++// mirrored into EVM storage for ecrecover and the mempool.
++func (app *EVMD) applyQuantumLock(ctx sdk.Context, owner, ctrl sdk.AccAddress) {
 +	ctx.KVStore(app.GetKey(pqStoreKey)).Set(pqLockKey(owner), ctrl)
-+	// Mirror into EVM storage for ecrecover; the account gets nonce 1 so the
-+	// EVM never drops it as empty.
-+	if app.AccountKeeper.GetAccount(ctx, PQLockAddress.Bytes()) == nil {
-+		acc := app.AccountKeeper.NewAccountWithAddress(ctx, PQLockAddress.Bytes())
-+		if err := acc.SetSequence(1); err != nil {
-+			return nil, err
-+		}
-+		app.AccountKeeper.SetAccount(ctx, acc)
-+	}
++	app.ensurePQLockAccount(ctx)
 +	app.EVMKeeper.SetState(ctx, PQLockAddress, common.BytesToHash(owner), common.BytesToHash(ctrl).Bytes())
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_quantum_lock", sdk.NewAttribute("owner", owner.String()), sdk.NewAttribute("controller", ctrl.String())))
-+	return &MsgPQResponse{}, nil
 +}
 +
 +// PQLockAddress: an EVM tx (MetaMask) to this address with no value and the
@@ -2254,6 +2866,15 @@ index 0000000..d64d23d
 +			if app.pqController(ctx, s) != nil {
 +				return newCtx, errorsmod.Wrapf(errortypes.ErrUnauthorized, "%s is quantum-locked: only its ML-DSA-44 controller can act for it", sdk.AccAddress(s))
 +			}
++		}
++		// ZETAPHY security core (zetaphy_security.go): Q-day, then the threat gate.
++		if app.qdayActive(ctx) {
++			if err := app.qdayCheckTx(ctx, tx); err != nil {
++				return newCtx, err
++			}
++		}
++		if err := app.threatGateTx(ctx, tx); err != nil {
++			return newCtx, err
 +		}
 +		return newCtx, nil
 +	}
@@ -2518,6 +3139,9 @@ index 0000000..d64d23d
 +		if k[0] == pqActivationKey[0] && app.zetaphyV2(ctx, ctx.BlockHeight()+1) {
 +			v = binary.BigEndian.AppendUint64(nil, 1) // already on: on from the new chain's start
 +		}
++		if k[0] == secV3Key[0] && app.secV3Height(ctx) > 0 && app.secV3Height(ctx) <= ctx.BlockHeight()+1 {
++			v = binary.BigEndian.AppendUint64(nil, 1)
++		}
 +		if k[0] == 2 { // vote keys: the current key only, valid from the new chain's start
 +			cur := app.pqVoteKeyAt(ctx, k[1:], ctx.BlockHeight()+1)
 +			if cur == nil {
@@ -2538,6 +3162,315 @@ index 0000000..d64d23d
 +	st := ctx.KVStore(app.GetKey(pqStoreKey))
 +	for _, e := range in {
 +		st.Set(e[0], e[1])
++	}
++	return nil
++}
+diff --git a/evmd/zetaphy_qday.go b/evmd/zetaphy_qday.go
+new file mode 100644
+index 0000000..bb88122
+--- /dev/null
++++ b/evmd/zetaphy_qday.go
+@@ -0,0 +1,303 @@
++package evmd
++
++// ZETAPHY Q-day: the day ECDSA (secp256k1) stops being trusted.
++//
++// Governance schedules it (MsgSetQDay, height 0 = not scheduled). Before it
++// nothing changes. From that block on:
++//   - a Cosmos tx is accepted only if every signer's key is ML-DSA-44 (or a
++//     multisig made only of ML-DSA-44 keys);
++//   - an Ethereum tx (always ECDSA) is refused, in blocks and at submission;
++//   - ecrecover returns nothing, so contract-checked ECDSA signatures
++//     (permits, meta-transactions) prove nothing any more.
++// A migrated account (quantum lock: an ML-DSA-44 controller acts for it with
++// MsgEVMCall.as_owner, including the staking, distribution and slashing
++// precompiles for a validator operator) keeps its address, balance and
++// contract roles. An account that did not migrate before Q-day is frozen:
++// its funds stay where they are, and governance may later add a recovery
++// method. Authorizations it gave before Q-day (ERC-20 allowances, authz and
++// fee grants) keep working: they were given with a then-trusted key.
++//
++// Recovery for keys never shown on chain (no tx sent, no signature seen by
++// ecrecover): their address is a hash of the public key, which only the
++// owner knows. Two steps, both signed by the new ML-DSA-44 account:
++//  1. MsgQDayCommit: sha256 of (chain id, the ECDSA public key, the new
++//     controller, a 32-byte salt) — reveals nothing;
++//  2. after reveal_delay blocks, MsgQDayReveal: the salt and an EIP-191
++//     signature by the old key over qdayRevealText. The chain recovers the
++//     public key, checks it opens the commitment, and records the migration
++//     as pending; it becomes a quantum lock reveal_delay blocks later.
++// The reveal shows the public key. A commitment made after seeing it is too
++// young to be revealed, and while a migration is pending, a reveal opening an
++// older commitment for the same account replaces it: the oldest commitment
++// wins.
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"fmt"
++	"math/big"
++
++	gogoproto "github.com/cosmos/gogoproto/proto"
++	"github.com/ethereum/go-ethereum/accounts"
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/crypto"
++
++	errorsmod "cosmossdk.io/errors"
++
++	"github.com/cosmos/cosmos-sdk/crypto/keys/multisig"
++	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
++	"github.com/cosmos/cosmos-sdk/x/authz"
++
++	"github.com/cosmos/evm/crypto/mldsa44"
++	evmtypes "github.com/cosmos/evm/x/vm/types"
++)
++
++const (
++	// QDayDefaultRevealDelay: blocks between commit and reveal, and between
++	// reveal and the lock (about an hour at 5 s blocks), unless governance sets one.
++	QDayDefaultRevealDelay = 720
++	QDayMinRevealDelay     = 2
++	QDayMaxRevealDelay     = 1_000_000
++	qdayFinalizePerBlock   = 50
++	qdayCommitDomain       = "zetaphy/qday-commit\x00"
++)
++
++// ErrQDay is the error of every Q-day refusal (codespace "zetaphy", code 20).
++var ErrQDay = errorsmod.Register("zetaphy", 20, "Q-day")
++
++func (app *EVMD) qdayParams(ctx sdk.Context) (height, delay int64) {
++	v := app.secRaw(ctx).Get(qdayKey)
++	height, delay = int64(readU64(v)), QDayDefaultRevealDelay // #nosec G115 -- block heights
++	if len(v) == 16 && readU64(v[8:]) > 0 {
++		delay = int64(readU64(v[8:])) // #nosec G115 -- bounded by QDayMaxRevealDelay
++	}
++	return height, delay
++}
++
++// qdayActive: this block is at or after Q-day.
++func (app *EVMD) qdayActive(ctx sdk.Context) bool {
++	h, _ := app.qdayParams(ctx)
++	return h > 0 && ctx.BlockHeight() >= h
++}
++
++func (app *EVMD) setQDay(ctx sdk.Context, m *MsgSetQDay) (gogoproto.Message, error) {
++	if m.Authority != govAuthority() {
++		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only governance can schedule Q-day")
++	}
++	if m.Height != 0 && int64(m.Height) <= ctx.BlockHeight() { // #nosec G115 -- compared, not stored
++		return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest, "Q-day must be a future block (now %d), or 0 to unschedule it", ctx.BlockHeight())
++	}
++	delay := m.RevealDelay
++	if delay == 0 {
++		delay = QDayDefaultRevealDelay
++	}
++	if delay < QDayMinRevealDelay || delay > QDayMaxRevealDelay {
++		return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest, "reveal_delay: %d to %d blocks", QDayMinRevealDelay, QDayMaxRevealDelay)
++	}
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(qdayKey, append(u64(m.Height), u64(delay)...))
++	app.setPQLockSlot(ctx, evmtypes.QDaySlot, m.Height)
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_qday", sdk.NewAttribute("height", fmt.Sprint(m.Height)), sdk.NewAttribute("reveal_delay", fmt.Sprint(delay))))
++	return &MsgPQResponse{}, nil
++}
++
++// QDayRevealText is what the old key signs (EIP-191 personal_sign) to move
++// its account to an ML-DSA-44 controller.
++func QDayRevealText(chainID string, owner, controller common.Address) string {
++	return "ZETAPHY Q-day migration\nChain: " + chainID + "\nAccount: " + owner.Hex() +
++		"\nNew ML-DSA-44 controller: " + controller.Hex() + "\nSign this only in the ZETAPHY wallet."
++}
++
++// QDayCommitment is sha256(domain || chain id || 0 || compressed secp256k1
++// public key (33) || controller (20) || salt (32)).
++func QDayCommitment(chainID string, pub33 []byte, controller common.Address, salt []byte) []byte {
++	h := sha256.New()
++	h.Write([]byte(qdayCommitDomain + chainID + "\x00"))
++	h.Write(pub33)
++	h.Write(controller.Bytes())
++	h.Write(salt)
++	return h.Sum(nil)
++}
++
++func qdayCommitKey(c []byte) []byte  { return append([]byte{qdayCommitPfx}, c...) }
++func qdayPendingKey(o []byte) []byte { return append([]byte{qdayPendingPfx}, o...) }
++func qdayQueueKey(final int64, owner []byte) []byte {
++	return append(append([]byte{qdayQueuePfx}, u64(uint64(final))...), owner...) // #nosec G115 -- block heights
++}
++
++func (app *EVMD) qdayCommit(ctx sdk.Context, m *MsgQDayCommit) (gogoproto.Message, error) {
++	if !app.secV3(ctx) {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "the security core is not active on this chain yet")
++	}
++	if len(m.Commitment) != 32 {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "commitment: 32 bytes (sha256)")
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if st.Has(qdayCommitKey(m.Commitment)) {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "this commitment is already recorded")
++	}
++	st.Set(qdayCommitKey(m.Commitment), u64(uint64(ctx.BlockHeight()))) // #nosec G115 -- block heights
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_qday_commit", sdk.NewAttribute("commitment", fmt.Sprintf("%x", m.Commitment)), sdk.NewAttribute("height", fmt.Sprint(ctx.BlockHeight()))))
++	return &MsgPQResponse{}, nil
++}
++
++// qdayPending: commit height, final height (when it becomes a lock), controller of a pending migration.
++func (app *EVMD) qdayPending(ctx sdk.Context, owner []byte) (commitH, finalH int64, ctrl []byte, ok bool) {
++	v := ctx.KVStore(app.GetKey(pqStoreKey)).Get(qdayPendingKey(owner))
++	if len(v) != 36 {
++		return 0, 0, nil, false
++	}
++	return int64(readU64(v)), int64(readU64(v[8:])), v[16:], true // #nosec G115 -- block heights
++}
++
++// qdayExposed: the account's ECDSA public key has been seen on chain (it
++// signed a Cosmos or EVM tx, or a signature ecrecover checked).
++func (app *EVMD) qdayExposed(ctx sdk.Context, owner sdk.AccAddress) bool {
++	if acc := app.AccountKeeper.GetAccount(ctx, owner); acc != nil && (acc.GetPubKey() != nil || acc.GetSequence() > 0) {
++		return true
++	}
++	return app.EVMKeeper.GetState(ctx, PQLockAddress, evmtypes.ExposedSlot(common.BytesToAddress(owner))) != (common.Hash{})
++}
++
++func (app *EVMD) qdayReveal(ctx sdk.Context, m *MsgQDayReveal) (gogoproto.Message, error) {
++	if !app.qdayActive(ctx) {
++		return nil, errorsmod.Wrap(ErrQDay, "the commit–reveal migration opens at Q-day; before it, quantum-lock the account from its own wallet")
++	}
++	_, delay := app.qdayParams(ctx)
++	owner, err := pqAddr(m.Owner)
++	if err != nil {
++		return nil, err
++	}
++	ctrl, err := pqAddr(m.Controller)
++	if err != nil {
++		return nil, err
++	}
++	if len(m.Salt) != 32 || len(m.Signature) != 65 {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "salt: 32 bytes; signature: 65 bytes (r, s, v)")
++	}
++	sig := bytes.Clone(m.Signature)
++	if sig[64] >= 27 {
++		sig[64] -= 27
++	}
++	r, s := new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:64])
++	if sig[64] > 1 || !crypto.ValidateSignatureValues(sig[64], r, s, true) {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "signature: not a valid secp256k1 signature")
++	}
++	ownerHex, ctrlHex := common.BytesToAddress(owner), common.BytesToAddress(ctrl)
++	pub, err := crypto.SigToPub(accounts.TextHash([]byte(QDayRevealText(ctx.ChainID(), ownerHex, ctrlHex))), sig)
++	if err != nil || crypto.PubkeyToAddress(*pub) != ownerHex {
++		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "signature: not made by the owner's key over the migration text")
++	}
++	if app.pqController(ctx, owner) != nil {
++		return nil, errorsmod.Wrap(ErrQDay, "this account is migrated already")
++	}
++	if acc := app.AccountKeeper.GetAccount(ctx, owner); acc != nil {
++		if _, ok := acc.GetPubKey().(*mldsa44.PubKey); ok {
++			return nil, errorsmod.Wrap(ErrQDay, "an ML-DSA-44 account is post-quantum already")
++		}
++	}
++	if err := app.checkPQController(ctx, owner, ctrl); err != nil {
++		return nil, err
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	ck := qdayCommitKey(QDayCommitment(ctx.ChainID(), crypto.CompressPubkey(pub), ctrlHex, m.Salt))
++	cv := st.Get(ck)
++	if len(cv) != 8 {
++		return nil, errorsmod.Wrap(ErrQDay, "no commitment matches this reveal (commit first, from the new account)")
++	}
++	commitH := int64(readU64(cv)) // #nosec G115 -- block heights
++	if commitH+delay > ctx.BlockHeight() {
++		return nil, errorsmod.Wrapf(ErrQDay, "the commitment is too recent: reveal from block %d", commitH+delay)
++	}
++	if pc, _, _, ok := app.qdayPending(ctx, owner); ok {
++		if commitH >= pc {
++			return nil, errorsmod.Wrap(ErrQDay, "a migration of this account from an older commitment is pending")
++		}
++	} else if app.qdayExposed(ctx, owner) {
++		return nil, errorsmod.Wrap(ErrQDay, "this account's public key was used on chain before Q-day, so it cannot migrate by commit–reveal; it stays frozen unless governance decides otherwise")
++	}
++	st.Delete(ck)
++	final := ctx.BlockHeight() + delay
++	st.Set(qdayPendingKey(owner), append(append(u64(uint64(commitH)), u64(uint64(final))...), ctrl...)) // #nosec G115 -- block heights
++	st.Set(qdayQueueKey(final, owner), []byte{})
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_qday_reveal", sdk.NewAttribute("owner", owner.String()),
++		sdk.NewAttribute("controller", ctrl.String()), sdk.NewAttribute("commit_height", fmt.Sprint(commitH)), sdk.NewAttribute("final_height", fmt.Sprint(final))))
++	return &MsgPQResponse{}, nil
++}
++
++// qdayFinalize turns pending migrations whose contest window is over into
++// quantum locks.
++func (app *EVMD) qdayFinalize(ctx sdk.Context) {
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	it := st.Iterator([]byte{qdayQueuePfx}, qdayQueueKey(ctx.BlockHeight()+1, nil))
++	var done [][]byte
++	for ; it.Valid() && len(done) < qdayFinalizePerBlock; it.Next() {
++		done = append(done, bytes.Clone(it.Key()))
++	}
++	_ = it.Close()
++	for _, k := range done {
++		st.Delete(k)
++		owner := k[9:]
++		_, finalH, ctrl, ok := app.qdayPending(ctx, owner)
++		if !ok || finalH != int64(readU64(k[1:9])) { // #nosec G115 -- block heights
++			continue // replaced by a reveal from an older commitment: its own entry finalizes it
++		}
++		st.Delete(qdayPendingKey(owner))
++		if app.pqController(ctx, owner) == nil {
++			app.applyQuantumLock(ctx, owner, ctrl)
++			ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_qday_migrated", sdk.NewAttribute("owner", sdk.AccAddress(owner).String()), sdk.NewAttribute("controller", sdk.AccAddress(ctrl).String())))
++		}
++	}
++}
++
++// pqIsPQKey: an ML-DSA-44 key, or a multisig of ML-DSA-44 keys only.
++func pqIsPQKey(pk cryptotypes.PubKey) bool {
++	switch k := pk.(type) {
++	case *mldsa44.PubKey:
++		return true
++	case *multisig.LegacyAminoPubKey:
++		for _, sub := range k.GetPubKeys() {
++			if !pqIsPQKey(sub) {
++				return false
++			}
++		}
++		return len(k.GetPubKeys()) > 0
++	}
++	return false
++}
++
++// qdayCheckTx is the Q-day rule in the ante handler (after the normal
++// checks, so every signer's public key is on its account).
++func (app *EVMD) qdayCheckTx(ctx sdk.Context, tx sdk.Tx) error {
++	q, _ := app.qdayParams(ctx)
++	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
++	for i := 0; i < len(msgs); i++ {
++		switch m := msgs[i].(type) {
++		case *evmtypes.MsgEthereumTx:
++			return errorsmod.Wrapf(ErrQDay, "Q-day (block %d) has passed: Ethereum transactions are signed with ECDSA and are no longer accepted; a migrated account acts through its ML-DSA-44 controller (MsgEVMCall as_owner)", q)
++		case *authz.MsgExec:
++			inner, err := m.GetMessages()
++			if err != nil {
++				return err
++			}
++			msgs = append(msgs, inner...)
++		}
++	}
++	st, ok := tx.(authsigning.SigVerifiableTx)
++	if !ok {
++		return nil
++	}
++	signers, err := st.GetSigners()
++	if err != nil {
++		return err
++	}
++	for _, s := range signers {
++		acc := app.AccountKeeper.GetAccount(ctx, s)
++		if acc == nil || !pqIsPQKey(acc.GetPubKey()) {
++			return errorsmod.Wrapf(ErrQDay, "Q-day (block %d) has passed: %s signs with an ECDSA key, which is no longer accepted. A migrated account acts through its ML-DSA-44 controller; an account whose key was never used on chain can still migrate by commit–reveal; others stay frozen", q, sdk.AccAddress(s))
++		}
 +	}
 +	return nil
 +}
@@ -2686,10 +3619,10 @@ index 0000000..81a5fff
 +}
 diff --git a/evmd/zetaphy_rpc.go b/evmd/zetaphy_rpc.go
 new file mode 100644
-index 0000000..7dfa1b1
+index 0000000..161572e
 --- /dev/null
 +++ b/evmd/zetaphy_rpc.go
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,482 @@
 +package evmd
 +
 +// ZETAPHY JSON-RPC namespace "zetaphy" on the public EVM endpoint (8545),
@@ -2699,6 +3632,8 @@ index 0000000..7dfa1b1
 +//	zetaphy_pqAccount(address)  account number and sequence to sign with
 +//	zetaphy_sendCosmosTx(0x…)   broadcast a signed Cosmos tx (CheckTx only)
 +//	zetaphy_faucet(address)     testnet only: a little ZETAPHY for newcomers
++//	zetaphy_securityStatus, zetaphy_migration, zetaphy_qdayCommitment,
++//	zetaphy_consent, zetaphy_ibcHolds: the security core (end of this file)
 +//
 +// The first two hold no keys: like eth_sendRawTransaction, sendCosmosTx only
 +// passes on bytes the user already signed. The faucet signs with its own key
@@ -2707,6 +3642,7 @@ index 0000000..7dfa1b1
 +import (
 +	"context"
 +	"crypto/ecdsa"
++	"encoding/json"
 +	"fmt"
 +	"math/big"
 +	"os"
@@ -2715,6 +3651,8 @@ index 0000000..7dfa1b1
 +	"sync"
 +	"time"
 +
++	abci "github.com/cometbft/cometbft/abci/types"
++	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
 +	"github.com/ethereum/go-ethereum/common"
 +	"github.com/ethereum/go-ethereum/common/hexutil"
 +	ethtypes "github.com/ethereum/go-ethereum/core/types"
@@ -2722,6 +3660,7 @@ index 0000000..7dfa1b1
 +	gethrpc "github.com/ethereum/go-ethereum/rpc"
 +	"google.golang.org/grpc/codes"
 +	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/encoding/protowire"
 +
 +	evmrpc "github.com/cosmos/evm/rpc"
 +	"github.com/cosmos/evm/rpc/backend"
@@ -2951,12 +3890,940 @@ index 0000000..7dfa1b1
 +}
 +
 +func ptr[T any](v T) *T { return &v }
++
++// ---- security core (zetaphy_security.go) ---------------------------------
++//
++//	zetaphy_securityStatus()             Q-day, threat gate, IBC hold settings
++//	zetaphy_migration(address)           is the account migrated / pending / exposed
++//	zetaphy_qdayCommitment(0x…32 bytes)  the block a commitment was recorded in
++//	zetaphy_consent(account, target)     until when account consented to target
++//	zetaphy_ibcHolds()                   the inbound IBC transfers waiting
++
++func (a *ZetaphyAPI) secGet(key []byte) []byte {
++	v, _, err := a.clientCtx.QueryStore(key, pqStoreKey)
++	if err != nil {
++		return nil
++	}
++	return v
++}
++
++type secPair struct{ Key, Value []byte }
++
++// secPairs: a store "subspace" query (kv.Pairs: repeated Pair{key = 1, value = 2}).
++func (a *ZetaphyAPI) secPairs(prefix []byte) []secPair {
++	res, err := a.clientCtx.QueryABCI(abci.RequestQuery{Path: "/store/" + pqStoreKey + "/subspace", Data: prefix})
++	if err != nil {
++		return nil
++	}
++	var out []secPair
++	b := res.Value
++	for len(b) > 0 {
++		num, typ, n := protowire.ConsumeTag(b)
++		if n < 0 || num != 1 || typ != protowire.BytesType {
++			return out
++		}
++		pair, m := protowire.ConsumeBytes(b[n:])
++		if m < 0 {
++			return out
++		}
++		b = b[n+m:]
++		var p secPair
++		for len(pair) > 0 {
++			f, t, k := protowire.ConsumeTag(pair)
++			if k < 0 || t != protowire.BytesType {
++				break
++			}
++			v, l := protowire.ConsumeBytes(pair[k:])
++			if l < 0 {
++				break
++			}
++			if f == 1 {
++				p.Key = v
++			} else if f == 2 {
++				p.Value = v
++			}
++			pair = pair[k+l:]
++		}
++		out = append(out, p)
++	}
++	return out
++}
++
++type SecurityStatus struct {
++	SecurityCoreFrom   uint64        `json:"securityCoreFrom"`
++	SecurityPrecompile string        `json:"securityPrecompile"`
++	QDayHeight         uint64        `json:"qdayHeight"`
++	RevealDelay        uint64        `json:"revealDelay"`
++	LatestHeight       uint64        `json:"latestHeight"`
++	QDayActive         bool          `json:"qdayActive"`
++	ThreatRegistry     string        `json:"threatRegistry"`
++	ThreatGateOn       bool          `json:"threatGateEnabled"`
++	MaxConsentSeconds  uint64        `json:"maxConsentSeconds"`
++	IBCHoldDelay       uint64        `json:"ibcHoldDelaySeconds"`
++	IBCHoldGuardian    string        `json:"ibcHoldGuardian"`
++	IBCHoldRules       []IBCHoldRule `json:"ibcHoldRules"`
++}
++
++type IBCHoldRule struct {
++	Denom     string `json:"denom"`
++	MinAmount string `json:"minAmount"`
++	SupplyBps uint64 `json:"supplyBps"`
++}
++
++// SecurityStatus (zetaphy_securityStatus).
++func (a *ZetaphyAPI) SecurityStatus(ctx context.Context) (*SecurityStatus, error) {
++	out := &SecurityStatus{SecurityPrecompile: SecurityPrecompileAddress.Hex(), MaxConsentSeconds: MaxConsentSeconds,
++		RevealDelay: QDayDefaultRevealDelay, IBCHoldDelay: IBCHoldDefaultDelay, IBCHoldRules: []IBCHoldRule{}}
++	out.SecurityCoreFrom = readU64(a.secGet(secV3Key))
++	if q := a.secGet(qdayKey); len(q) == 16 {
++		out.QDayHeight = readU64(q)
++		if d := readU64(q[8:]); d > 0 {
++			out.RevealDelay = d
++		}
++	}
++	if n, err := a.backend.BlockNumber(ctx); err == nil {
++		out.LatestHeight = uint64(n)
++	}
++	out.QDayActive = out.QDayHeight > 0 && out.LatestHeight+1 >= out.QDayHeight
++	if g := a.secGet(gateKey); len(g) == 21 {
++		out.ThreatRegistry = common.BytesToAddress(g[:20]).Hex()
++		out.ThreatGateOn = g[20] == 1
++	}
++	if h := a.secGet(holdParamsKey); len(h) >= 8 {
++		out.IBCHoldDelay = readU64(h)
++		if len(h) == 28 {
++			out.IBCHoldGuardian = sdk.AccAddress(h[8:]).String()
++		}
++	}
++	for _, p := range a.secPairs([]byte{holdRulePfx}) {
++		if len(p.Key) > 1 && len(p.Value) >= 8 {
++			min := string(p.Value[8:])
++			if min == "" {
++				min = "0"
++			}
++			out.IBCHoldRules = append(out.IBCHoldRules, IBCHoldRule{Denom: string(p.Key[1:]), MinAmount: min, SupplyBps: readU64(p.Value)})
++		}
++	}
++	return out, nil
++}
++
++type Migration struct {
++	Address           string  `json:"address"`
++	Hex               string  `json:"hex"`
++	Migrated          bool    `json:"migrated"`
++	Controller        *string `json:"controller"`
++	PendingController *string `json:"pendingController"`
++	PendingCommit     uint64  `json:"pendingCommitHeight"`
++	PendingFinal      uint64  `json:"pendingFinalHeight"`
++	PostQuantum       bool    `json:"postQuantum"`
++	PubKeyType        *string `json:"pubKeyType"`
++	Exposed           bool    `json:"exposed"`
++	CanCommitReveal   bool    `json:"canCommitReveal"`
++}
++
++// Migration (zetaphy_migration): where an account stands for Q-day.
++func (a *ZetaphyAPI) Migration(ctx context.Context, address string) (*Migration, error) {
++	acc, err := a.PqAccount(ctx, address)
++	if err != nil {
++		return nil, err
++	}
++	addr := common.HexToAddress(acc.Hex)
++	out := &Migration{Address: acc.Address, Hex: acc.Hex, PubKeyType: acc.PubKeyType, Controller: acc.LockedTo, Migrated: acc.LockedTo != nil}
++	out.PostQuantum = acc.PubKeyType != nil && *acc.PubKeyType == "mldsa44"
++	if p := a.secGet(qdayPendingKey(addr.Bytes())); len(p) == 36 {
++		c := sdk.AccAddress(p[16:]).String()
++		out.PendingController, out.PendingCommit, out.PendingFinal = &c, readU64(p), readU64(p[8:])
++	}
++	out.Exposed = acc.PubKeyType != nil || (acc.Sequence != nil && *acc.Sequence != "0")
++	if !out.Exposed {
++		if v, err := a.backend.GetStorageAt(ctx, PQLockAddress, evmtypes.ExposedSlot(addr).Hex(), rpctypes.BlockNumberOrHash{BlockNumber: ptr(rpctypes.EthLatestBlockNumber)}); err == nil {
++			out.Exposed = common.BytesToHash(v) != (common.Hash{})
++		}
++	}
++	out.CanCommitReveal = !out.Migrated && !out.PostQuantum && (!out.Exposed || out.PendingController != nil)
++	return out, nil
++}
++
++type QDayCommitmentInfo struct {
++	Found  bool   `json:"found"`
++	Height uint64 `json:"height"`
++}
++
++// QdayCommitment (zetaphy_qdayCommitment).
++func (a *ZetaphyAPI) QdayCommitment(c hexutil.Bytes) (*QDayCommitmentInfo, error) {
++	if len(c) != 32 {
++		return nil, fmt.Errorf("a commitment is 32 bytes")
++	}
++	v := a.secGet(qdayCommitKey(c))
++	return &QDayCommitmentInfo{Found: len(v) == 8, Height: readU64(v)}, nil
++}
++
++type ConsentInfo struct {
++	Until uint64 `json:"until"`
++}
++
++// Consent (zetaphy_consent): until when (unix seconds) account consented to target.
++func (a *ZetaphyAPI) Consent(account, target string) (*ConsentInfo, error) {
++	acc, err := parseAccount(account)
++	if err != nil {
++		return nil, err
++	}
++	if !common.IsHexAddress(target) {
++		return nil, fmt.Errorf("target: a 0x address")
++	}
++	return &ConsentInfo{Until: readU64(a.secGet(consentKey(common.BytesToAddress(acc), common.HexToAddress(target))))}, nil
++}
++
++type IBCHoldInfo struct {
++	ID        uint64 `json:"id"`
++	Channel   string `json:"channel"`
++	Sequence  uint64 `json:"sequence"`
++	Denom     string `json:"denom"`
++	Amount    string `json:"amount"`
++	Sender    string `json:"sender"`
++	Receiver  string `json:"receiver"`
++	HeldAt    int64  `json:"heldAt"`
++	ReleaseAt int64  `json:"releaseAt"`
++	Stuck     string `json:"stuck,omitempty"`
++}
++
++// IbcHolds (zetaphy_ibcHolds): the inbound IBC transfers waiting (at most 200).
++func (a *ZetaphyAPI) IbcHolds() ([]IBCHoldInfo, error) {
++	out := []IBCHoldInfo{}
++	for _, p := range a.secPairs([]byte{holdPfx}) {
++		var h ibcHold
++		if json.Unmarshal(p.Value, &h) != nil {
++			continue
++		}
++		var pk channeltypes.Packet
++		_ = pk.Unmarshal(h.Packet)
++		out = append(out, IBCHoldInfo{ID: h.ID, Channel: h.Channel, Sequence: pk.Sequence, Denom: h.Denom, Amount: h.Amount,
++			Sender: h.Sender, Receiver: h.Receiver, HeldAt: h.HeldAt, ReleaseAt: h.ReleaseAt, Stuck: h.Stuck})
++		if len(out) == 200 {
++			break
++		}
++	}
++	return out, nil
++}
+diff --git a/evmd/zetaphy_seccli.go b/evmd/zetaphy_seccli.go
+new file mode 100644
+index 0000000..e5297ea
+--- /dev/null
++++ b/evmd/zetaphy_seccli.go
+@@ -0,0 +1,172 @@
++package evmd
++
++// zetaphyd commands for the security core (gov.sh wraps the proposals):
++//
++//	tx security-proposal qday <height> [reveal-delay-blocks]
++//	tx security-proposal threat-gate <ThreatRegistry 0x…> on|off
++//	tx security-proposal ibc-hold <delay-seconds> [guardian]
++//	tx security-proposal ibc-hold-rule <denom|*> <min-amount> <supply-bps>
++//	tx qday-commit <commitment hex>
++//	tx qday-reveal <owner> <controller> <salt hex> <signature hex>
++//	tx ibc-hold-cancel <id>
++
++import (
++	"encoding/hex"
++	"fmt"
++	"strconv"
++	"strings"
++
++	"github.com/spf13/cobra"
++
++	"github.com/cosmos/cosmos-sdk/client"
++	"github.com/cosmos/cosmos-sdk/client/flags"
++	"github.com/cosmos/cosmos-sdk/client/tx"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	govv1 "github.com/cosmos/cosmos-sdk/x/gov/types/v1"
++)
++
++func secTxCmd(use, short string, args int, build func(from string, args []string) (sdk.Msg, error)) *cobra.Command {
++	cmd := &cobra.Command{
++		Use: use, Short: short, Args: cobra.ExactArgs(args),
++		RunE: func(cmd *cobra.Command, args []string) error {
++			cctx, err := client.GetClientTxContext(cmd)
++			if err != nil {
++				return err
++			}
++			m, err := build(cctx.GetFromAddress().String(), args)
++			if err != nil {
++				return err
++			}
++			return tx.GenerateOrBroadcastTxCLI(cctx, cmd.Flags(), m)
++		},
++	}
++	flags.AddTxFlagsToCmd(cmd)
++	return cmd
++}
++
++func secHex(s string) ([]byte, error) { return hex.DecodeString(strings.TrimPrefix(s, "0x")) }
++
++// QDayCommitCmd: zetaphyd tx qday-commit <commitment> --from <ML-DSA account>.
++func QDayCommitCmd() *cobra.Command {
++	return secTxCmd("qday-commit <commitment hex>", "Record a Q-day migration commitment (step 1 of the commit–reveal migration)", 1,
++		func(from string, a []string) (sdk.Msg, error) {
++			c, err := secHex(a[0])
++			return &MsgQDayCommit{Signer: from, Commitment: c}, err
++		})
++}
++
++// QDayRevealCmd: zetaphyd tx qday-reveal <owner> <controller> <salt> <signature> --from <ML-DSA account>.
++func QDayRevealCmd() *cobra.Command {
++	return secTxCmd("qday-reveal <owner> <controller> <salt hex> <signature hex>", "Open a Q-day migration commitment (step 2): the owner moves to the ML-DSA-44 controller", 4,
++		func(from string, a []string) (sdk.Msg, error) {
++			salt, err := secHex(a[2])
++			if err != nil {
++				return nil, err
++			}
++			sig, err := secHex(a[3])
++			return &MsgQDayReveal{Signer: from, Owner: a[0], Controller: a[1], Salt: salt, Signature: sig}, err
++		})
++}
++
++// IBCHoldCancelCmd: zetaphyd tx ibc-hold-cancel <id> --from <guardian>.
++func IBCHoldCancelCmd() *cobra.Command {
++	return secTxCmd("ibc-hold-cancel <id>", "Return a held inbound IBC transfer to its sender (the IBC hold guardian)", 1,
++		func(from string, a []string) (sdk.Msg, error) {
++			id, err := strconv.ParseUint(a[0], 10, 64)
++			return &MsgIBCHoldCancel{Signer: from, Id: id}, err
++		})
++}
++
++func secProposalMsg(args []string) (sdk.Msg, string, error) {
++	gov := govAuthority()
++	num := func(s string) (uint64, error) { return strconv.ParseUint(s, 10, 64) }
++	switch args[0] {
++	case "qday":
++		if len(args) < 2 || len(args) > 3 {
++			return nil, "", fmt.Errorf("qday <height> [reveal-delay-blocks]")
++		}
++		h, err := num(args[1])
++		if err != nil {
++			return nil, "", err
++		}
++		var d uint64
++		if len(args) == 3 {
++			if d, err = num(args[2]); err != nil {
++				return nil, "", err
++			}
++		}
++		title := fmt.Sprintf("Q-day at block %d: ECDSA-signed transactions refused from then on", h)
++		if h == 0 {
++			title = "Unschedule Q-day"
++		}
++		return &MsgSetQDay{Authority: gov, Height: h, RevealDelay: d}, title, nil
++	case "threat-gate":
++		if len(args) != 3 || (args[2] != "on" && args[2] != "off") {
++			return nil, "", fmt.Errorf("threat-gate <ThreatRegistry 0x…> on|off")
++		}
++		on := map[string]uint64{"on": 1, "off": 0}[args[2]]
++		return &MsgSetThreatGate{Authority: gov, Registry: args[1], Enabled: on}, fmt.Sprintf("Threat gate %s (registry %s)", args[2], args[1]), nil
++	case "ibc-hold":
++		if len(args) < 2 || len(args) > 3 {
++			return nil, "", fmt.Errorf("ibc-hold <delay-seconds> [guardian]")
++		}
++		d, err := num(args[1])
++		if err != nil {
++			return nil, "", err
++		}
++		g := ""
++		if len(args) == 3 {
++			g = args[2]
++		}
++		return &MsgSetIBCHold{Authority: gov, DelaySeconds: d, Guardian: g}, fmt.Sprintf("IBC large-transfer hold: %d s, guardian %q", d, g), nil
++	case "ibc-hold-rule":
++		if len(args) != 4 {
++			return nil, "", fmt.Errorf("ibc-hold-rule <denom|*> <min-amount> <supply-bps>")
++		}
++		bps, err := num(args[3])
++		if err != nil {
++			return nil, "", err
++		}
++		min := args[2]
++		if min == "0" {
++			min = ""
++		}
++		return &MsgSetIBCHoldRule{Authority: gov, Denom: args[1], MinAmount: min, SupplyBps: bps}, fmt.Sprintf("IBC hold rule for %s: from %s, or %d bps of supply", args[1], args[2], bps), nil
++	}
++	return nil, "", fmt.Errorf("unknown proposal %q: qday, threat-gate, ibc-hold or ibc-hold-rule", args[0])
++}
++
++// SecurityProposalCmd: zetaphyd tx security-proposal <kind> ... --deposit ... --from <key>.
++func SecurityProposalCmd() *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "security-proposal qday|threat-gate|ibc-hold|ibc-hold-rule <args>",
++		Short: "Propose a ZETAPHY security-core setting (Q-day, threat gate, IBC large-transfer hold)",
++		Args:  cobra.RangeArgs(2, 4),
++		RunE: func(cmd *cobra.Command, args []string) error {
++			cctx, err := client.GetClientTxContext(cmd)
++			if err != nil {
++				return err
++			}
++			m, title, err := secProposalMsg(args)
++			if err != nil {
++				return err
++			}
++			dep, err := cmd.Flags().GetString("deposit")
++			if err != nil {
++				return err
++			}
++			coins, err := sdk.ParseCoinsNormalized(dep)
++			if err != nil {
++				return err
++			}
++			p, err := govv1.NewMsgSubmitProposal([]sdk.Msg{m}, coins, cctx.GetFromAddress().String(), "", title, title, false)
++			if err != nil {
++				return err
++			}
++			return tx.GenerateOrBroadcastTxCLI(cctx, cmd.Flags(), p)
++		},
++	}
++	cmd.Flags().String("deposit", "", "initial deposit, e.g. 1000000000000000000000azetaphy")
++	flags.AddTxFlagsToCmd(cmd)
++	return cmd
++}
+diff --git a/evmd/zetaphy_secprecompile.go b/evmd/zetaphy_secprecompile.go
+new file mode 100644
+index 0000000..13386b1
+--- /dev/null
++++ b/evmd/zetaphy_secprecompile.go
+@@ -0,0 +1,148 @@
++package evmd
++
++// ZETAPHY security precompile at 0x…0901 (always on from the security-core
++// height, whatever the active_static_precompiles param says), so MetaMask
++// and contracts reach the security core without a Cosmos wallet:
++//
++//	consent(address target, uint64 seconds) returns (uint64 until)
++//	    the caller accepts calling `target` although the threat gate would
++//	    refuse it, for `seconds` (at most a day; 0 withdraws). Only an account
++//	    calling directly (msg.sender == tx.origin): a contract cannot consent
++//	    for the person who called it.
++//	consentUntil(address account, address target) view returns (uint64)
++//	threatGate() view returns (address registry, bool enabled)
++//	qday() view returns (uint64 height, uint64 revealDelay, bool active)
++//	migration(address account) view returns (bool migrated, address controller,
++//	    address pendingController, uint64 finalHeight, bool exposed)
++//	cancelIBCHold(uint64 id)
++//	    the IBC hold guardian (a multisig contract, for example) returns a
++//	    held inbound transfer to its sender
++//	event Consent(address indexed account, address indexed target, uint64 until)
++
++import (
++	"bytes"
++	"errors"
++	"fmt"
++
++	"github.com/ethereum/go-ethereum/accounts/abi"
++	"github.com/ethereum/go-ethereum/common"
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++	"github.com/ethereum/go-ethereum/core/vm"
++
++	cmn "github.com/cosmos/evm/precompiles/common"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++)
++
++const securityPrecompileABI = `[
++ {"type":"function","name":"consent","stateMutability":"nonpayable","inputs":[{"name":"target","type":"address"},{"name":"seconds","type":"uint64"}],"outputs":[{"name":"until","type":"uint64"}]},
++ {"type":"function","name":"consentUntil","stateMutability":"view","inputs":[{"name":"account","type":"address"},{"name":"target","type":"address"}],"outputs":[{"name":"until","type":"uint64"}]},
++ {"type":"function","name":"threatGate","stateMutability":"view","inputs":[],"outputs":[{"name":"registry","type":"address"},{"name":"enabled","type":"bool"}]},
++ {"type":"function","name":"qday","stateMutability":"view","inputs":[],"outputs":[{"name":"height","type":"uint64"},{"name":"revealDelay","type":"uint64"},{"name":"active","type":"bool"}]},
++ {"type":"function","name":"migration","stateMutability":"view","inputs":[{"name":"account","type":"address"}],"outputs":[{"name":"migrated","type":"bool"},{"name":"controller","type":"address"},{"name":"pendingController","type":"address"},{"name":"finalHeight","type":"uint64"},{"name":"exposed","type":"bool"}]},
++ {"type":"function","name":"cancelIBCHold","stateMutability":"nonpayable","inputs":[{"name":"id","type":"uint64"}],"outputs":[]},
++ {"type":"event","name":"Consent","anonymous":false,"inputs":[{"name":"account","type":"address","indexed":true},{"name":"target","type":"address","indexed":true},{"name":"until","type":"uint64","indexed":false}]}
++]`
++
++// SecurityABI is the security precompile's ABI.
++var SecurityABI = func() abi.ABI {
++	a, err := abi.JSON(bytes.NewReader([]byte(securityPrecompileABI)))
++	if err != nil {
++		panic(err)
++	}
++	return a
++}()
++
++type securityPrecompile struct {
++	cmn.Precompile
++	app *EVMD
++}
++
++func newSecurityPrecompile(app *EVMD) *securityPrecompile {
++	return &securityPrecompile{Precompile: cmn.Precompile{
++		KvGasConfig: storetypes.KVGasConfig(), TransientKVGasConfig: storetypes.TransientGasConfig(),
++		ContractAddress: SecurityPrecompileAddress,
++	}, app: app}
++}
++
++func (*securityPrecompile) Name() string { return "zetaphy-security" }
++
++func securityIsTx(m *abi.Method) bool { return m.Name == "consent" || m.Name == "cancelIBCHold" }
++
++func (p *securityPrecompile) RequiredGas(input []byte) uint64 {
++	if len(input) < 4 {
++		return 0
++	}
++	m, err := SecurityABI.MethodById(input[:4])
++	if err != nil {
++		return 0
++	}
++	return p.Precompile.RequiredGas(input, securityIsTx(m))
++}
++
++func (p *securityPrecompile) Run(evm *vm.EVM, contract *vm.Contract, readonly bool) ([]byte, error) {
++	return p.RunNativeAction(evm, contract, func(ctx sdk.Context) ([]byte, error) {
++		return p.execute(ctx, evm, contract, readonly)
++	})
++}
++
++func (p *securityPrecompile) execute(ctx sdk.Context, evm *vm.EVM, contract *vm.Contract, readonly bool) ([]byte, error) {
++	method, args, err := cmn.SetupABI(SecurityABI, contract, readonly, securityIsTx)
++	if err != nil {
++		return nil, err
++	}
++	if v := contract.Value(); v != nil && !v.IsZero() {
++		return nil, errors.New("the security precompile takes no value")
++	}
++	app, caller := p.app, contract.Caller()
++	switch method.Name {
++	case "consent":
++		if caller != evm.Origin {
++			return nil, errors.New("consent: only the account itself, calling directly (not through a contract)")
++		}
++		target, seconds := args[0].(common.Address), args[1].(uint64)
++		until, err := app.setConsent(ctx, caller, target, seconds)
++		if err != nil {
++			return nil, err
++		}
++		ev := SecurityABI.Events["Consent"]
++		data, err := ev.Inputs.NonIndexed().Pack(uint64(until)) // #nosec G115 -- unix seconds
++		if err != nil {
++			return nil, err
++		}
++		evm.StateDB.AddLog(&ethtypes.Log{Address: SecurityPrecompileAddress, Data: data, BlockNumber: uint64(ctx.BlockHeight()), // #nosec G115 -- block heights
++			Topics: []common.Hash{ev.ID, common.BytesToHash(caller.Bytes()), common.BytesToHash(target.Bytes())}})
++		ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_consent", sdk.NewAttribute("account", caller.Hex()),
++			sdk.NewAttribute("target", target.Hex()), sdk.NewAttribute("until", fmt.Sprint(until))))
++		return method.Outputs.Pack(uint64(until)) // #nosec G115 -- unix seconds
++	case "consentUntil":
++		return method.Outputs.Pack(uint64(app.consentUntil(ctx, args[0].(common.Address), args[1].(common.Address)))) // #nosec G115 -- unix seconds
++	case "threatGate":
++		reg, on := app.threatGate(ctx)
++		return method.Outputs.Pack(reg, on)
++	case "qday":
++		h, d := app.qdayParams(ctx)
++		return method.Outputs.Pack(uint64(h), uint64(d), app.qdayActive(ctx)) // #nosec G115 -- block heights
++	case "migration":
++		who := args[0].(common.Address)
++		ctrl := app.pqController(ctx, who.Bytes())
++		_, final, pending, _ := app.qdayPending(ctx, who.Bytes())
++		return method.Outputs.Pack(ctrl != nil, common.BytesToAddress(ctrl), common.BytesToAddress(pending),
++			uint64(final), app.qdayExposed(ctx, who.Bytes())) // #nosec G115 -- block heights
++	case "cancelIBCHold":
++		if err := app.ibcHoldCancel(ctx, caller.Bytes(), args[0].(uint64)); err != nil {
++			return nil, err
++		}
++		return method.Outputs.Pack()
++	}
++	return nil, fmt.Errorf("unknown method %s", method.Name)
++}
++
++// zetaphyPrecompile is the EVM keeper's hook for chain-defined precompiles.
++func (app *EVMD) zetaphyPrecompile(ctx sdk.Context, addr common.Address) (vm.PrecompiledContract, bool) {
++	if addr != SecurityPrecompileAddress || !app.secV3(ctx) {
++		return nil, false
++	}
++	return app.secPrecompile, true
++}
+diff --git a/evmd/zetaphy_security.go b/evmd/zetaphy_security.go
+new file mode 100644
+index 0000000..7ebcdc5
+--- /dev/null
++++ b/evmd/zetaphy_security.go
+@@ -0,0 +1,134 @@
++package evmd
++
++// ZETAPHY security core: three protocol rules, each off until governance
++// turns it on, kept in the zetaphypq store next to the quantum locks.
++//
++//   - Q-day (zetaphy_qday.go): from a governance-set height, txs authorized
++//     only by ECDSA are refused; accounts migrate to ML-DSA-44 beforehand
++//     (quantum lock), or after it by commit–reveal if their key was never
++//     shown on chain.
++//   - Threat gate (zetaphy_threatgate.go): a tx whose target has an ENFORCED
++//     flag in the Neuro ThreatRegistry is refused unless its sender gave
++//     consent (one tx to the security precompile, valid up to a day).
++//   - IBC large-transfer hold (zetaphy_ibchold.go): inbound transfers over a
++//     governance threshold wait in the IBC layer (async acknowledgement) and
++//     are delivered after a delay, unless the guardian returns them to the
++//     sender through an error acknowledgement.
++//
++// Upgrade path: a new chain has them from block 1 (key 0x0F = 1 in
++// app_state.zetaphypq, as `zetaphyd init` writes); a running chain gets the
++// "zetaphy-v3" upgrade, which sets 0x0F to the upgrade height + 1. Below
++// that height blocks run as before (the precompile is absent and ecrecover
++// marks nothing); the governance switches themselves are new messages.
++
++import (
++	"encoding/binary"
++	"math/big"
++
++	"github.com/ethereum/go-ethereum/common"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
++	govtypes "github.com/cosmos/cosmos-sdk/x/gov/types"
++
++	evmtypes "github.com/cosmos/evm/x/vm/types"
++)
++
++// Keys of the zetaphypq store used by the security core.
++var (
++	secV3Key       = []byte{0x0F} // height (8) from which the security core applies
++	qdayKey        = []byte{0x10} // Q-day height (8) || reveal delay in blocks (8)
++	qdayCommitPfx  = byte(0x11)   // || commitment (32) -> height of the commit (8)
++	qdayPendingPfx = byte(0x12)   // || owner (20) -> commit height (8) || final height (8) || controller (20)
++	qdayQueuePfx   = byte(0x13)   // || final height (8) || owner (20) -> {}
++	gateKey        = []byte{0x15} // registry (20) || enabled (1)
++	consentPfx     = byte(0x16)   // || account (20) || target (20) -> until, unix seconds (8)
++	holdParamsKey  = []byte{0x17} // delay seconds (8) || guardian (0 or 20)
++	holdRulePfx    = byte(0x18)   // || denom -> supply bps (8) || minimum amount (decimal)
++	holdSeqKey     = []byte{0x19} // next hold id (8)
++	holdPfx        = byte(0x1A)   // || id (8) -> ibcHold (JSON)
++	holdQueuePfx   = byte(0x1B)   // || release time (8) || id (8) -> {}
++)
++
++// secKeyKnown: prefixes of the zetaphypq store a genesis may carry.
++func secKeyKnown(p byte) bool { return p >= 0x0F && p <= 0x1B && p != 0x14 }
++
++func u64(v uint64) []byte { return binary.BigEndian.AppendUint64(nil, v) }
++
++func readU64(b []byte) uint64 {
++	if len(b) < 8 {
++		return 0
++	}
++	return binary.BigEndian.Uint64(b)
++}
++
++// secRaw reads the zetaphypq store without gas: parameters are read inside
++// ante handlers and EVM calls, whose gas must not depend on them.
++func (app *EVMD) secRaw(ctx sdk.Context) storetypes.KVStore {
++	return ctx.MultiStore().GetKVStore(app.GetKey(pqStoreKey))
++}
++
++func govAuthority() string { return authtypes.NewModuleAddress(govtypes.ModuleName).String() }
++
++// secV3Height is the height from which the security core applies (0: never).
++func (app *EVMD) secV3Height(ctx sdk.Context) int64 {
++	return int64(readU64(app.secRaw(ctx).Get(secV3Key))) // #nosec G115 -- block heights
++}
++
++func (app *EVMD) secV3(ctx sdk.Context) bool {
++	a := app.secV3Height(ctx)
++	return a > 0 && ctx.BlockHeight() >= a
++}
++
++func (app *EVMD) setSecV3Height(ctx sdk.Context, h int64) {
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(secV3Key, u64(uint64(h))) // #nosec G115 -- block heights
++	app.setPQLockSlot(ctx, evmtypes.SecurityV3Slot, uint64(h))        // #nosec G115 -- block heights
++}
++
++// setPQLockSlot mirrors a number into the storage of PQLockAddress, where the
++// EVM (ecrecover, the mempool) reads it. The account gets nonce 1 so the EVM
++// never drops it as empty.
++func (app *EVMD) setPQLockSlot(ctx sdk.Context, slot common.Hash, v uint64) {
++	app.ensurePQLockAccount(ctx)
++	if v == 0 {
++		app.EVMKeeper.DeleteState(ctx, PQLockAddress, slot)
++		return
++	}
++	app.EVMKeeper.SetState(ctx, PQLockAddress, slot, common.BigToHash(new(big.Int).SetUint64(v)).Bytes())
++}
++
++func (app *EVMD) ensurePQLockAccount(ctx sdk.Context) {
++	if app.AccountKeeper.GetAccount(ctx, PQLockAddress.Bytes()) == nil {
++		acc := app.AccountKeeper.NewAccountWithAddress(ctx, PQLockAddress.Bytes())
++		_ = acc.SetSequence(1)
++		app.AccountKeeper.SetAccount(ctx, acc)
++	}
++}
++
++// secMirrorAfterGenesis copies the heights a genesis set in the zetaphypq
++// store into EVM storage (InitChainer; the EVM genesis ran after them).
++func (app *EVMD) secMirrorAfterGenesis(ctx sdk.Context) {
++	if h := app.secV3Height(ctx); h > 0 {
++		app.setPQLockSlot(ctx, evmtypes.SecurityV3Slot, uint64(h)) // #nosec G115 -- block heights
++	}
++	if q, _ := app.qdayParams(ctx); q > 0 {
++		app.setPQLockSlot(ctx, evmtypes.QDaySlot, uint64(q)) // #nosec G115 -- block heights
++	}
++}
++
++// secBeginBlock: Q-day migrations that finished their wait, and held IBC
++// transfers whose delay is over (both bounded per block).
++func (app *EVMD) secBeginBlock(ctx sdk.Context) {
++	if !app.secV3(ctx) {
++		return
++	}
++	app.qdayFinalize(ctx)
++	app.ibcHoldReleaseDue(ctx)
++}
++
++// isGovAddr: s (zetaphy1… or 0x…) is the governance module account.
++func isGovAddr(s string) bool {
++	a, err := pqAddr(s)
++	return err == nil && a.Equals(authtypes.NewModuleAddress(govtypes.ModuleName))
++}
+diff --git a/evmd/zetaphy_threatgate.go b/evmd/zetaphy_threatgate.go
+new file mode 100644
+index 0000000..38fee5b
+--- /dev/null
++++ b/evmd/zetaphy_threatgate.go
+@@ -0,0 +1,235 @@
++package evmd
++
++// ZETAPHY threat gate: the Neuro "vaccine" at protocol level, as consent,
++// not censorship.
++//
++// Governance points the chain at the ThreatRegistry contract
++// (MsgSetThreatGate). An Ethereum tx, or a MsgEVMCall, whose target (tx.to;
++// contract creation is never checked) has an ENFORCED flag there
++// (isContractEnforced: the flag stood enforceDelay, or went through the
++// fast lane) is refused, unless its sender gave consent for that target:
++// one tx calling consent(target, seconds) on the security precompile
++// (0x…0901, zetaphy_secprecompile.go), valid for at most a day. Wallets
++// show the flag and offer that tx; anyone can still go ahead.
++//
++// What the registry already guarantees is kept: warning and held flags do
++// not count, protected keys (the protocol's own contracts) can never be
++// flagged, a cleared flag or a won appeal ends the refusal at once.
++// The chain adds: system addresses (below 0x10000: precompiles, the lock and
++// security addresses) and the registry itself are never refused, so appeals
++// and responses always go through; governance's own calls are not checked.
++//
++// Cost: at most one EVM static call per tx (isContractEnforced, a few
++// storage reads), capped at threatGateGas. Any failure of that call (no
++// code, revert, out of gas, malformed answer) counts as "not enforced": a
++// broken registry turns the gate off, never the chain.
++
++import (
++	"bytes"
++	"fmt"
++	"math/big"
++
++	gogoproto "github.com/cosmos/gogoproto/proto"
++	"github.com/ethereum/go-ethereum/accounts/abi"
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core"
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++
++	errorsmod "cosmossdk.io/errors"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	"github.com/cosmos/cosmos-sdk/x/authz"
++
++	"github.com/cosmos/evm/x/vm/statedb"
++	evmtypes "github.com/cosmos/evm/x/vm/types"
++)
++
++const (
++	// MaxConsentSeconds: a consent lasts at most a day.
++	MaxConsentSeconds = 86400
++	// threatGateGas caps the registry call (beyond the 21000 intrinsic gas).
++	threatGateGas = 100_000
++)
++
++// ErrThreatFlagged is the threat gate's refusal (codespace "zetaphy", code 21).
++var ErrThreatFlagged = errorsmod.Register("zetaphy", 21, "threat gate")
++
++// SecurityPrecompileAddress hosts consent and the security-core views.
++var SecurityPrecompileAddress = common.HexToAddress("0x0000000000000000000000000000000000000901")
++
++var threatRegistryABI = func() abi.ABI {
++	a, err := abi.JSON(bytes.NewReader([]byte(`[{"type":"function","name":"isContractEnforced","stateMutability":"view",
++		"inputs":[{"name":"who","type":"address"}],"outputs":[{"name":"","type":"bool"},{"name":"","type":"uint8"}]}]`)))
++	if err != nil {
++		panic(err)
++	}
++	return a
++}()
++
++// ThreatReasons are the ThreatRegistry's Reason names, by number.
++var ThreatReasons = []string{"None", "CannotSellInSimulation", "UnlimitedMint", "OwnerCanBlockTransfers",
++	"OwnerCanMoveHolderFunds", "SameNameAsKnownToken", "SweepsApprovedTokens", "Other"}
++
++func (app *EVMD) threatGate(ctx sdk.Context) (common.Address, bool) {
++	v := app.secRaw(ctx).Get(gateKey)
++	if len(v) != 21 {
++		return common.Address{}, false
++	}
++	reg := common.BytesToAddress(v[:20])
++	return reg, v[20] == 1 && reg != (common.Address{})
++}
++
++func (app *EVMD) setThreatGate(ctx sdk.Context, m *MsgSetThreatGate) (gogoproto.Message, error) {
++	if m.Authority != govAuthority() {
++		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only governance can set the threat gate")
++	}
++	if m.Enabled > 1 || (m.Registry != "" && !common.IsHexAddress(m.Registry)) {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "registry: a 0x address; enabled: 0 or 1")
++	}
++	reg := common.HexToAddress(m.Registry)
++	if m.Enabled == 1 && len(app.EVMKeeper.GetCode(ctx, app.EVMKeeper.GetCodeHash(ctx, reg))) == 0 {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "registry: no contract at that address")
++	}
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(gateKey, append(reg.Bytes(), byte(m.Enabled)))
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_threat_gate", sdk.NewAttribute("registry", reg.Hex()), sdk.NewAttribute("enabled", fmt.Sprint(m.Enabled))))
++	return &MsgPQResponse{}, nil
++}
++
++func consentKey(account, target common.Address) []byte {
++	return append(append([]byte{consentPfx}, account.Bytes()...), target.Bytes()...)
++}
++
++// consentUntil: until when (unix seconds) account consented to target (0: never).
++func (app *EVMD) consentUntil(ctx sdk.Context, account, target common.Address) int64 {
++	return int64(readU64(app.secRaw(ctx).Get(consentKey(account, target)))) // #nosec G115 -- unix seconds
++}
++
++// setConsent records (seconds > 0) or withdraws (0) a consent; returns its end.
++func (app *EVMD) setConsent(ctx sdk.Context, account, target common.Address, seconds uint64) (int64, error) {
++	if seconds > MaxConsentSeconds {
++		return 0, fmt.Errorf("a consent lasts at most %d seconds (a day)", MaxConsentSeconds)
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if seconds == 0 {
++		st.Delete(consentKey(account, target))
++		return 0, nil
++	}
++	until := ctx.BlockTime().Unix() + int64(seconds) // #nosec G115 -- at most a day
++	st.Set(consentKey(account, target), u64(uint64(until)))
++	return until, nil
++}
++
++func threatSystemAddress(a common.Address) bool {
++	return new(big.Int).SetBytes(a.Bytes()).Cmp(big.NewInt(0x10000)) < 0
++}
++
++// threatEnforced asks the registry, in a throw-away branch, whether target
++// has an enforced flag. Every failure answers false.
++func (app *EVMD) threatEnforced(ctx sdk.Context, registry, target common.Address) (bool, uint8) {
++	data, err := threatRegistryABI.Pack("isContractEnforced", target)
++	if err != nil {
++		return false, 0
++	}
++	c, _ := ctx.CacheContext()
++	c = c.WithGasMeter(storetypes.NewInfiniteGasMeter()).WithKVGasConfig(storetypes.GasConfig{}).
++		WithTransientKVGasConfig(storetypes.GasConfig{}).WithEventManager(sdk.NewEventManager())
++	var res *evmtypes.MsgEthereumTxResponse
++	func() {
++		defer func() { _ = recover() }()
++		sdb := statedb.New(c, app.EVMKeeper, statedb.NewEmptyTxConfig())
++		res, err = app.EVMKeeper.ApplyMessage(c, sdb, core.Message{
++			From: SecurityPrecompileAddress, To: &registry, Value: new(big.Int), GasLimit: 21000 + threatGateGas, Data: data,
++			GasPrice: new(big.Int), GasFeeCap: new(big.Int), GasTipCap: new(big.Int), AccessList: ethtypes.AccessList{},
++			SkipNonceChecks: true,
++		}, nil, false, false, true)
++	}()
++	if err != nil || res == nil || res.Failed() || len(res.Ret) != 64 {
++		return false, 0
++	}
++	out, err := threatRegistryABI.Unpack("isContractEnforced", res.Ret)
++	if err != nil || len(out) != 2 {
++		return false, 0
++	}
++	on, _ := out[0].(bool)
++	reason, _ := out[1].(uint8)
++	return on, reason
++}
++
++// threatCheck refuses a call from `from` to `to` that the gate stops.
++func (app *EVMD) threatCheck(ctx sdk.Context, from, to common.Address) error {
++	reg, on := app.threatGate(ctx)
++	if !on || !app.secV3(ctx) || threatSystemAddress(to) || to == reg {
++		return nil
++	}
++	if app.consentUntil(ctx, from, to) > ctx.BlockTime().Unix() {
++		return nil
++	}
++	enforced, reason := app.threatEnforced(ctx, reg, to)
++	if !enforced {
++		return nil
++	}
++	name := fmt.Sprint(reason)
++	if int(reason) < len(ThreatReasons) {
++		name = ThreatReasons[reason]
++	}
++	return errorsmod.Wrapf(ErrThreatFlagged, "%s has an enforced flag in the Neuro threat registry %s (reason: %s). Nothing was done. "+
++		"To go ahead anyway, first send consent(%s, seconds) to %s from %s (valid up to %d seconds), then send this again",
++		to.Hex(), reg.Hex(), name, to.Hex(), SecurityPrecompileAddress.Hex(), from.Hex(), MaxConsentSeconds)
++}
++
++// threatGateTx: the gate in the ante handler, for Ethereum txs and
++// MsgEVMCall (also inside authz). MsgEVMCall is checked again where it runs
++// (evmCall), which covers governance proposals and nested execution.
++func (app *EVMD) threatGateTx(ctx sdk.Context, tx sdk.Tx) error {
++	if _, on := app.threatGate(ctx); !on {
++		return nil
++	}
++	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
++	for i := 0; i < len(msgs) && i < 64; i++ {
++		switch m := msgs[i].(type) {
++		case *authz.MsgExec:
++			if inner, err := m.GetMessages(); err == nil {
++				msgs = append(msgs, inner...)
++			}
++		case *MsgEVMCall: // also checked where it runs; here so CheckTx refuses it at once
++			if m.To == "" || !common.IsHexAddress(m.To) || isGovAddr(m.Sender) {
++				continue
++			}
++			from := m.Sender
++			if m.AsOwner != "" {
++				from = m.AsOwner
++			}
++			a, err := pqAddr(from)
++			if err != nil {
++				continue
++			}
++			if err := app.threatCheck(ctx, common.BytesToAddress(a), common.HexToAddress(m.To)); err != nil {
++				return err
++			}
++		case *evmtypes.MsgEthereumTx:
++			t := m.AsTransaction()
++			if t == nil || t.To() == nil {
++				continue
++			}
++			if err := app.threatCheck(ctx, common.BytesToAddress(m.From), *t.To()); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++// threatMempoolCheck: the same rule when an EVM tx is submitted, on the
++// latest committed state, so the wallet sees the refusal at once.
++func (app *EVMD) threatMempoolCheck(from common.Address, tx *ethtypes.Transaction) error {
++	if tx.To() == nil {
++		return nil
++	}
++	ctx, err := app.CreateQueryContext(0, false)
++	if err != nil {
++		return nil
++	}
++	return app.threatCheck(ctx.WithBlockHeight(ctx.BlockHeight()+1), from, *tx.To())
++}
 diff --git a/evmd/zetaphy_upgrade.go b/evmd/zetaphy_upgrade.go
 new file mode 100644
-index 0000000..1c50e36
+index 0000000..57b38ee
 --- /dev/null
 +++ b/evmd/zetaphy_upgrade.go
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,167 @@
 +package evmd
 +
 +// ZETAPHY v2 activation height.
@@ -3001,6 +4868,11 @@ index 0000000..1c50e36
 +// features on for a chain that runs without them.
 +const ZetaphyV2UpgradeName = "zetaphy-v2"
 +
++// ZetaphyV3UpgradeName turns the security core (zetaphy_security.go) on for
++// a chain that runs without it: key 0x0F of the zetaphypq store = the
++// upgrade height + 1. Its rules themselves stay off until governance sets them.
++const ZetaphyV3UpgradeName = "zetaphy-v3"
++
 +var pqActivationKey = []byte{8} // height (8 bytes) from which the v2 features apply
 +
 +// zetaphyV2Height is the activation height, 0 when unset (never). It reads
@@ -3043,11 +4915,27 @@ index 0000000..1c50e36
 +			return app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
 +		})
 +
++	app.UpgradeKeeper.SetUpgradeHandler(ZetaphyV3UpgradeName,
++		func(c context.Context, _ upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
++			ctx := sdk.UnwrapSDKContext(c)
++			if !app.zetaphyV2(ctx, ctx.BlockHeight()+1) { // v3 includes v2
++				p := app.EVMKeeper.GetParams(ctx)
++				p.HistoryServeWindow = evmtypes.DefaultHistoryServeWindow
++				if err := app.EVMKeeper.SetParams(ctx, p); err != nil {
++					return nil, err
++				}
++				app.setZetaphyV2Height(ctx, ctx.BlockHeight()+1)
++			}
++			app.setSecV3Height(ctx, ctx.BlockHeight()+1)
++			ctx.Logger().Info("ZETAPHY security core scheduled", "from_height", ctx.BlockHeight()+1)
++			return app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
++		})
++
 +	info, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
 +	if err != nil {
 +		panic(err)
 +	}
-+	if info.Name == ZetaphyV2UpgradeName && !app.UpgradeKeeper.IsSkipHeight(info.Height) {
++	if (info.Name == ZetaphyV2UpgradeName || info.Name == ZetaphyV3UpgradeName) && !app.UpgradeKeeper.IsSkipHeight(info.Height) {
 +		// Stores the running binary does not have yet go here, e.g.
 +		// pqStoreKey and ratelimittypes.StoreKey when upgrading from a binary
 +		// built without the PQ patch. A chain started with the PQ patch
@@ -3071,11 +4959,11 @@ index 0000000..1c50e36
 +	for _, e := range in {
 +		k, err1 := hex.DecodeString(e.Key)
 +		v, err2 := hex.DecodeString(e.Value)
-+		if err1 != nil || err2 != nil || len(k) == 0 || (k[0] != 1 && k[0] != 2 && k[0] != pqEvidenceKey[0] && k[0] != pqActivationKey[0]) {
++		if err1 != nil || err2 != nil || len(k) == 0 || (k[0] != 1 && k[0] != 2 && k[0] != pqEvidenceKey[0] && k[0] != pqActivationKey[0] && !secKeyKnown(k[0])) {
 +			return nil, fmt.Errorf("zetaphypq genesis: bad entry %q", e.Key)
 +		}
-+		if k[0] == pqActivationKey[0] && (len(k) != 1 || len(v) != 8) {
-+			return nil, fmt.Errorf("zetaphypq genesis: activation height: want key 08 and 8 bytes")
++		if (k[0] == pqActivationKey[0] || k[0] == secV3Key[0]) && (len(k) != 1 || len(v) != 8) {
++			return nil, fmt.Errorf("zetaphypq genesis: activation height: want key %02x and 8 bytes", k[0])
 +		}
 +		out = append(out, [2][]byte{k, v})
 +	}
@@ -3094,7 +4982,8 @@ index 0000000..1c50e36
 +func (pqGenesisBasic) RegisterGRPCGatewayRoutes(client.Context, *gwruntime.ServeMux) {}
 +
 +func (pqGenesisBasic) DefaultGenesis(codec.JSONCodec) json.RawMessage {
-+	bz, _ := json.Marshal([]pqGenesisEntry{{hex.EncodeToString(pqActivationKey), hex.EncodeToString(binary.BigEndian.AppendUint64(nil, 1))}})
++	one := hex.EncodeToString(binary.BigEndian.AppendUint64(nil, 1))
++	bz, _ := json.Marshal([]pqGenesisEntry{{hex.EncodeToString(pqActivationKey), one}, {hex.EncodeToString(secV3Key), one}})
 +	return bz
 +}
 +
@@ -3128,10 +5017,20 @@ index 11f8f59..bbea7b7 100644
  github.com/cloudwego/base64x v0.1.6/go.mod h1:OFcloc187FXDaYHvrNIjxSe8ncn0OOM8gEHfghB2IPU=
  github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGXZJjfX53e64911xZQV5JYwmTeXPW+k8Sc=
 diff --git a/mempool/mempool.go b/mempool/mempool.go
-index 74c2f89..61f856c 100644
+index 74c2f89..22fc803 100644
 --- a/mempool/mempool.go
 +++ b/mempool/mempool.go
-@@ -333,6 +333,9 @@ func (m *Mempool) insert(tx sdk.Tx) (<-chan error, error) {
+@@ -113,6 +113,9 @@ type Mempool struct {
+ 	/** Keepers **/
+ 	vmKeeper VMKeeperI
+ 
++	// ZETAPHY: the app's extra check on EVM txs at submission (zetaphy_lock.go)
++	zetaphyCheck func(common.Address, *ethtypes.Transaction) error
++
+ 	/** Mempools **/
+ 	txPool                   *txpool.TxPool
+ 	legacyTxPool             *legacypool.LegacyPool
+@@ -333,6 +336,9 @@ func (m *Mempool) insert(tx sdk.Tx) (<-chan error, error) {
  	switch {
  	case err == nil:
  		ethTx := ethMsg.AsTransaction()
@@ -3141,7 +5040,7 @@ index 74c2f89..61f856c 100644
  
  		// Reject txs below base fee up-front, which can never be included.
  		if baseFee := m.blockchain.CurrentBlock().BaseFee; baseFee != nil && ethTx.GasFeeCapIntCmp(baseFee) < 0 {
-@@ -341,6 +344,9 @@ func (m *Mempool) insert(tx sdk.Tx) (<-chan error, error) {
+@@ -341,6 +347,9 @@ func (m *Mempool) insert(tx sdk.Tx) (<-chan error, error) {
  				ethTx.GasFeeCap(), baseFee,
  			)
  		}
@@ -3205,28 +5104,34 @@ index 5a38319..508ebac 100644
  		}
 diff --git a/mempool/zetaphy_lock.go b/mempool/zetaphy_lock.go
 new file mode 100644
-index 0000000..4e016ba
+index 0000000..81015e1
 --- /dev/null
 +++ b/mempool/zetaphy_lock.go
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,46 @@
 +package mempool
 +
 +import (
 +	"fmt"
++	"math/big"
 +
++	"github.com/ethereum/go-ethereum/common"
 +	ethtypes "github.com/ethereum/go-ethereum/core/types"
 +
 +	evmtypes "github.com/cosmos/evm/x/vm/types"
 +)
 +
 +// pqLockCheck (ZETAPHY) refuses, at submission, an EVM tx sent by a
-+// quantum-locked account or carrying its EIP-7702 authorization, so the
-+// wallet gets an error instead of a tx that stays pending. The ante handler
-+// refuses them as well.
++// quantum-locked account or carrying its EIP-7702 authorization, and every
++// ECDSA-signed EVM tx once Q-day is reached, so the wallet gets an error
++// instead of a tx that stays pending. The ante handler refuses them as well.
++// The app's extra check (SetZetaphyCheck: the threat gate) runs last.
 +func (m *Mempool) pqLockCheck(tx *ethtypes.Transaction) error {
 +	st, err := m.blockchain.StateAt(m.blockchain.CurrentBlock().Hash())
 +	if err != nil || st == nil {
 +		return nil
++	}
++	if next := new(big.Int).Add(m.blockchain.CurrentBlock().Number, big.NewInt(1)); evmtypes.QDayReached(st.GetState, next) {
++		return fmt.Errorf("Q-day (block %s) has passed: ECDSA-signed transactions are no longer accepted; a migrated account acts through its ML-DSA-44 controller", st.GetState(evmtypes.PQLockAddress, evmtypes.QDaySlot).Big())
 +	}
 +	from, err := ethtypes.Sender(ethtypes.LatestSignerForChainID(tx.ChainId()), tx)
 +	if err == nil && evmtypes.PQLocked(st.GetState, from) {
@@ -3237,7 +5142,17 @@ index 0000000..4e016ba
 +			return fmt.Errorf("authorization signed by %s, which is quantum-locked", au.Hex())
 +		}
 +	}
++	if m.zetaphyCheck != nil && err == nil {
++		return m.zetaphyCheck(from, tx)
++	}
 +	return nil
++}
++
++// SetZetaphyCheck (ZETAPHY) sets a check every EVM tx passes at submission,
++// after the quantum-lock and Q-day checks (the app's threat gate). It must
++// only read state; the ante handler applies the same rule in blocks.
++func (m *Mempool) SetZetaphyCheck(f func(from common.Address, tx *ethtypes.Transaction) error) {
++	m.zetaphyCheck = f
 +}
 diff --git a/precompiles/mldsa/mldsa.go b/precompiles/mldsa/mldsa.go
 new file mode 100644
@@ -3404,10 +5319,10 @@ index 1f241fa..a4cda86 100644
  	return nil
  }
 diff --git a/x/vm/keeper/keeper.go b/x/vm/keeper/keeper.go
-index 6b7b956..8b78d2b 100644
+index 6b7b956..fc7430b 100644
 --- a/x/vm/keeper/keeper.go
 +++ b/x/vm/keeper/keeper.go
-@@ -86,6 +86,10 @@ type Keeper struct {
+@@ -86,6 +86,12 @@ type Keeper struct {
  	// virtualFeeCollection enabling will use "Virtual" methods from the bank module to accumulate
  	// fees to the fee collector module in the endBlocker instead of using regular sends during tx execution.
  	virtualFeeCollection bool
@@ -3415,20 +5330,27 @@ index 6b7b956..8b78d2b 100644
 +	// ZETAPHY: supplies block.prevrandao (zetaphy_random.go); nil keeps the
 +	// upstream constant.
 +	randomFn func(sdk.Context) common.Hash
++	// ZETAPHY: chain-defined precompiles (SetZetaphyPrecompiles)
++	zetaphyPrecompile func(sdk.Context, common.Address) (vm.PrecompiledContract, bool)
  }
  
  // NewKeeper generates new evm module keeper
 diff --git a/x/vm/keeper/precompiles.go b/x/vm/keeper/precompiles.go
-index ee26a8e..bd19281 100644
+index ee26a8e..3c75664 100644
 --- a/x/vm/keeper/precompiles.go
 +++ b/x/vm/keeper/precompiles.go
-@@ -27,6 +27,10 @@ func (k *Keeper) GetPrecompileInstance(
+@@ -27,6 +27,15 @@ func (k *Keeper) GetPrecompileInstance(
  		attribute.String("address", address.Hex()),
  	))
  	defer func() { evmtrace.EndSpanErr(span, err) }()
 +	// ZETAPHY: ecrecover that refuses quantum-locked accounts (zetaphy_ecrecover.go).
 +	if address == ecrecoverAddress {
 +		return &Precompiles{Map: map[common.Address]vm.PrecompiledContract{address: pqEcrecover{}}, Addresses: []common.Address{address}}, true, nil
++	}
++	if k.zetaphyPrecompile != nil { // ZETAPHY: e.g. the security precompile at 0x…0901
++		if p, ok := k.zetaphyPrecompile(ctx, address); ok {
++			return &Precompiles{Map: map[common.Address]vm.PrecompiledContract{address: p}, Addresses: []common.Address{address}}, true, nil
++		}
 +	}
  	params := k.GetParams(ctx)
  	// Get the precompile from the static precompiles
@@ -3456,14 +5378,15 @@ index 0c160b4..b165687 100644
  		}
 diff --git a/x/vm/keeper/zetaphy_ecrecover.go b/x/vm/keeper/zetaphy_ecrecover.go
 new file mode 100644
-index 0000000..f078923
+index 0000000..73cdb39
 --- /dev/null
 +++ b/x/vm/keeper/zetaphy_ecrecover.go
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,57 @@
 +package keeper
 +
 +import (
 +	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core/tracing"
 +	"github.com/ethereum/go-ethereum/core/vm"
 +
 +	"github.com/cosmos/evm/x/vm/types"
@@ -3473,6 +5396,15 @@ index 0000000..f078923
 +// evmd/zetaphy_pqguard.go) is marked in the storage of types.PQLockAddress. Contracts check ECDSA signatures with
 +// ecrecover (0x01), so permits, Permit2 and meta-transactions signed by a
 +// locked account are treated as invalid signatures: ecrecover returns nothing.
++//
++// Security core (evmd/zetaphy_qday.go):
++//   - from the Q-day height on, ecrecover returns nothing for every
++//     signature: an ECDSA signature no longer proves anything;
++//   - before it, a successful recovery of an account that holds funds but
++//     never sent a transaction marks it "exposed" (its public key is now on
++//     chain), so it cannot use the commit–reveal migration meant for keys
++//     never shown. Accounts without funds are not marked: no state for
++//     random signatures.
 +
 +var (
 +	ecrecoverAddress = common.BytesToAddress([]byte{1})
@@ -3485,22 +5417,39 @@ index 0000000..f078923
 +func (pqEcrecover) RequiredGas(input []byte) uint64 { return gethEcrecover.RequiredGas(input) }
 +func (pqEcrecover) Name() string                    { return gethEcrecover.Name() }
 +func (pqEcrecover) Run(evm *vm.EVM, c *vm.Contract, ro bool) ([]byte, error) {
-+	out, err := gethEcrecover.Run(evm, c, ro)
-+	if err == nil && len(out) == 32 && types.PQLocked(evm.StateDB.GetState, common.BytesToAddress(out)) {
++	if types.QDayReached(evm.StateDB.GetState, evm.Context.BlockNumber) {
 +		return nil, nil
 +	}
-+	return out, err
++	out, err := gethEcrecover.Run(evm, c, ro)
++	if err != nil || len(out) != 32 {
++		return out, err
++	}
++	who := common.BytesToAddress(out)
++	if types.PQLocked(evm.StateDB.GetState, who) {
++		return nil, nil
++	}
++	// Solidity's ecrecover is a STATICCALL (ro): the mark is the chain's own
++	// bookkeeping, invisible to contracts, so it is written regardless.
++	if types.SecurityV3(evm.StateDB.GetState, evm.Context.BlockNumber) && evm.StateDB.GetNonce(who) == 0 &&
++		evm.StateDB.GetBalance(who).Sign() > 0 && evm.StateDB.GetState(types.PQLockAddress, types.ExposedSlot(who)) == (common.Hash{}) {
++		if evm.StateDB.GetNonce(types.PQLockAddress) == 0 { // never dropped as an empty account
++			evm.StateDB.SetNonce(types.PQLockAddress, 1, tracing.NonceChangeUnspecified)
++		}
++		evm.StateDB.SetState(types.PQLockAddress, types.ExposedSlot(who), common.Hash{31: 1})
++	}
++	return out, nil
 +}
 diff --git a/x/vm/keeper/zetaphy_random.go b/x/vm/keeper/zetaphy_random.go
 new file mode 100644
-index 0000000..034de21
+index 0000000..6e1f2de
 --- /dev/null
 +++ b/x/vm/keeper/zetaphy_random.go
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,38 @@
 +package keeper
 +
 +import (
 +	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core/vm"
 +
 +	sdk "github.com/cosmos/cosmos-sdk/types"
 +)
@@ -3525,6 +5474,14 @@ index 0000000..034de21
 +	}
 +	h := k.randomFn(ctx)
 +	return &h
++}
++
++// SetZetaphyPrecompiles (ZETAPHY) sets chain-defined precompiles that are on
++// regardless of the active_static_precompiles param; f decides from which
++// height each applies (e.g. the security precompile at 0x…0901, evmd).
++func (k *Keeper) SetZetaphyPrecompiles(f func(sdk.Context, common.Address) (vm.PrecompiledContract, bool)) *Keeper {
++	k.zetaphyPrecompile = f
++	return k
 +}
 diff --git a/x/vm/types/params.go b/x/vm/types/params.go
 index 0a9fd86..ec754ec 100644
@@ -3564,22 +5521,60 @@ index a7e058a..e64b909 100644
  }
 diff --git a/x/vm/types/zetaphy.go b/x/vm/types/zetaphy.go
 new file mode 100644
-index 0000000..8f5ded9
+index 0000000..b6fb932
 --- /dev/null
 +++ b/x/vm/types/zetaphy.go
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,51 @@
 +package types
 +
-+import "github.com/ethereum/go-ethereum/common"
++import (
++	"math/big"
++
++	"github.com/ethereum/go-ethereum/common"
++)
 +
 +// PQLockAddress (ZETAPHY): an EVM tx to it, with the controller's address as
 +// data, quantum-locks the sender; its storage marks locked accounts (key =
-+// account, value = controller). It has no code, so only the lock writes there.
++// account, value = controller). It has no code, so only the chain writes there.
 +var PQLockAddress = common.HexToAddress("0x0000000000000000000000000000000000005051")
++
++// Other slots of PQLockAddress (ZETAPHY security core, evmd/zetaphy_qday.go).
++// A lock slot is the account's 20 bytes left-padded with zeros, so a slot
++// whose first byte is not zero never collides with one.
++var (
++	// QDaySlot holds the Q-day height (0: not scheduled). From that block on,
++	// ecrecover answers nothing and ECDSA-signed EVM txs are refused.
++	QDaySlot = common.Hash{0x02}
++	// SecurityV3Slot holds the height from which the security-core EVM rules
++	// (exposure marks, the 0x…0901 precompile) apply.
++	SecurityV3Slot = common.Hash{0x03}
++)
++
++// ExposedSlot marks an account whose ECDSA public key was seen on chain by
++// ecrecover (a permit, a meta-transaction): it cannot use the commit–reveal
++// Q-day migration, which is only for keys never shown.
++func ExposedSlot(account common.Address) common.Hash {
++	h := common.BytesToHash(account.Bytes())
++	h[0] = 0x01
++	return h
++}
 +
 +// PQLocked reports whether a StateDB marks the account as quantum-locked.
 +func PQLocked(get func(common.Address, common.Hash) common.Hash, account common.Address) bool {
 +	return get(PQLockAddress, common.BytesToHash(account.Bytes())) != (common.Hash{})
++}
++
++// QDayReached reports whether block number n is at or after the Q-day height
++// stored in the StateDB.
++func QDayReached(get func(common.Address, common.Hash) common.Hash, n *big.Int) bool {
++	q := get(PQLockAddress, QDaySlot).Big()
++	return q.Sign() > 0 && n != nil && n.Cmp(q) >= 0
++}
++
++// SecurityV3 reports whether block number n runs the security-core EVM rules.
++func SecurityV3(get func(common.Address, common.Hash) common.Hash, n *big.Int) bool {
++	a := get(PQLockAddress, SecurityV3Slot).Big()
++	return a.Sign() > 0 && n != nil && n.Cmp(a) >= 0
 +}
 ZETAPHY_PQ_PATCH
 : <<'ZETAPHY_PREINSTALLS'
