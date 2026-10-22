@@ -52,6 +52,12 @@ LOG="/var/log/zetaphy-setup.log"
 # Test hooks (leave unset on Oracle): ZETAPHYD_BIN=<prebuilt evmd>, NO_SYSTEMD=1
 ZETAPHYD_BIN="${ZETAPHYD_BIN:-}"
 NO_SYSTEMD="${NO_SYSTEMD:-}"
+# Optional: your own DNS name for the public RPC (an A record pointing at this
+# machine), e.g. PUBLIC_HOST=rpc.sawasdeecoin.com. Caddy serves it next to
+# <ip>.sslip.io, and the wallet files (keplr.json, evm-chain.json) use it.
+PUBLIC_HOST="${PUBLIC_HOST:-}"
+[ -z "$PUBLIC_HOST" ] || [[ "$PUBLIC_HOST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] \
+  || { echo "PUBLIC_HOST: a DNS name like rpc.example.com"; exit 1; }
 
 # ---- The ZETAPHY changes to the Cosmos EVM source -------------------------
 # Used in step 4 below, and by CI: setup-node.sh --patch-source <cosmos/evm checkout>
@@ -468,12 +474,13 @@ ip=$(curl -fsS -m 5 https://checkip.amazonaws.com 2>/dev/null || hostname -I | a
 # from Ubuntu's archive gets a free Let's Encrypt certificate for
 # <ip>.sslip.io, a free DNS name that points at the IP. Not fatal if it fails.
 host="${ip//./-}.sslip.io"
+pubhost="${PUBLIC_HOST:-$host}"   # the name wallets are given
 # It also publishes what another machine needs to JOIN this chain.
 pub=/var/lib/zetaphy-public
 mkdir -p $pub && install -m 644 "$NODE_HOME/config/genesis.json" $pub/ && install -m 644 "$0" $pub/setup-node.sh
 echo "$(z comet show-node-id --home "$NODE_HOME")@$ip:26656" > $pub/peer
 # Wallet settings for this node, for one-click "add network" buttons.
-jq -n --arg h "https://$host" --arg c "$CHAIN_ID" --arg d "$DENOM" '
+jq -n --arg h "https://$pubhost" --arg c "$CHAIN_ID" --arg d "$DENOM" '
   {denom: $d, cur: {coinDenom: "ZETAPHY", coinMinimalDenom: $d, coinDecimals: 18}} as $x |
   {chainId: $c, chainName: "ZETAPHY Testnet", rpc: ($h + "/rpc"), rest: ($h + "/rest"), bip44: {coinType: 60},
    bech32Config: {bech32PrefixAccAddr: "zetaphy", bech32PrefixAccPub: "zetaphypub", bech32PrefixValAddr: "zetaphyvaloper",
@@ -481,7 +488,7 @@ jq -n --arg h "https://$host" --arg c "$CHAIN_ID" --arg d "$DENOM" '
    currencies: [$x.cur], stakeCurrency: $x.cur,
    feeCurrencies: [$x.cur + {gasPriceStep: {low: 1000000000, average: 2000000000, high: 4000000000}}],
    features: ["eth-address-gen", "eth-key-sign", "eth-secp256k1-cosmos", "force-enable-evm-ledger"], isTestnet: true, evm: {chainId: '"$EVM_CHAIN_ID"', rpc: $h}}' > $pub/keplr.json
-jq -n --arg h "https://$host" --arg id "$(printf '0x%x' "$EVM_CHAIN_ID")" \
+jq -n --arg h "https://$pubhost" --arg id "$(printf '0x%x' "$EVM_CHAIN_ID")" \
   '{chainId: $id, chainName: "ZETAPHY Testnet", nativeCurrency: {name: "ZETAPHY", symbol: "ZTPHY", decimals: 18}, rpcUrls: [$h]}' > $pub/evm-chain.json
 chmod 644 $pub/keplr.json $pub/evm-chain.json
 if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]]; then
@@ -490,7 +497,7 @@ if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]
   # https://$host/rest/   Cosmos REST    }
   # https://$host/zetaphy/  files: genesis, peer, setup script, wallet configs
   { apt-get install -y caddy >/dev/null && cat > /etc/caddy/Caddyfile <<CADDY
-$host {
+$host${PUBLIC_HOST:+, $PUBLIC_HOST} {
 	header ?Access-Control-Allow-Origin *
 	header ?Access-Control-Allow-Headers "Content-Type"
 	header ?Access-Control-Allow-Methods "GET, POST, OPTIONS"
@@ -575,9 +582,9 @@ ZETAPHY testnet node is starting.
   Chain ID (Cosmos):   $CHAIN_ID
   Chain ID (EVM):      $EVM_CHAIN_ID
   MetaMask RPC URL:    http://$ip:8545
-  HTTPS RPC (wallet):  https://$host  (needs ports 80 and 443 open)
-  Keplr / Leap:        RPC https://$host/rpc  REST https://$host/rest
-                       (chain settings: https://$host/zetaphy/keplr.json)
+  HTTPS RPC (wallet):  https://$pubhost  (needs ports 80 and 443 open)
+  Keplr / Leap:        RPC https://$pubhost/rpc  REST https://$pubhost/rest
+                       (chain settings: https://$pubhost/zetaphy/keplr.json)
   Others join with:    JOIN=$host in setup-node.sh, then --become-validator 9
   Currency symbol:     ZETAPHY
   Genesis keys:        $KEYS_DIR (testnet only; MNEMONICS-KEEP-SECRET.txt)
