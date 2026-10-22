@@ -407,7 +407,7 @@ new = re.sub(r'(?m)^api = .*', 'api = \"eth,net,web3,txpool,zetaphy\"', new)
 # The port is public: keep one caller from tying the node up.
 limits = {
     'allow-insecure-unlock': 'false',         # no account unlocking over RPC
-    'gas-cap': '10000000',                    # eth_call / estimateGas gas ceiling
+    'gas-cap': '30000000',                    # eth_call / estimateGas gas ceiling = block max_gas (big deploys, e.g. a token + DAO, need ~12.5M)
     'evm-timeout': '\"3s\"',                  # eth_call wall-clock ceiling
     'logs-cap': '2000',                       # eth_getLogs results per call
     'block-range-cap': '2000',                # eth_getLogs block span per call
