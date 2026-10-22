@@ -169,11 +169,14 @@ SELF_STAKE=500000$Z
 
 # ---------------------------------------------------------------------------
 step "1/8 packages"
+# Ubuntu's automatic updates may hold the package lock for a few minutes
+# (often right after a machine starts): wait for it instead of failing.
+apt_get() { apt-get -o DPkg::Lock::Timeout=900 "$@"; }
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   need=""
   for p in git jq curl make gcc; do command -v "$p" >/dev/null || need=1; done
-  if [ -n "$need" ]; then apt-get update -y && apt-get install -y git jq curl build-essential ca-certificates; fi
+  if [ -n "$need" ]; then apt_get update -y && apt_get install -y git jq curl build-essential ca-certificates; fi
 fi
 
 step "2/8 swap (small machines need it to compile)"
@@ -195,7 +198,7 @@ elif [ ! -x "$BIN" ] || [ -n "${FORCE_BUILD:-}" ]; then
   # verified against Go's checksum database. Ubuntu 24.04's golang-go is 1.22.
   GO=$(command -v go || true)
   [ -z "$GO" ] && [ -x /usr/local/go/bin/go ] && GO=/usr/local/go/bin/go
-  if [ -z "$GO" ]; then apt-get install -y golang-go && GO=$(command -v go); fi
+  if [ -z "$GO" ]; then apt_get install -y golang-go && GO=$(command -v go); fi
   minor=$("$GO" env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')
   [ "$minor" -ge 21 ] || { echo "Go $("$GO" env GOVERSION) is too old; use Ubuntu 24.04"; exit 1; }
   src="/home/${NODE_USER}/src/evm"
@@ -496,7 +499,7 @@ if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]
   # https://$host/rpc/    CometBFT RPC   } Keplr, Leap, Cosmostation
   # https://$host/rest/   Cosmos REST    }
   # https://$host/zetaphy/  files: genesis, peer, setup script, wallet configs
-  { apt-get install -y caddy >/dev/null && cat > /etc/caddy/Caddyfile <<CADDY
+  { apt_get install -y caddy >/dev/null && cat > /etc/caddy/Caddyfile <<CADDY
 $host${PUBLIC_HOST:+, $PUBLIC_HOST} {
 	header ?Access-Control-Allow-Origin *
 	header ?Access-Control-Allow-Headers "Content-Type"
