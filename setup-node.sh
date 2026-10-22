@@ -34,6 +34,14 @@ GO_VERSION="1.25.9"                # what cosmos/evm v0.7.3 go.mod requires
 # IBC rate limits: ibc-apps rate-limiting, ported to ibc-go v11 by the patch below.
 RATELIMIT_MOD="github.com/cosmos/ibc-apps/modules/rate-limiting/v10@v10.7.0"
 RATELIMIT_SUM="h1:5X2o/xT1x1fltUrkhvDCOpFaRJK5/1M36/SCh873VOc="
+# Stage 7, CosmWasm: wasmd v0.70.5 (x/wasm for SDK v0.54) on wasmvm v3.0.9,
+# pinned with their hashes in the patched evmd/go.sum. libwasmvm (Rust) is a
+# shared library inside the wasmvm Go module (so go.sum pins it too); it is
+# checked again against wasmvm's release checksums.txt and installed in
+# /usr/local/lib, for x86_64 and aarch64 (glibc >= 2.30: Ubuntu 24.04 has 2.39).
+WASMVM_VERSION="v3.0.9"
+WASMVM_SO_SHA256_x86_64="0d41aa842c004a6aa138291d1f9f99818479fec7aef024d419e4ad244f858ee4"
+WASMVM_SO_SHA256_aarch64="7eeb256b7baecaf465c555260d4e21b6d2532f451a2c7b95fd8acef4c4da597e"
 
 NODE_USER="zetaphy"
 NODE_HOME="/home/${NODE_USER}/.zetaphy"          # chain data + config (no keys)
@@ -67,6 +75,10 @@ NO_SYSTEMD="${NO_SYSTEMD:-}"
 #    enforced Neuro flag needs its sender's consent, precompile 0x…0901), and
 #    the IBC large-transfer hold (big inbound transfers wait, the guardian
 #    can return them to the sender).
+#  - stage 7: CosmWasm (x/wasm, Rust contracts) beside the EVM
+#    (evmd/zetaphy_cosmwasm.go): code upload by governance only, instantiate
+#    by anyone; Q-day, quantum locks and the fee burn cover wasm txs; IBC
+#    for contracts is off; a running chain gets it with "zetaphy-v4".
 # The patches are at the end of this file. Their tests (zetaphy-chain/fork-tests
 # on GitHub, kept out of this file so it fits Oracle's size limit) run in CI
 # on every change, against this same patching.
@@ -188,8 +200,26 @@ elif [ ! -x "$BIN" ] || [ -n "${FORCE_BUILD:-}" ]; then
   as_node "cd '$src' && $goenv bash /tmp/zetaphy-setup-node.sh --patch-source '$src'"
   as_node "cd '$src' && $goenv make install"
   install -m 755 "/home/${NODE_USER}/go/bin/evmd" "$BIN"
+  [ "$(as_node "cd '$src/evmd' && $goenv go list -m -f '{{.Version}}' github.com/CosmWasm/wasmvm/v3")" = "$WASMVM_VERSION" ] || { echo "wasmvm is not $WASMVM_VERSION"; exit 1; }
+  wasmvm_so="$(as_node "cd '$src/evmd' && $goenv go list -m -f '{{.Dir}}' github.com/CosmWasm/wasmvm/v3")/internal/api/libwasmvm.$(uname -m).so"
+fi
+# libwasmvm, the CosmWasm VM the binary links (stage 7), in /usr/local/lib:
+# the copy in the wasmvm Go module just built against (go.sum verified it),
+# or for a prebuilt binary (ZETAPHYD_BIN) wasmvm's own release file; either
+# way checked against the pin at the top.
+arch=$(uname -m); want_var="WASMVM_SO_SHA256_$arch"; want=${!want_var:-}
+[ -n "$want" ] || { echo "CosmWasm: no libwasmvm for $arch (x86_64 or aarch64 only)"; exit 1; }
+lib="/usr/local/lib/libwasmvm.$arch.so"
+if ! echo "$want  $lib" | sha256sum -c --quiet - 2>/dev/null; then
+  if [ -z "${wasmvm_so:-}" ]; then
+    wasmvm_so=$(mktemp)
+    curl -fsSL "https://github.com/CosmWasm/wasmvm/releases/download/$WASMVM_VERSION/libwasmvm.$arch.so" -o "$wasmvm_so"
+  fi
+  echo "$want  $wasmvm_so" | sha256sum -c --quiet - || { echo "libwasmvm hash mismatch"; exit 1; }
+  install -m 644 "$wasmvm_so" "$lib" && ldconfig
 fi
 "$BIN" version
+su -s /bin/bash "$NODE_USER" -c "$BIN q wasm libwasmvm-version" # the VM loads (CosmWasm)
 
 # Runs the chain binary as the node user with the right home.
 z() { su -s /bin/bash "$NODE_USER" -c "$BIN $*"; }
@@ -250,6 +280,10 @@ elif [ ! -f "$NODE_HOME/config/genesis.json" ]; then
   # Key 0f = the security core (Q-day, threat gate, IBC hold; all off until
   # voted on) from block 1; a running chain gets it with "zetaphy-v3".
   jqg '.app_state.zetaphypq = (((.app_state.zetaphypq // []) | map(select(.key != "08" and .key != "0f"))) + [{"key":"08","value":"0000000000000001"},{"key":"0f","value":"0000000000000001"}]) | .app_state.evm.params.history_serve_window = "8191"'
+  # CosmWasm (stage 7): contract code is stored by a governance vote only
+  # (gov.sh wasm-store); anyone instantiates it. `zetaphyd init` writes the
+  # same; set here so it is explicit.
+  jqg '.app_state.wasm.params = {"code_upload_access":{"permission":"Nobody","addresses":[]},"instantiate_default_permission":"Everybody"}'
   # Standard contracts (CREATE2 deployer, Multicall3, Permit2, Safe factory).
   pre=$(as_node mktemp) && zetaphy_preinstalls | as_node "cat > '$pre'"
   as_node "jq --slurpfile p '$pre' '.app_state.evm.preinstalls = \$p[0]' '$G' > '$G.tmp' && mv '$G.tmp' '$G' && rm -f '$pre'"
@@ -310,6 +344,11 @@ as_node "sed -i -E 's/^evm-chain-id = .*/evm-chain-id = $EVM_CHAIN_ID/' '$A'"
 # Keep ~6 days of state, not all of it: disk stays small on free VMs.
 as_node "sed -i -E 's/^pruning = .*/pruning = \"custom\"/; s/^pruning-keep-recent = .*/pruning-keep-recent = \"100000\"/; s/^pruning-interval = .*/pruning-interval = \"10\"/' '$A'"
 [ "$mem_kb" -lt 3000000 ] && as_node "sed -i -E 's/^iavl-cache-size = .*/iavl-cache-size = 50000/' '$A'"
+# CosmWasm: contract queries capped at 3M gas; the VM's module cache at
+# 100 MiB, 32 MiB under 3 GB of RAM (it holds only contracts in use).
+wcache=100; [ "$mem_kb" -lt 3000000 ] && wcache=32
+as_node "grep -q '^\[wasm\]' '$A' || printf '\n[wasm]\nquery_gas_limit = 3000000\nmemory_cache_size = 100\n' >> '$A'"
+as_node "sed -i -E 's/^memory_cache_size = .*/memory_cache_size = $wcache/' '$A'"
 if [ "$LOW_EGRESS" = 1 ]; then
   # Few peers and a 256 KB/s ceiling per peer: other nodes still sync, slowly.
   as_node "sed -i -E 's/^max_num_inbound_peers = .*/max_num_inbound_peers = 4/; s/^max_num_outbound_peers = .*/max_num_outbound_peers = 2/; s/^send_rate = .*/send_rate = 262144/' '$C'"
@@ -683,6 +722,49 @@ index f06ec14..98f8abe 100644
 +func (am AppModule) IsOnePerModuleType() {}
 ZETAPHY_RL_PATCH
 : <<'ZETAPHY_PQ_PATCH'
+diff --git a/ante/ante.go b/ante/ante.go
+index 4db3133..57347cd 100644
+--- a/ante/ante.go
++++ b/ante/ante.go
+@@ -36,6 +36,9 @@ type HandlerOptions struct {
+ 	// use dynamic fee checker or the cosmos-sdk default one for native transactions
+ 	DynamicFeeChecker bool
+ 	PendingTxListener PendingTxListener
++	// ZETAPHY: decorators for Cosmos txs that run right after the context
++	// setup (CosmWasm's: simulation gas cap, tx counter, gas register).
++	ExtraCosmosDecorators []sdk.AnteDecorator
+ }
+ 
+ // Validate checks if the keepers are defined
+diff --git a/ante/cosmos.go b/ante/cosmos.go
+index d1bad06..9cb92e6 100644
+--- a/ante/cosmos.go
++++ b/ante/cosmos.go
+@@ -19,13 +19,16 @@ func newCosmosAnteHandler(ctx sdk.Context, options HandlerOptions) sdk.AnteHandl
+ 		txFeeChecker = evmante.NewDynamicFeeChecker(&feemarketParams)
+ 	}
+ 
+-	return sdk.ChainAnteDecorators(
++	decorators := []sdk.AnteDecorator{
+ 		cosmosante.NewRejectMessagesDecorator(), // reject MsgEthereumTxs
+ 		cosmosante.NewAuthzLimiterDecorator( // disable the Msg types that cannot be included on an authz.MsgExec msgs field
+ 			sdk.MsgTypeURL(&evmtypes.MsgEthereumTx{}),
+ 			sdk.MsgTypeURL(&sdkvesting.MsgCreateVestingAccount{}),
+ 		),
+ 		ante.NewSetUpContextDecorator(),
++	}
++	decorators = append(decorators, options.ExtraCosmosDecorators...) // ZETAPHY
++	return sdk.ChainAnteDecorators(append(decorators,
+ 		ante.NewExtensionOptionsDecorator(options.ExtensionOptionChecker),
+ 		ante.NewValidateBasicDecorator(),
+ 		ante.NewTxTimeoutHeightDecorator(),
+@@ -40,5 +43,5 @@ func newCosmosAnteHandler(ctx sdk.Context, options HandlerOptions) sdk.AnteHandl
+ 		ante.NewSigVerificationDecorator(options.AccountKeeper, options.SignModeHandler),
+ 		ante.NewIncrementSequenceDecorator(options.AccountKeeper),
+ 		ibcante.NewRedundantRelayDecorator(options.IBCKeeper),
+-	)
++	)...)
+ }
 diff --git a/ante/sigverify.go b/ante/sigverify.go
 index 2710573..f3d89ce 100644
 --- a/ante/sigverify.go
@@ -987,10 +1069,21 @@ index 0000000..62d63ad
 +	return pk.UnmarshalBinary(bytes.Clone(m.Key)) == nil
 +}
 diff --git a/evmd/app.go b/evmd/app.go
-index 204345c..45c8bad 100644
+index 204345c..35824e7 100644
 --- a/evmd/app.go
 +++ b/evmd/app.go
-@@ -36,6 +36,10 @@ import (
+@@ -14,6 +14,10 @@ import (
+ 	_ "github.com/ethereum/go-ethereum/eth/tracers/js"
+ 	_ "github.com/ethereum/go-ethereum/eth/tracers/native"
+ 
++	"github.com/CosmWasm/wasmd/x/wasm"
++	wasmkeeper "github.com/CosmWasm/wasmd/x/wasm/keeper"
++	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
++
+ 	abci "github.com/cometbft/cometbft/abci/types"
+ 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
+ 
+@@ -36,6 +40,10 @@ import (
  	feemarketkeeper "github.com/cosmos/evm/x/feemarket/keeper"
  	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
  	ibccallbackskeeper "github.com/cosmos/evm/x/ibc/callbacks/keeper"
@@ -1001,7 +1094,7 @@ index 204345c..45c8bad 100644
  	"github.com/cosmos/evm/x/vm"
  	evmkeeper "github.com/cosmos/evm/x/vm/keeper"
  	vmrunner "github.com/cosmos/evm/x/vm/runner"
-@@ -179,6 +183,12 @@ type EVMD struct {
+@@ -179,6 +187,15 @@ type EVMD struct {
  	IBCKeeper      *ibckeeper.Keeper // IBC Keeper must be a pointer in the app, so we can SetRouter on it correctly
  	TransferKeeper *transferkeeper.Keeper
  	CallbackKeeper ibccallbackskeeper.ContractKeeper
@@ -1011,10 +1104,13 @@ index 204345c..45c8bad 100644
 +	// ZETAPHY security core (zetaphy_security.go)
 +	secPrecompile *securityPrecompile
 +	ibcHoldStack  *ibcHoldMiddleware
++	// ZETAPHY stage 7: CosmWasm contracts (zetaphy_cosmwasm.go)
++	WasmKeeper     wasmkeeper.Keeper
++	wasmNodeConfig wasmtypes.NodeConfig
  
  	// Cosmos EVM keepers
  	FeeMarketKeeper feemarketkeeper.Keeper
-@@ -238,9 +248,10 @@ func NewExampleApp(
+@@ -238,9 +255,11 @@ func NewExampleApp(
  		govtypes.StoreKey, consensusparamtypes.StoreKey,
  		upgradetypes.StoreKey, feegrant.StoreKey, evidencetypes.StoreKey, authzkeeper.StoreKey,
  		// ibc keys
@@ -1022,11 +1118,12 @@ index 204345c..45c8bad 100644
 +		ibcexported.StoreKey, ibctransfertypes.StoreKey, ratelimittypes.StoreKey,
  		// Cosmos EVM store keys
  		evmtypes.StoreKey, feemarkettypes.StoreKey, erc20types.StoreKey,
-+		pqStoreKey, // ZETAPHY: quantum locks and validator vote keys
++		pqStoreKey,         // ZETAPHY: quantum locks and validator vote keys
++		wasmtypes.StoreKey, // ZETAPHY: CosmWasm contracts
  	)
  	oKeys := storetypes.NewObjectStoreKeys(banktypes.ObjectStoreKey, evmtypes.ObjectKey)
  
-@@ -487,6 +498,10 @@ func NewExampleApp(
+@@ -487,6 +506,10 @@ func NewExampleApp(
  
  	// enable virtual fee collection
  	app.EVMKeeper.EnableVirtualFeeCollection()
@@ -1037,7 +1134,7 @@ index 204345c..45c8bad 100644
  
  	app.Erc20Keeper = erc20keeper.NewKeeper(
  		keys[erc20types.StoreKey],
-@@ -530,9 +545,34 @@ func NewExampleApp(
+@@ -530,9 +553,38 @@ func NewExampleApp(
  	callbacksMiddleware.SetUnderlyingApplication(transferStack)
  	transferStack = callbacksMiddleware
  
@@ -1069,10 +1166,14 @@ index 204345c..45c8bad 100644
 +	rateLimitV2 := ratelimitv2.NewIBCMiddleware(*app.RateLimitKeeper, transferStackV2)
 +	transferStackV2 = &rateLimitV2
 +	transferStackV2 = &ibcHoldV2{app: transferStackV2, z: app} // ZETAPHY: over the hold threshold is refused on v2
++
++	// ZETAPHY: CosmWasm (zetaphy_cosmwasm.go). Its IBC ports get no route below:
++	// IBC for contracts is off; their ICS-20 transfers use the stack above.
++	app.wasmNodeConfig = app.setupWasm(appOpts, homePath)
  
  	// Create static IBC router, add transfer route, then set and seal it
  	ibcRouter := porttypes.NewRouter()
-@@ -579,6 +619,7 @@ func NewExampleApp(
+@@ -579,10 +631,13 @@ func NewExampleApp(
  		ibc.NewAppModule(app.IBCKeeper),
  		ibctm.NewAppModule(tmLightClientModule),
  		transferModule,
@@ -1080,15 +1181,22 @@ index 204345c..45c8bad 100644
  		// Cosmos EVM modules
  		vmModule,
  		feemarket.NewAppModule(app.FeeMarketKeeper),
-@@ -598,6 +639,7 @@ func NewExampleApp(
+ 		erc20.NewAppModule(app.Erc20Keeper, app.AccountKeeper),
++		// ZETAPHY: CosmWasm, last: contracts may call any module
++		wasm.NewAppModule(appCodec, &app.WasmKeeper, app.StakingKeeper, app.AccountKeeper, app.BankKeeper, app.MsgServiceRouter(), nil),
+ 	)
+ 
+ 	// BasicModuleManager defines the module BasicManager which is in charge of setting up basic,
+@@ -598,6 +653,8 @@ func NewExampleApp(
  			ibctransfertypes.ModuleName: transfer.AppModuleBasic{},
  		},
  	)
-+	app.BasicModuleManager[pqStoreKey] = pqGenesisBasic{} // ZETAPHY: app_state.zetaphypq in `init` (zetaphy_upgrade.go)
++	app.BasicModuleManager[pqStoreKey] = pqGenesisBasic{}             // ZETAPHY: app_state.zetaphypq in `init` (zetaphy_upgrade.go)
++	app.BasicModuleManager[wasmtypes.ModuleName] = wasmGenesisBasic{} // ZETAPHY: upload by governance only in `init` (zetaphy_cosmwasm.go)
  	app.BasicModuleManager.RegisterLegacyAminoCodec(legacyAmino)
  	app.BasicModuleManager.RegisterInterfaces(interfaceRegistry)
  
-@@ -618,7 +660,7 @@ func NewExampleApp(
+@@ -618,7 +675,7 @@ func NewExampleApp(
  		minttypes.ModuleName,
  
  		// IBC modules
@@ -1097,7 +1205,15 @@ index 204345c..45c8bad 100644
  
  		// Cosmos EVM BeginBlockers
  		erc20types.ModuleName, feemarkettypes.ModuleName,
-@@ -645,7 +687,7 @@ func NewExampleApp(
+@@ -631,6 +688,7 @@ func NewExampleApp(
+ 		authz.ModuleName, feegrant.ModuleName,
+ 		consensusparamtypes.ModuleName,
+ 		vestingtypes.ModuleName,
++		wasmtypes.ModuleName,
+ 	)
+ 
+ 	// NOTE: the feemarket module should go last in order of end blockers that are actually doing something,
+@@ -645,12 +703,13 @@ func NewExampleApp(
  		evmtypes.ModuleName, erc20types.ModuleName, feemarkettypes.ModuleName,
  
  		// no-ops
@@ -1106,7 +1222,13 @@ index 204345c..45c8bad 100644
  		distrtypes.ModuleName,
  		slashingtypes.ModuleName, minttypes.ModuleName,
  		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,
-@@ -670,7 +712,7 @@ func NewExampleApp(
+ 		feegrant.ModuleName, upgradetypes.ModuleName, consensusparamtypes.ModuleName,
+ 		vestingtypes.ModuleName,
++		wasmtypes.ModuleName,
+ 	)
+ 
+ 	// NOTE: The genutils module must occur after staking so that pools are
+@@ -670,9 +729,10 @@ func NewExampleApp(
  		feemarkettypes.ModuleName,
  		erc20types.ModuleName,
  
@@ -1114,8 +1236,11 @@ index 204345c..45c8bad 100644
 +		ibctransfertypes.ModuleName, ratelimittypes.ModuleName,
  		genutiltypes.ModuleName, evidencetypes.ModuleName, authz.ModuleName,
  		feegrant.ModuleName, upgradetypes.ModuleName, vestingtypes.ModuleName,
++		wasmtypes.ModuleName, // ZETAPHY: after IBC transfer and genutil, as in wasmd
  	}
-@@ -684,10 +726,14 @@ func NewExampleApp(
+ 	app.ModuleManager.SetOrderInitGenesis(genesisModuleOrder...)
+ 	app.ModuleManager.SetOrderExportGenesis(genesisModuleOrder...)
+@@ -684,10 +744,14 @@ func NewExampleApp(
  	if err = app.ModuleManager.RegisterServices(app.configurator); err != nil {
  		panic(fmt.Sprintf("failed to register services in module manager: %s", err.Error()))
  	}
@@ -1130,7 +1255,7 @@ index 204345c..45c8bad 100644
  
  	autocliv1.RegisterQueryServer(app.GRPCQueryRouter(), runtimeservices.NewAutoCLIQueryService(app.ModuleManager.Modules))
  
-@@ -730,6 +776,10 @@ func NewExampleApp(
+@@ -730,6 +794,10 @@ func NewExampleApp(
  	if err := app.configureEVMMempool(appOpts, logger); err != nil {
  		panic(fmt.Sprintf("failed to configure EVM mempool: %s", err.Error()))
  	}
@@ -1141,7 +1266,36 @@ index 204345c..45c8bad 100644
  
  	// In v0.46, the SDK introduces _postHandlers_. PostHandlers are like
  	// antehandlers, but are run _after_ the `runMsgs` execution. They are also
-@@ -812,7 +862,7 @@ func (app *EVMD) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
+@@ -751,6 +819,13 @@ func NewExampleApp(
+ 	// upgrade.
+ 	app.setPostHandler()
+ 
++	// ZETAPHY: state sync snapshots carry the contract code too.
++	if manager := app.SnapshotManager(); manager != nil {
++		if err := manager.RegisterExtensions(wasmkeeper.NewWasmSnapshotter(app.CommitMultiStore(), &app.WasmKeeper)); err != nil {
++			panic(fmt.Errorf("failed to register wasm snapshot extension: %w", err))
++		}
++	}
++
+ 	// At startup, after all modules have been registered, check that all prot
+ 	// annotations are correct.
+ 	protoFiles, err := proto.MergedRegistry()
+@@ -777,6 +852,7 @@ func NewExampleApp(
+ 
+ 		// set global evm variables from KV store
+ 		vmModule.HydrateGlobals(ctx)
++		app.wasmPinnedCodes(ctx) // ZETAPHY: pinned contracts into the VM cache
+ 	}
+ 
+ 	vmrunner.SetRunner(bApp, txnrunner.NewSTMRunner(
+@@ -807,12 +883,14 @@ func (app *EVMD) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
+ 		MaxTxGasWanted:         maxGasWanted,
+ 		DynamicFeeChecker:      true,
+ 		PendingTxListener:      app.onPendingTx,
++		// ZETAPHY: wasmd's ante decorators for Cosmos txs (zetaphy_cosmwasm.go)
++		ExtraCosmosDecorators: app.wasmAnteDecorators(app.wasmNodeConfig),
+ 	}
+ 	if err := options.Validate(); err != nil {
  		panic(err)
  	}
  
@@ -1150,7 +1304,7 @@ index 204345c..45c8bad 100644
  }
  
  func (app *EVMD) onPendingTx(hash common.Hash) {
-@@ -842,7 +892,21 @@ func (app *EVMD) Name() string { return app.BaseApp.Name() }
+@@ -842,7 +920,21 @@ func (app *EVMD) Name() string { return app.BaseApp.Name() }
  
  // BeginBlocker application updates every begin block
  func (app *EVMD) BeginBlocker(ctx sdk.Context) (sdk.BeginBlock, error) {
@@ -1173,7 +1327,7 @@ index 204345c..45c8bad 100644
  }
  
  // EndBlocker application updates every end block
-@@ -869,10 +933,23 @@ func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci
+@@ -869,10 +961,23 @@ func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci
  		panic(err)
  	}
  
@@ -1200,10 +1354,30 @@ index 204345c..45c8bad 100644
  }
  
 diff --git a/evmd/cmd/evmd/cmd/root.go b/evmd/cmd/evmd/cmd/root.go
-index 4da3349..7fe2640 100644
+index 4da3349..8eda4d3 100644
 --- a/evmd/cmd/evmd/cmd/root.go
 +++ b/evmd/cmd/evmd/cmd/root.go
-@@ -249,6 +249,8 @@ func txCommand() *cobra.Command {
+@@ -22,6 +22,8 @@ import (
+ 	"github.com/cosmos/evm/utils"
+ 	"github.com/cosmos/evm/x/vm/types"
+ 
++	"github.com/CosmWasm/wasmd/x/wasm"
++
+ 	"cosmossdk.io/log/v2"
+ 	confixcmd "cosmossdk.io/tools/confix/cmd"
+ 	"github.com/cosmos/cosmos-sdk/store/v2"
+@@ -204,7 +206,9 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
+ 	}
+ }
+ 
+-func addModuleInitFlags(_ *cobra.Command) {}
++// ZETAPHY: --wasm.* start flags ([wasm] in app.toml) and the check that
++// the linked libwasmvm matches the wasmvm Go package.
++func addModuleInitFlags(startCmd *cobra.Command) { wasm.AddModuleInitFlags(startCmd) }
+ 
+ func queryCommand() *cobra.Command {
+ 	cmd := &cobra.Command{
+@@ -249,6 +253,8 @@ func txCommand() *cobra.Command {
  		authcmd.GetEncodeCommand(),
  		authcmd.GetDecodeCommand(),
  		authcmd.GetSimulateCmd(),
@@ -1212,6 +1386,27 @@ index 4da3349..7fe2640 100644
  	)
  
  	cmd.PersistentFlags().String(flags.FlagChainID, "", "The network chain ID")
+diff --git a/evmd/config/permissions.go b/evmd/config/permissions.go
+index 312b521..6b8033d 100644
+--- a/evmd/config/permissions.go
++++ b/evmd/config/permissions.go
+@@ -14,6 +14,8 @@ import (
+ 	feemarkettypes "github.com/cosmos/evm/x/feemarket/types"
+ 	vmtypes "github.com/cosmos/evm/x/vm/types"
+ 	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
++
++	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
+ 	corevm "github.com/ethereum/go-ethereum/core/vm"
+ )
+ 
+@@ -58,6 +60,7 @@ var maccPerms = map[string][]string{
+ 	stakingtypes.BondedPoolName:    {authtypes.Burner, authtypes.Staking},
+ 	stakingtypes.NotBondedPoolName: {authtypes.Burner, authtypes.Staking},
+ 	govtypes.ModuleName:            {authtypes.Burner},
++	wasmtypes.ModuleName:           {authtypes.Burner}, // ZETAPHY: CosmWasm (BankMsg::Burn)
+ 
+ 	// Cosmos EVM modules
+ 	vmtypes.ModuleName:        {authtypes.Minter, authtypes.Burner},
 diff --git a/evmd/export.go b/evmd/export.go
 index 9fdd8ef..e6ff55d 100644
 --- a/evmd/export.go
@@ -1227,22 +1422,189 @@ index 9fdd8ef..e6ff55d 100644
  	if err != nil {
  		return servertypes.ExportedApp{}, err
 diff --git a/evmd/go.mod b/evmd/go.mod
-index e503386..dc04366 100644
+index e503386..cbc3a7e 100644
 --- a/evmd/go.mod
 +++ b/evmd/go.mod
-@@ -88,6 +88,7 @@ require (
- 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
- 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
- 	github.com/chzyer/readline v1.5.1 // indirect
-+	github.com/cloudflare/circl v1.6.3 // indirect
- 	github.com/cloudwego/base64x v0.1.6 // indirect
- 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
- 	github.com/cockroachdb/errors v1.13.0 // indirect
+@@ -4,20 +4,24 @@ go 1.25.9
+ 
+ require (
+ 	cosmossdk.io/api v1.0.0
+-	cosmossdk.io/client/v2 v2.0.0-beta.10.0.20260227212600-39d4711b8970
++	cosmossdk.io/client/v2 v2.11.0
+ 	cosmossdk.io/core v1.1.0
+ 	cosmossdk.io/errors v1.1.0
+ 	cosmossdk.io/log/v2 v2.1.0
+ 	cosmossdk.io/math v1.5.3
+ 	cosmossdk.io/tools/confix v0.1.2
++	github.com/CosmWasm/wasmd v0.70.5
++	github.com/CosmWasm/wasmvm/v3 v3.0.9
++	github.com/cloudflare/circl v1.6.3
+ 	github.com/cometbft/cometbft v0.39.3
+ 	github.com/cosmos/cosmos-db v1.1.3
+ 	github.com/cosmos/cosmos-sdk v0.54.3
+ 	github.com/cosmos/cosmos-sdk/store/v2 v2.0.0
+ 	github.com/cosmos/evm v0.2.0
+ 	github.com/cosmos/gogoproto v1.7.2
+-	github.com/cosmos/ibc-go/v11 v11.0.0
+-	github.com/ethereum/go-ethereum v1.16.8
++	github.com/cosmos/ibc-go/v11 v11.2.0
++	github.com/ethereum/go-ethereum v1.17.0
++	github.com/grpc-ecosystem/grpc-gateway v1.16.0
+ 	github.com/onsi/ginkgo/v2 v2.23.4
+ 	github.com/onsi/gomega v1.38.0
+ 	github.com/spf13/cast v1.10.0
+@@ -25,8 +29,9 @@ require (
+ 	github.com/spf13/pflag v1.0.10
+ 	github.com/spf13/viper v1.21.0
+ 	github.com/stretchr/testify v1.11.1
+-	golang.org/x/sync v0.20.0
++	golang.org/x/sync v0.22.0
+ 	google.golang.org/grpc v1.80.0
++	google.golang.org/protobuf v1.36.11
+ )
+ 
+ require (
+@@ -117,6 +122,7 @@ require (
+ 	github.com/desertbit/timer v1.0.1 // indirect
+ 	github.com/dgraph-io/badger/v4 v4.9.1 // indirect
+ 	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
++	github.com/distribution/reference v0.6.0 // indirect
+ 	github.com/dlclark/regexp2 v1.7.0 // indirect
+ 	github.com/dop251/goja v0.0.0-20230605162241-28ee0ee714f3 // indirect
+ 	github.com/dunglas/httpsfv v1.1.0 // indirect
+@@ -154,6 +160,7 @@ require (
+ 	github.com/google/btree v1.1.3 // indirect
+ 	github.com/google/flatbuffers v25.2.10+incompatible // indirect
+ 	github.com/google/go-cmp v0.7.0 // indirect
++	github.com/google/gofuzz v1.2.0 // indirect
+ 	github.com/google/orderedcode v0.0.1 // indirect
+ 	github.com/google/pprof v0.0.0-20250403155104-27863c87afa6 // indirect
+ 	github.com/google/s2a-go v0.1.9 // indirect
+@@ -164,7 +171,6 @@ require (
+ 	github.com/gorilla/mux v1.8.1 // indirect
+ 	github.com/gorilla/websocket v1.5.3 // indirect
+ 	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0 // indirect
+-	github.com/grpc-ecosystem/grpc-gateway v1.16.0 // indirect
+ 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
+ 	github.com/gsterjov/go-libsecret v0.0.0-20161001094733-a6f4afe4910c // indirect
+ 	github.com/hashicorp/aws-sdk-go-base/v2 v2.0.0-beta.72 // indirect
+@@ -191,7 +197,7 @@ require (
+ 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
+ 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
+ 	github.com/jmhodges/levigo v1.0.0 // indirect
+-	github.com/klauspost/compress v1.18.5 // indirect
++	github.com/klauspost/compress v1.19.1 // indirect
+ 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+ 	github.com/koron/go-ssdp v0.0.6 // indirect
+ 	github.com/kr/pretty v0.3.1 // indirect
+@@ -235,9 +241,10 @@ require (
+ 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+ 	github.com/oasisprotocol/curve25519-voi v0.0.0-20251114093237-2ab5a27a1729 // indirect
+ 	github.com/oklog/run v1.2.0 // indirect
++	github.com/opencontainers/go-digest v1.0.0 // indirect
+ 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
+ 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
+-	github.com/petermattis/goid v0.0.0-20260113132338-7c7de50cc741 // indirect
++	github.com/petermattis/goid v0.0.0-20260226131333-17d1149c6ac6 // indirect
+ 	github.com/pion/datachannel v1.5.10 // indirect
+ 	github.com/pion/dtls/v2 v2.2.12 // indirect
+ 	github.com/pion/dtls/v3 v3.1.2 // indirect
+@@ -263,19 +270,20 @@ require (
+ 	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
+ 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+ 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
+-	github.com/prometheus/client_golang v1.23.2 // indirect
++	github.com/prometheus/client_golang v1.24.1 // indirect
+ 	github.com/prometheus/client_model v0.6.2 // indirect
+-	github.com/prometheus/common v0.67.5 // indirect
+-	github.com/prometheus/procfs v0.20.1 // indirect
++	github.com/prometheus/common v0.70.1 // indirect
++	github.com/prometheus/procfs v0.21.1 // indirect
+ 	github.com/quic-go/qpack v0.6.0 // indirect
+-	github.com/quic-go/quic-go v0.59.0 // indirect
+-	github.com/quic-go/webtransport-go v0.10.0 // indirect
++	github.com/quic-go/quic-go v0.60.0 // indirect
++	github.com/quic-go/webtransport-go v0.11.1 // indirect
+ 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9 // indirect
+ 	github.com/rogpeppe/go-internal v1.14.1 // indirect
+ 	github.com/rs/cors v1.11.1 // indirect
+-	github.com/rs/zerolog v1.35.0 // indirect
++	github.com/rs/zerolog v1.35.1 // indirect
+ 	github.com/sagikazarmark/locafero v0.12.0 // indirect
+ 	github.com/sasha-s/go-deadlock v0.3.9 // indirect
++	github.com/shamaton/msgpack/v2 v2.2.3 // indirect
+ 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
+ 	github.com/shirou/gopsutil/v4 v4.26.4 // indirect
+ 	github.com/spaolacci/murmur3 v1.1.0 // indirect
+@@ -342,22 +350,21 @@ require (
+ 	go.yaml.in/yaml/v2 v2.4.4 // indirect
+ 	go.yaml.in/yaml/v3 v3.0.4 // indirect
+ 	golang.org/x/arch v0.26.0 // indirect
+-	golang.org/x/crypto v0.50.0 // indirect
++	golang.org/x/crypto v0.54.0 // indirect
+ 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
+-	golang.org/x/mod v0.34.0 // indirect
+-	golang.org/x/net v0.53.0 // indirect
++	golang.org/x/mod v0.37.0 // indirect
++	golang.org/x/net v0.57.0 // indirect
+ 	golang.org/x/oauth2 v0.36.0 // indirect
+-	golang.org/x/sys v0.43.0 // indirect
+-	golang.org/x/telemetry v0.0.0-20260311193753-579e4da9a98c // indirect
+-	golang.org/x/term v0.42.0 // indirect
+-	golang.org/x/text v0.36.0 // indirect
++	golang.org/x/sys v0.47.0 // indirect
++	golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57 // indirect
++	golang.org/x/term v0.45.0 // indirect
++	golang.org/x/text v0.40.0 // indirect
+ 	golang.org/x/time v0.15.0 // indirect
+-	golang.org/x/tools v0.43.0 // indirect
++	golang.org/x/tools v0.47.0 // indirect
+ 	google.golang.org/api v0.276.0 // indirect
+ 	google.golang.org/genproto v0.0.0-20260414002931-afd174a4e478 // indirect
+ 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
+ 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
+-	google.golang.org/protobuf v1.36.11 // indirect
+ 	gopkg.in/yaml.v2 v2.4.0 // indirect
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+ 	gotest.tools/v3 v3.5.2 // indirect
+@@ -372,6 +379,10 @@ replace (
+ 	// use cosmos fork of keyring
+ 	github.com/99designs/keyring => github.com/cosmos/keyring v1.2.0
+ 	github.com/cosmos/evm => ../
++	// ZETAPHY: keep IBC at the audited v11.0.0 (wasmd v0.70.5 asks for
++	// v11.2.0, whose test app links ibc-go's own rate-limiting module next
++	// to x/ratelimit; wasmd v0.70.0-v0.70.2 were built on v11.0.0)
++	github.com/cosmos/ibc-go/v11 => github.com/cosmos/ibc-go/v11 v11.0.0
+ 	// use Cosmos geth fork
+ 	// branch: release/1.17
+ 	github.com/ethereum/go-ethereum => github.com/cosmos/go-ethereum v1.17.2-cosmos-0
 diff --git a/evmd/go.sum b/evmd/go.sum
-index 92d6f82..4ce53b3 100644
+index 92d6f82..193e955 100644
 --- a/evmd/go.sum
 +++ b/evmd/go.sum
-@@ -220,6 +220,8 @@ github.com/circonus-labs/circonus-gometrics v2.3.1+incompatible/go.mod h1:nmEj6D
+@@ -24,8 +24,8 @@ cloud.google.com/go/trace v1.13.0 h1:RfqsqPOiSCG8ql50UZt5F65KrVa1zbY9mJrO7xvZfbE
+ cloud.google.com/go/trace v1.13.0/go.mod h1:r+bdAn16dKLSV1G2D5v3e58IlQlizfxWrUfjx7kM7X0=
+ cosmossdk.io/api v1.0.0 h1:qTV8OPVEwcBPwp2b9p4Qy4noZyihJ+sOMaWL/VT+RCc=
+ cosmossdk.io/api v1.0.0/go.mod h1:fKRljeYk+04p4T8Shdyv+uH2fSVyzHoWrvDAs/7OxfI=
+-cosmossdk.io/client/v2 v2.0.0-beta.10.0.20260227212600-39d4711b8970 h1:hRL2KLqyVnbOfb2UzNQUZ0IXdL8TsHSGeYyF3tbcfcM=
+-cosmossdk.io/client/v2 v2.0.0-beta.10.0.20260227212600-39d4711b8970/go.mod h1:cgdrvgMJ23AzeYIXQtcIyw283R9heNuGXHoHYJ5KvdM=
++cosmossdk.io/client/v2 v2.11.0 h1:k3hg9liNjrLv5P/PEle8wcihSwQ/ALCr1fja2sp5His=
++cosmossdk.io/client/v2 v2.11.0/go.mod h1:wJNFx9sSqSDE3QeXIU6DRZDagqdv98j6O7hmjnfGa2I=
+ cosmossdk.io/collections v1.4.0 h1:b373bkxCxKiRbapxZ42TRmcKJEnBVBebdQVk9I5IkkE=
+ cosmossdk.io/collections v1.4.0/go.mod h1:gxbieVY3tjbvWlkm3yOXf7sGyDrVi12haZH+sek6whw=
+ cosmossdk.io/core v1.1.0 h1:iJ7j2DjNsFzg4/z4ImNQYzy2D4LfMCsaQ8Lrz1KCmxk=
+@@ -51,6 +51,10 @@ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEK
+ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
+ github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
+ github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
++github.com/CosmWasm/wasmd v0.70.5 h1:9HxdLFGHy2ZA121MZGVTSJqjeBTrShAXFI7Hr+4ldho=
++github.com/CosmWasm/wasmd v0.70.5/go.mod h1:KUtQdhbr0pwlCdSpwsOmnquSl+1lA9t4pNS+VsJLxW4=
++github.com/CosmWasm/wasmvm/v3 v3.0.9 h1:pQGrS3w8udbKvumbNUBrZgZXfDM+3mHXRdZ0EOVn3zU=
++github.com/CosmWasm/wasmvm/v3 v3.0.9/go.mod h1:oknpb1bFERvvKcY7vHRp1F/Y/z66xVrsl7n9uWkOAlM=
+ github.com/DataDog/datadog-go v3.2.0+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
+ github.com/DataDog/datadog-go v4.8.3+incompatible h1:fNGaYSuObuQb5nzeTQqowRAd9bpDIRRV4/gUtIBjh8Q=
+ github.com/DataDog/datadog-go v4.8.3+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
+@@ -220,6 +224,8 @@ github.com/circonus-labs/circonus-gometrics v2.3.1+incompatible/go.mod h1:nmEj6D
  github.com/circonus-labs/circonusllhist v0.1.3/go.mod h1:kMXHVDlOchFAehlya5ePtbp5jckzBHf4XRpQvBOLI+I=
  github.com/clbanning/x2j v0.0.0-20191024224557-825249438eec/go.mod h1:jMjuTZXRI4dUb/I5gc9Hdhagfvm9+RyrPryS/auMzxE=
  github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
@@ -1251,6 +1613,196 @@ index 92d6f82..4ce53b3 100644
  github.com/cloudwego/base64x v0.1.6 h1:t11wG9AECkCDk5fMSoxmufanudBtJ+/HemLstXDLI2M=
  github.com/cloudwego/base64x v0.1.6/go.mod h1:OFcloc187FXDaYHvrNIjxSe8ncn0OOM8gEHfghB2IPU=
  github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGXZJjfX53e64911xZQV5JYwmTeXPW+k8Sc=
+@@ -336,6 +342,8 @@ github.com/dgraph-io/ristretto/v2 v2.4.0/go.mod h1:0KsrXtXvnv0EqnzyowllbVJB8yBon
+ github.com/dgrijalva/jwt-go v3.2.0+incompatible/go.mod h1:E3ru+11k8xSBh+hMPgOLZmtrrCbhqsmaPHjLKYnJCaQ=
+ github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da h1:aIftn67I1fkbMa512G+w+Pxci9hJPB8oMnkcP3iZF38=
+ github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da/go.mod h1:SqUrOPUnsFjfmXRMNPybcSiG0BgUW2AuFH8PAnS2iTw=
++github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
++github.com/distribution/reference v0.6.0/go.mod h1:BbU0aIcezP1/5jX/8MP0YiH4SdvB5Y4f/wlDRiLyi3E=
+ github.com/dlclark/regexp2 v1.4.1-0.20201116162257-a2a8dda75c91/go.mod h1:2pZnwuY/m+8K6iRw6wQdMtk+rH5tNGR1i55kozfMjCc=
+ github.com/dlclark/regexp2 v1.7.0 h1:7lJfhqlPssTb1WQx4yvTHN0uElPEv52sbaECrAQxjAo=
+ github.com/dlclark/regexp2 v1.7.0/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
+@@ -682,8 +690,8 @@ github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+o
+ github.com/kkdai/bstream v0.0.0-20161212061736-f391b8402d23/go.mod h1:J+Gs4SYgM6CZQHDETBtE9HaSEkGmuNXF86RwHhHUvq4=
+ github.com/klauspost/compress v1.10.3/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
+ github.com/klauspost/compress v1.11.7/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
+-github.com/klauspost/compress v1.18.5 h1:/h1gH5Ce+VWNLSWqPzOVn6XBO+vJbCNGvjoaGBFW2IE=
+-github.com/klauspost/compress v1.18.5/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
++github.com/klauspost/compress v1.19.1 h1:VsB4HPswih7mmZ8WleSFQ75c/Ui1M4trX5oAsJnhSlk=
++github.com/klauspost/compress v1.19.1/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
+ github.com/klauspost/cpuid/v2 v2.0.9/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
+ github.com/klauspost/cpuid/v2 v2.2.4/go.mod h1:RVVoqg1df56z8g3pUjL/3lE5UfnlrJX8tyFgg4nqhuY=
+ github.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=
+@@ -895,8 +903,8 @@ github.com/performancecopilot/speed v3.0.0+incompatible/go.mod h1:/CLtqpZ5gBg1M9
+ github.com/peterh/liner v1.1.1-0.20190123174540-a2c9a5303de7 h1:oYW+YCJ1pachXTQmzR3rNLYGGz4g/UgFcjb28p/viDM=
+ github.com/peterh/liner v1.1.1-0.20190123174540-a2c9a5303de7/go.mod h1:CRroGNssyjTd/qIG2FyxByd2S8JEAZXBl4qUrZf8GS0=
+ github.com/petermattis/goid v0.0.0-20250813065127-a731cc31b4fe/go.mod h1:pxMtw7cyUw6B2bRH0ZBANSPg+AoSud1I1iyJHI69jH4=
+-github.com/petermattis/goid v0.0.0-20260113132338-7c7de50cc741 h1:KPpdlQLZcHfTMQRi6bFQ7ogNO0ltFT4PmtwTLW4W+14=
+-github.com/petermattis/goid v0.0.0-20260113132338-7c7de50cc741/go.mod h1:pxMtw7cyUw6B2bRH0ZBANSPg+AoSud1I1iyJHI69jH4=
++github.com/petermattis/goid v0.0.0-20260226131333-17d1149c6ac6 h1:rh2lKw/P/EqHa724vYH2+VVQ1YnW4u6EOXl0PMAovZE=
++github.com/petermattis/goid v0.0.0-20260226131333-17d1149c6ac6/go.mod h1:pxMtw7cyUw6B2bRH0ZBANSPg+AoSud1I1iyJHI69jH4=
+ github.com/pierrec/lz4 v1.0.2-0.20190131084431-473cd7ce01a1/go.mod h1:3/3N9NVKO0jef7pBehbT1qWhCMrIgbYNnFAZCqQ5LRc=
+ github.com/pierrec/lz4 v2.0.5+incompatible/go.mod h1:pdkljMzZIN41W+lC3N2tnIh5sFi+IEE17M5jbnwPHcY=
+ github.com/pingcap/errors v0.11.4 h1:lFuQV/oaUMGcD2tqt+01ROSmJs75VG1ToEOkZIZ4nE4=
+@@ -971,8 +979,8 @@ github.com/prometheus/client_golang v1.3.0/go.mod h1:hJaj2vgQTGQmVCsAACORcieXFeD
+ github.com/prometheus/client_golang v1.4.0/go.mod h1:e9GMxYsXl05ICDXkRhurwBS4Q3OK1iX/F2sw+iXX5zU=
+ github.com/prometheus/client_golang v1.7.1/go.mod h1:PY5Wy2awLA44sXw4AOSfFBetzPP4j5+D6mVACh+pe2M=
+ github.com/prometheus/client_golang v1.11.1/go.mod h1:Z6t4BnS23TR94PD6BsDNk8yVqroYurpAkEiz0P2BEV0=
+-github.com/prometheus/client_golang v1.23.2 h1:Je96obch5RDVy3FDMndoUsjAhG5Edi49h0RJWRi/o0o=
+-github.com/prometheus/client_golang v1.23.2/go.mod h1:Tb1a6LWHB3/SPIzCoaDXI4I8UHKeFTEQ1YCr+0Gyqmg=
++github.com/prometheus/client_golang v1.24.1 h1:JnJkREXzWxUdCuPFpIWZiPispT9xVV59uiuyR2bPlnU=
++github.com/prometheus/client_golang v1.24.1/go.mod h1:F+oSRECHg4sse5ucfYpYDeIv/hu68Zo0uoHKetWnzcE=
+ github.com/prometheus/client_model v0.0.0-20180712105110-5c3871d89910/go.mod h1:MbSGuTsp3dbXC40dX6PRTWyKYBIrTGTE9sqQNg2J8bo=
+ github.com/prometheus/client_model v0.0.0-20190115171406-56726106282f/go.mod h1:MbSGuTsp3dbXC40dX6PRTWyKYBIrTGTE9sqQNg2J8bo=
+ github.com/prometheus/client_model v0.0.0-20190129233127-fd36f4220a90/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
+@@ -988,8 +996,8 @@ github.com/prometheus/common v0.9.1/go.mod h1:yhUN8i9wzaXS3w1O07YhxHEBxD+W35wd8b
+ github.com/prometheus/common v0.10.0/go.mod h1:Tlit/dnDKsSWFlCLTWaA1cyBgKHSMdTB80sz/V91rCo=
+ github.com/prometheus/common v0.15.0/go.mod h1:U+gB1OBLb1lF3O42bTCL+FK18tX9Oar16Clt/msog/s=
+ github.com/prometheus/common v0.26.0/go.mod h1:M7rCNAaPfAosfx8veZJCuw84e35h3Cfd9VFqTh1DIvc=
+-github.com/prometheus/common v0.67.5 h1:pIgK94WWlQt1WLwAC5j2ynLaBRDiinoAb86HZHTUGI4=
+-github.com/prometheus/common v0.67.5/go.mod h1:SjE/0MzDEEAyrdr5Gqc6G+sXI67maCxzaT3A2+HqjUw=
++github.com/prometheus/common v0.70.1 h1:1HvjP4D5oL3t8RsPlwxA9onvvStjtIHYE5XuuwOi/PY=
++github.com/prometheus/common v0.70.1/go.mod h1:VdFUQDMZK3VLkurFUVhia6uys/0suUp86TJz5qbJRhc=
+ github.com/prometheus/procfs v0.0.0-20181005140218-185b4288413d/go.mod h1:c3At6R/oaqEKCNdg8wHV1ftS6bRYblBhIjjI8uT2IGk=
+ github.com/prometheus/procfs v0.0.0-20190117184657-bf6a532e95b1/go.mod h1:c3At6R/oaqEKCNdg8wHV1ftS6bRYblBhIjjI8uT2IGk=
+ github.com/prometheus/procfs v0.0.2/go.mod h1:TjEm7ze935MbeOT/UhFTIMYKhuLP4wbCsTZCD3I8kEA=
+@@ -997,16 +1005,18 @@ github.com/prometheus/procfs v0.0.8/go.mod h1:7Qr8sr6344vo1JqZ6HhLceV9o3AJ1Ff+Gx
+ github.com/prometheus/procfs v0.1.3/go.mod h1:lV6e/gmhEcM9IjHGsFOCxxuZ+z1YqCvr4OA4YeYWdaU=
+ github.com/prometheus/procfs v0.3.0/go.mod h1:lV6e/gmhEcM9IjHGsFOCxxuZ+z1YqCvr4OA4YeYWdaU=
+ github.com/prometheus/procfs v0.6.0/go.mod h1:cz+aTbrPOrUb4q7XlbU9ygM+/jj0fzG6c1xBZuNvfVA=
+-github.com/prometheus/procfs v0.20.1 h1:XwbrGOIplXW/AU3YhIhLODXMJYyC1isLFfYCsTEycfc=
+-github.com/prometheus/procfs v0.20.1/go.mod h1:o9EMBZGRyvDrSPH1RqdxhojkuXstoe4UlK79eF5TGGo=
++github.com/prometheus/procfs v0.21.1 h1:GljZCt+zSTS+NZq88cyQ1LjZ+RCHp3uVuabBWA5+OJI=
++github.com/prometheus/procfs v0.21.1/go.mod h1:aB55Cww9pdSJVHk0hUf0inxWyyjPogFIjmHKYgMKmtY=
+ github.com/prysmaticlabs/gohashtree v0.0.4-beta h1:H/EbCuXPeTV3lpKeXGPpEV9gsUpkqOOVnWapUyeWro4=
+ github.com/prysmaticlabs/gohashtree v0.0.4-beta/go.mod h1:BFdtALS+Ffhg3lGQIHv9HDWuHS8cTvHZzrHWxwOtGOs=
++github.com/quic-go/go-ossfuzz-seeds v0.1.0 h1:APacT+iIaNF6fd8AGEiN3bT/Jtkd2jz4v4TzM7MFjy0=
++github.com/quic-go/go-ossfuzz-seeds v0.1.0/go.mod h1:3IOHRbJIc+L6YKMwfDtJAM9Vj9k0YY4muhuyUYk5tbk=
+ github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
+ github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
+-github.com/quic-go/quic-go v0.59.0 h1:OLJkp1Mlm/aS7dpKgTc6cnpynnD2Xg7C1pwL6vy/SAw=
+-github.com/quic-go/quic-go v0.59.0/go.mod h1:upnsH4Ju1YkqpLXC305eW3yDZ4NfnNbmQRCMWS58IKU=
+-github.com/quic-go/webtransport-go v0.10.0 h1:LqXXPOXuETY5Xe8ITdGisBzTYmUOy5eSj+9n4hLTjHI=
+-github.com/quic-go/webtransport-go v0.10.0/go.mod h1:LeGIXr5BQKE3UsynwVBeQrU1TPrbh73MGoC6jd+V7ow=
++github.com/quic-go/quic-go v0.60.0 h1:xcQioE8OM66UQLeUMHltK1CCcOu3JbVB4JAQdDQSB+0=
++github.com/quic-go/quic-go v0.60.0/go.mod h1:wpKpjmPpftl30sL6pFh7REVpjbcCVy4zt2vDyK1TuJk=
++github.com/quic-go/webtransport-go v0.11.1 h1:rrFQMO+7/52ZDJ04fsrjIaWqn6q1z1MYo9iVFq6JtbA=
++github.com/quic-go/webtransport-go v0.11.1/go.mod h1:SHgEzUFVyj+9WUSuGB1P6Zd351Pww2leWV3SwlTovkA=
+ github.com/rcrowley/go-metrics v0.0.0-20181016184325-3113b8401b8a/go.mod h1:bCqnVzQkZxMG4s8nGwiZ5l3QUCyqpo9Y+/ZMZ9VjZe4=
+ github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9 h1:bsUq1dX0N8AOIL7EB/X911+m4EHsnWEHeJ0c+3TTBrg=
+ github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9/go.mod h1:bCqnVzQkZxMG4s8nGwiZ5l3QUCyqpo9Y+/ZMZ9VjZe4=
+@@ -1022,8 +1032,8 @@ github.com/rogpeppe/go-internal v1.14.1/go.mod h1:MaRKkUm5W0goXpeCfT7UZI6fk/L7L7
+ github.com/rs/cors v1.7.0/go.mod h1:gFx+x8UowdsKA9AchylcLynDq+nNFfI8FkUZdN/jGCU=
+ github.com/rs/cors v1.11.1 h1:eU3gRzXLRK57F5rKMGMZURNdIG4EoAmX8k94r9wXWHA=
+ github.com/rs/cors v1.11.1/go.mod h1:XyqrcTp5zjWr1wsJ8PIRZssZ8b/WMcMf71DJnit4EMU=
+-github.com/rs/zerolog v1.35.0 h1:VD0ykx7HMiMJytqINBsKcbLS+BJ4WYjz+05us+LRTdI=
+-github.com/rs/zerolog v1.35.0/go.mod h1:EjML9kdfa/RMA7h/6z6pYmq1ykOuA8/mjWaEvGI+jcw=
++github.com/rs/zerolog v1.35.1 h1:m7xQeoiLIiV0BCEY4Hs+j2NG4Gp2o2KPKmhnnLiazKI=
++github.com/rs/zerolog v1.35.1/go.mod h1:EjML9kdfa/RMA7h/6z6pYmq1ykOuA8/mjWaEvGI+jcw=
+ github.com/russross/blackfriday/v2 v2.0.1/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
+ github.com/russross/blackfriday/v2 v2.1.0 h1:JIOH55/0cWyOuilr9/qlrm0BSXldqnqwMsf35Ld67mk=
+ github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
+@@ -1034,6 +1044,8 @@ github.com/samuel/go-zookeeper v0.0.0-20190923202752-2cc03de413da/go.mod h1:gi+0
+ github.com/sasha-s/go-deadlock v0.3.9 h1:fiaT9rB7g5sr5ddNZvlwheclN9IP86eFW9WgqlEQV+w=
+ github.com/sasha-s/go-deadlock v0.3.9/go.mod h1:KuZj51ZFmx42q/mPaYbRk0P1xcwe697zsJKE03vD4/Y=
+ github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529/go.mod h1:DxrIzT+xaE7yg65j358z/aeFdxmN0P9QXhEzd20vsDc=
++github.com/shamaton/msgpack/v2 v2.2.3 h1:uDOHmxQySlvlUYfQwdjxyybAOzjlQsD1Vjy+4jmO9NM=
++github.com/shamaton/msgpack/v2 v2.2.3/go.mod h1:6khjYnkx73f7VQU7wjcFS9DFjs+59naVWJv1TB7qdOI=
+ github.com/shirou/gopsutil v3.21.11+incompatible h1:+1+c1VGhc88SSonWP6foOcLhvnKlUeu/erjjvaPEYiI=
+ github.com/shirou/gopsutil v3.21.11+incompatible/go.mod h1:5b4v6he4MtMOwMlS0TUMTu2PcXUg8+E1lC7eC3UO/RA=
+ github.com/shirou/gopsutil/v4 v4.26.4 h1:B4SXVbcwTyrocPHEmWBC4uCYr4Xcu3MK1TXqbprAOWY=
+@@ -1273,8 +1285,8 @@ golang.org/x/crypto v0.8.0/go.mod h1:mRqEX+O9/h5TFCrQhkgjo2yKi0yYA+9ecGkdQoHrywE
+ golang.org/x/crypto v0.9.0/go.mod h1:yrmDGqONDYtNj3tH8X9dzUun2m2lzPa9ngI6/RUPGR0=
+ golang.org/x/crypto v0.12.0/go.mod h1:NF0Gs7EO5K4qLn+Ylc+fih8BSTeIjAP05siRnAh98yw=
+ golang.org/x/crypto v0.18.0/go.mod h1:R0j02AL6hcrfOiy9T4ZYp/rcWeMxM3L6QYxlOuEG1mg=
+-golang.org/x/crypto v0.50.0 h1:zO47/JPrL6vsNkINmLoo/PH1gcxpls50DNogFvB5ZGI=
+-golang.org/x/crypto v0.50.0/go.mod h1:3muZ7vA7PBCE6xgPX7nkzzjiUq87kRItoJQM1Yo8S+Q=
++golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=
++golang.org/x/crypto v0.54.0/go.mod h1:KWL8ny2AZdGR2cWmzeHrp2azQPGogOv+HeQaVEXC2dk=
+ golang.org/x/exp v0.0.0-20190121172915-509febef88a4/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
+ golang.org/x/exp v0.0.0-20190306152737-a1d7652674e8/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
+ golang.org/x/exp v0.0.0-20200331195152-e8c3332aa8e5/go.mod h1:4M0jN8W1tt0AVLNr8HDosyJCDCDuyL9N9+3m7wDWgKw=
+@@ -1295,8 +1307,8 @@ golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+ golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+ golang.org/x/mod v0.6.0-dev.0.20220419223038-86c51ed26bb4/go.mod h1:jJ57K6gSWd91VN4djpZkiMVwK6gcyfeH4XE8wZrZaV4=
+ golang.org/x/mod v0.8.0/go.mod h1:iBbtSCu2XBx23ZKBPSOrRkjjQPZFPuis4dIYUhu/chs=
+-golang.org/x/mod v0.34.0 h1:xIHgNUUnW6sYkcM5Jleh05DvLOtwc6RitGHbDk4akRI=
+-golang.org/x/mod v0.34.0/go.mod h1:ykgH52iCZe79kzLLMhyCUzhMci+nQj+0XkbXpNYtVjY=
++golang.org/x/mod v0.37.0 h1:vF1DjpVEshcIqoEaauuHebaLk1O1forxjxBaVn884JQ=
++golang.org/x/mod v0.37.0/go.mod h1:m8S8VeM9r4dzDwjrKO0a1sZP3YjeMamRRlD+fmR2Q/0=
+ golang.org/x/net v0.0.0-20180719180050-a680a1efc54d/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+ golang.org/x/net v0.0.0-20180724234803-3673e40ba225/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+ golang.org/x/net v0.0.0-20180826012351-8a410e7b638d/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
+@@ -1333,8 +1345,8 @@ golang.org/x/net v0.9.0/go.mod h1:d48xBJpPfHeWQsugry2m+kC02ZBRGRgulfHnEXEuWns=
+ golang.org/x/net v0.10.0/go.mod h1:0qNGK6F8kojg2nk9dLZ2mShWaEBan6FAoqfSigmmuDg=
+ golang.org/x/net v0.14.0/go.mod h1:PpSgVXXLK0OxS0F31C1/tv6XNguvCrnXIDrFMspZIUI=
+ golang.org/x/net v0.20.0/go.mod h1:z8BVo6PvndSri0LbOE3hAn0apkU+1YvI6E70E9jsnvY=
+-golang.org/x/net v0.53.0 h1:d+qAbo5L0orcWAr0a9JweQpjXF19LMXJE8Ey7hwOdUA=
+-golang.org/x/net v0.53.0/go.mod h1:JvMuJH7rrdiCfbeHoo3fCQU24Lf5JJwT9W3sJFulfgs=
++golang.org/x/net v0.57.0 h1:K5+3DljvIuDG9/Jv9rvyMywYNFCQ9RSUY6OOTTkT+tE=
++golang.org/x/net v0.57.0/go.mod h1:KpXc8iv+r3XplLAG/f7Jsf9RPszJzdR0f58q9vGOuEU=
+ golang.org/x/oauth2 v0.0.0-20180821212333-d2e6202438be/go.mod h1:N/0e6XlmueqKjAGxoOufVs8QHGRruUQn6yWY3a++T0U=
+ golang.org/x/oauth2 v0.0.0-20190226205417-e64efc72b421/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
+ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
+@@ -1351,8 +1363,8 @@ golang.org/x/sync v0.0.0-20201207232520-09787c993a3a/go.mod h1:RxMgew5VJxzue5/jJ
+ golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+ golang.org/x/sync v0.1.0/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+-golang.org/x/sync v0.20.0 h1:e0PTpb7pjO8GAtTs2dQ6jYa5BWYlMuX047Dco/pItO4=
+-golang.org/x/sync v0.20.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
++golang.org/x/sync v0.22.0 h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=
++golang.org/x/sync v0.22.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
+ golang.org/x/sys v0.0.0-20180823144017-11551d06cbcc/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ golang.org/x/sys v0.0.0-20180830151530-49385e6e1522/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+ golang.org/x/sys v0.0.0-20180905080454-ebe1bf3edb33/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+@@ -1415,10 +1427,10 @@ golang.org/x/sys v0.8.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.11.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+ golang.org/x/sys v0.16.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
+ golang.org/x/sys v0.21.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
+-golang.org/x/sys v0.43.0 h1:Rlag2XtaFTxp19wS8MXlJwTvoh8ArU6ezoyFsMyCTNI=
+-golang.org/x/sys v0.43.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+-golang.org/x/telemetry v0.0.0-20260311193753-579e4da9a98c h1:6a8FdnNk6bTXBjR4AGKFgUKuo+7GnR3FX5L7CbveeZc=
+-golang.org/x/telemetry v0.0.0-20260311193753-579e4da9a98c/go.mod h1:TpUTTEp9frx7rTdLpC9gFG9kdI7zVLFTFFlqaH2Cncw=
++golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
++golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
++golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57 h1:nwGZBCt+FnXUrGsj5vjzAsEmkcaFvd82BbOjECiFYZc=
++golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57/go.mod h1:3AWMyWHS+caVoiEXpiq6+tzKA40J4vQT3MYr80ZtQpc=
+ golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
+ golang.org/x/term v0.0.0-20210927222741-03fcf44c2211/go.mod h1:jbD1KX2456YbFQfuXm/mYQcufACuNUgVhRMnK/tPxf8=
+ golang.org/x/term v0.5.0/go.mod h1:jMB1sMXY+tzblOD4FWmEbocvup2/aLOaQEp7JmGp78k=
+@@ -1427,8 +1439,8 @@ golang.org/x/term v0.7.0/go.mod h1:P32HKFT3hSsZrRxla30E9HqToFYAQPCMs/zFMBUFqPY=
+ golang.org/x/term v0.8.0/go.mod h1:xPskH00ivmX89bAKVGSKKtLOWNx2+17Eiy94tnKShWo=
+ golang.org/x/term v0.11.0/go.mod h1:zC9APTIj3jG3FdV/Ons+XE1riIZXG4aZ4GTHiPZJPIU=
+ golang.org/x/term v0.16.0/go.mod h1:yn7UURbUtPyrVJPGPq404EukNFxcm/foM+bV/bfcDsY=
+-golang.org/x/term v0.42.0 h1:UiKe+zDFmJobeJ5ggPwOshJIVt6/Ft0rcfrXZDLWAWY=
+-golang.org/x/term v0.42.0/go.mod h1:Dq/D+snpsbazcBG5+F9Q1n2rXV8Ma+71xEjTRufARgY=
++golang.org/x/term v0.45.0 h1:NwWyBmoJCbfTHpxrWoZ9C6/VxOf7ic219I8xZZFdrf0=
++golang.org/x/term v0.45.0/go.mod h1:9aqxs0blBcrm/n0L9QW0aRVD+ktan8ssZromtqJC43w=
+ golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+ golang.org/x/text v0.3.2/go.mod h1:bEr9sfX3Q8Zfm5fL9x+3itogRgK3+ptLWKqgva+5dAk=
+ golang.org/x/text v0.3.3/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+@@ -1441,8 +1453,8 @@ golang.org/x/text v0.8.0/go.mod h1:e1OnstbJyHTd6l/uOt8jFFHp6TRDWZR/bV3emEE/zU8=
+ golang.org/x/text v0.9.0/go.mod h1:e1OnstbJyHTd6l/uOt8jFFHp6TRDWZR/bV3emEE/zU8=
+ golang.org/x/text v0.12.0/go.mod h1:TvPlkZtksWOMsz7fbANvkp4WM8x/WCo/om8BMLbz+aE=
+ golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=
+-golang.org/x/text v0.36.0 h1:JfKh3XmcRPqZPKevfXVpI1wXPTqbkE5f7JA92a55Yxg=
+-golang.org/x/text v0.36.0/go.mod h1:NIdBknypM8iqVmPiuco0Dh6P5Jcdk8lJL0CUebqK164=
++golang.org/x/text v0.40.0 h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=
++golang.org/x/text v0.40.0/go.mod h1:hpnzDAfGV753zIKo+wk3u1bVKCGPbrnF7+7LBF/UHVY=
+ golang.org/x/time v0.0.0-20180412165947-fbb02b2291d2/go.mod h1:tRJNPiyCQ0inRvYxbN9jk5I+vvW/OXSQhTDSoE431IQ=
+ golang.org/x/time v0.0.0-20191024005414-555d28b269f0/go.mod h1:tRJNPiyCQ0inRvYxbN9jk5I+vvW/OXSQhTDSoE431IQ=
+ golang.org/x/time v0.15.0 h1:bbrp8t3bGUeFOx08pvsMYRTCVSMk89u4tKbNOZbp88U=
+@@ -1468,8 +1480,8 @@ golang.org/x/tools v0.0.0-20200619180055-7c47624df98f/go.mod h1:EkVYQZoAsY45+roY
+ golang.org/x/tools v0.0.0-20210106214847-113979e3529a/go.mod h1:emZCQorbCU4vsT4fOWvOPXz4eW1wZW4PmDk9uLelYpA=
+ golang.org/x/tools v0.1.12/go.mod h1:hNGJHUnrk76NpqgfD5Aqm5Crs+Hm0VOH/i9J2+nxYbc=
+ golang.org/x/tools v0.6.0/go.mod h1:Xwgl3UAJ/d3gWutnCtw505GrjyAbvKui8lOU390QaIU=
+-golang.org/x/tools v0.43.0 h1:12BdW9CeB3Z+J/I/wj34VMl8X+fEXBxVR90JeMX5E7s=
+-golang.org/x/tools v0.43.0/go.mod h1:uHkMso649BX2cZK6+RpuIPXS3ho2hZo4FVwfoy1vIk0=
++golang.org/x/tools v0.47.0 h1:7Kn5x/d1svx/PzryTsqeoZN4TZwqeH5pGWjefhLi/1Q=
++golang.org/x/tools v0.47.0/go.mod h1:dFHnyTvFWY212G+h7ZY4Vsp/K3U4/7W9TyVaAul8uCA=
+ golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+ golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+ golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
 diff --git a/evmd/mempool.go b/evmd/mempool.go
 index d6af75f..843b34a 100644
 --- a/evmd/mempool.go
@@ -1274,6 +1826,328 @@ index d6af75f..843b34a 100644
  	app.SetInsertTxHandler(insertTxHandler)
  	app.SetReapTxsHandler(reapTxsHandler)
  	app.SetCheckTxHandler(checkTxHandler)
+diff --git a/evmd/zetaphy_cosmwasm.go b/evmd/zetaphy_cosmwasm.go
+new file mode 100644
+index 0000000..a786a35
+--- /dev/null
++++ b/evmd/zetaphy_cosmwasm.go
+@@ -0,0 +1,316 @@
++package evmd
++
++// ZETAPHY stage 7: CosmWasm (Rust smart contracts, x/wasm from wasmd) next
++// to the EVM, on the same chain, accounts and coins.
++//
++// Security defaults (docs/SECURITY-CORE.md, "CosmWasm"):
++//   - code upload: governance only (CodeUploadAccess = Nobody; a gov
++//     proposal with MsgStoreCode, or MsgUpdateParams for an allow-list);
++//     instantiate: everybody, unless the stored code says otherwise;
++//   - code size: 800 KiB, also for code stored by proposal;
++//   - wasm txs are ordinary Cosmos txs: the quantum lock, Q-day (ML-DSA-44
++//     signers only) and the fee burn apply to them unchanged;
++//   - what a contract dispatches is checked too (wasmGuard below): it cannot
++//     use an authz grant of a quantum-locked account, send EVM txs or ZETAPHY
++//     post-quantum messages, or open IBC channels / send raw IBC packets.
++//     ICS-20 transfers from contracts go through the full transfer stack
++//     (rate limits; inbound: the large-transfer hold);
++//   - IBC for wasm ports (wasm.<addr>, wasm2<addr>) is off: no route is
++//     registered, so no channel can be opened to a contract. Opening it
++//     later is a governance-scheduled upgrade with its own review;
++//   - the threat gate stays EVM-only: the ThreatRegistry flags 20-byte EVM
++//     contracts and Neuro reads EVM bytecode, while contract addresses here
++//     are 32 bytes. A contract cannot call an EVM contract as itself
++//     (MsgEVMCall needs a 20-byte sender, MsgEthereumTx is refused below),
++//     and a MsgEVMCall it runs through authz is checked where it runs.
++//
++// Upgrade path: a new chain has x/wasm from genesis (DefaultGenesis below,
++// setup-node.sh); a running chain gets the "zetaphy-v4" upgrade, which adds
++// the wasm store and sets the parameters above (it includes v2 and v3).
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++
++	wasmvmtypes "github.com/CosmWasm/wasmvm/v3/types"
++
++	"github.com/CosmWasm/wasmd/x/wasm"
++	wasmkeeper "github.com/CosmWasm/wasmd/x/wasm/keeper"
++	"github.com/CosmWasm/wasmd/x/wasm/keeper/wasmtesting"
++	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
++
++	errorsmod "cosmossdk.io/errors"
++
++	"github.com/cosmos/cosmos-sdk/baseapp"
++	"github.com/cosmos/cosmos-sdk/codec"
++	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
++	"github.com/cosmos/cosmos-sdk/runtime"
++	servertypes "github.com/cosmos/cosmos-sdk/server/types"
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	"github.com/cosmos/cosmos-sdk/types/module"
++	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
++	"github.com/cosmos/cosmos-sdk/x/authz"
++	distrkeeper "github.com/cosmos/cosmos-sdk/x/distribution/keeper"
++	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
++
++	evmtypes "github.com/cosmos/evm/x/vm/types"
++)
++
++// ZetaphyV4UpgradeName adds CosmWasm to a chain that runs without it.
++const ZetaphyV4UpgradeName = "zetaphy-v4"
++
++// ZetaphyMaxWasmSize: the largest contract code, uncompressed (wasmd's
++// default for MsgStoreCode); code stored by proposal gets the same cap
++// instead of wasmd's 3 MiB.
++const ZetaphyMaxWasmSize = 800 * 1024
++
++// ErrWasmGuard is the refusal of a message a contract dispatched (codespace "zetaphy", code 30).
++var ErrWasmGuard = errorsmod.Register("zetaphy", 30, "not allowed from a CosmWasm contract")
++
++func init() {
++	wasmtypes.MaxWasmSize = ZetaphyMaxWasmSize
++	wasmtypes.MaxProposalWasmSize = ZetaphyMaxWasmSize
++}
++
++// ZetaphyWasmParams: upload by governance only, instantiate by everybody.
++func ZetaphyWasmParams() wasmtypes.Params {
++	return wasmtypes.Params{CodeUploadAccess: wasmtypes.AllowNobody, InstantiateDefaultPermission: wasmtypes.AccessTypeEverybody}
++}
++
++// setupWasm creates the wasm keeper (after the IBC, transfer and EVM keepers).
++func (app *EVMD) setupWasm(appOpts servertypes.AppOptions, homePath string) wasmtypes.NodeConfig {
++	nodeConfig, err := wasm.ReadNodeConfig(appOpts)
++	if err != nil {
++		panic(fmt.Sprintf("error while reading wasm config: %s", err))
++	}
++	opts := []wasmkeeper.Option{
++		wasmkeeper.WithMessageHandlerDecorator(func(old wasmkeeper.Messenger) wasmkeeper.Messenger {
++			return wasmGuardMessenger{next: old}
++		}),
++	}
++	wasmDir := wasmVMDir(homePath)
++	if wasmDir == "" {
++		// An app without a home only serves the CLI's encoding setup: no VM
++		// (wasmvm would take a directory and its lock for nothing).
++		opts = append(opts, wasmkeeper.WithWasmEngine(&wasmtesting.MockWasmEngine{}))
++	}
++	app.WasmKeeper = wasmkeeper.NewKeeper(
++		app.appCodec,
++		runtime.NewKVStoreService(app.keys[wasmtypes.StoreKey]),
++		app.AccountKeeper,
++		app.BankKeeper,
++		app.StakingKeeper,
++		distrkeeper.NewQuerier(app.DistrKeeper),
++		app.IBCKeeper.ChannelKeeper,
++		app.IBCKeeper.ChannelKeeper,
++		app.IBCKeeper.ChannelKeeperV2,
++		app.TransferKeeper,
++		wasmGuardRouter{app: app, next: app.MsgServiceRouter()},
++		app.GRPCQueryRouter(),
++		wasmDir,
++		nodeConfig,
++		wasmtypes.VMConfig{},
++		wasmkeeper.BuiltInCapabilities(),
++		authtypes.NewModuleAddress("gov").String(),
++		opts...,
++	)
++	return nodeConfig
++}
++
++// wasmDirsInUse: the VM directories of the apps of this process. wasmvm
++// locks its directory; a second app in the same process (tests, in-process
++// testnets) gets a temporary one.
++var wasmDirsInUse sync.Map
++
++func wasmVMDir(home string) string {
++	if home == "" {
++		return ""
++	}
++	d := filepath.Join(home, "wasm")
++	if _, used := wasmDirsInUse.LoadOrStore(d, true); used {
++		t, err := os.MkdirTemp("", "zetaphy-wasm-")
++		if err != nil {
++			panic(err)
++		}
++		return t
++	}
++	return d
++}
++
++// wasmAnteDecorators run in the Cosmos tx ante chain right after its context
++// setup, as in wasmd: simulation gas capped (by [wasm] simulation_gas_limit,
++// or the block gas limit), the tx position for wasm txs, the gas register,
++// and the per-tx contract cache discount.
++func (app *EVMD) wasmAnteDecorators(nodeConfig wasmtypes.NodeConfig) []sdk.AnteDecorator {
++	return []sdk.AnteDecorator{
++		wasmkeeper.NewLimitSimulationGasDecorator(nodeConfig.SimulationGasLimit),
++		wasmOnlyDecorator{wasmkeeper.NewCountTXDecorator(runtime.NewKVStoreService(app.keys[wasmtypes.StoreKey]))},
++		wasmkeeper.NewGasRegisterDecorator(app.WasmKeeper.GetGasRegister()),
++		wasmkeeper.NewTxContractsDecorator(),
++	}
++}
++
++// wasmOnlyDecorator runs its decorator only for txs with a wasm message.
++// The tx counter is a single key every counted tx writes; keeping other txs
++// out of it keeps them parallel under the block-STM runner.
++type wasmOnlyDecorator struct{ d sdk.AnteDecorator }
++
++func (w wasmOnlyDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, sim bool, next sdk.AnteHandler) (sdk.Context, error) {
++	if !hasWasmMsg(tx.GetMsgs(), 0) {
++		return next(ctx, tx, sim)
++	}
++	return w.d.AnteHandle(ctx, tx, sim, next)
++}
++
++func hasWasmMsg(msgs []sdk.Msg, depth int) bool {
++	for _, m := range msgs {
++		if strings.HasPrefix(sdk.MsgTypeURL(m), "/cosmwasm.wasm.") {
++			return true
++		}
++		if ex, ok := m.(*authz.MsgExec); ok && depth < 4 {
++			if inner, err := ex.GetMessages(); err == nil && hasWasmMsg(inner, depth+1) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// ---- what contracts may dispatch
++
++// wasmGuardMessenger: no IBC channel traffic from contracts (their ports
++// have no route); ICS-20 transfers (IbcMsg::Transfer) pass, as a normal
++// MsgTransfer through the transfer stack.
++type wasmGuardMessenger struct{ next wasmkeeper.Messenger }
++
++func (g wasmGuardMessenger) DispatchMsg(ctx sdk.Context, contractAddr sdk.AccAddress, portID string, msg wasmvmtypes.CosmosMsg) ([]sdk.Event, [][]byte, [][]*codectypes.Any, error) {
++	if msg.IBC2 != nil || (msg.IBC != nil && msg.IBC.Transfer == nil) {
++		return nil, nil, nil, errorsmod.Wrap(ErrWasmGuard, "IBC channels for contracts are off on ZETAPHY; ICS-20 transfers are allowed")
++	}
++	return g.next.DispatchMsg(ctx, contractAddr, portID, msg)
++}
++
++// wasmGuardRouter is the message router the wasm keeper dispatches through.
++type wasmGuardRouter struct {
++	app  *EVMD
++	next *baseapp.MsgServiceRouter
++}
++
++func (r wasmGuardRouter) Handler(msg sdk.Msg) baseapp.MsgServiceHandler {
++	h := r.next.Handler(msg)
++	if h == nil {
++		return nil
++	}
++	return func(ctx sdk.Context, m sdk.Msg) (*sdk.Result, error) {
++		if err := r.app.wasmGuard(ctx, m, 0); err != nil {
++			return nil, err
++		}
++		return h(ctx, m)
++	}
++}
++
++// wasmGuard refuses, from a contract: EVM txs and ZETAPHY's account
++// messages (they are for keys, a contract has none), and any message, also
++// inside authz, on behalf of a quantum-locked account (the ante handler
++// refuses those for signed txs; a contract holding an older grant must not
++// get around it).
++func (app *EVMD) wasmGuard(ctx sdk.Context, m sdk.Msg, depth int) error {
++	url := sdk.MsgTypeURL(m)
++	if url == sdk.MsgTypeURL(&evmtypes.MsgEthereumTx{}) || strings.HasPrefix(url, "/zetaphy.") {
++		return errorsmod.Wrapf(ErrWasmGuard, "%s", url)
++	}
++	signers, _, err := app.appCodec.GetMsgV1Signers(m)
++	if err != nil {
++		return err
++	}
++	for _, s := range signers {
++		if app.pqController(ctx, s) != nil {
++			return errorsmod.Wrapf(errortypes.ErrUnauthorized, "%s is quantum-locked: only its ML-DSA-44 controller can act for it", sdk.AccAddress(s))
++		}
++	}
++	if ex, ok := m.(*authz.MsgExec); ok {
++		if depth >= 4 {
++			return errorsmod.Wrap(ErrWasmGuard, "authz nested too deep")
++		}
++		inner, err := ex.GetMessages()
++		if err != nil {
++			return err
++		}
++		for _, im := range inner {
++			if err := app.wasmGuard(ctx, im, depth+1); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++// ---- genesis and upgrade
++
++// wasmGenesisBasic is x/wasm's module basic with ZETAPHY's parameters in
++// its default genesis (what `zetaphyd init` and DefaultGenesis write).
++type wasmGenesisBasic struct{ wasm.AppModuleBasic }
++
++func (wasmGenesisBasic) DefaultGenesis(cdc codec.JSONCodec) json.RawMessage {
++	return cdc.MustMarshalJSON(&wasmtypes.GenesisState{Params: ZetaphyWasmParams()})
++}
++
++// zetaphyWasmMigrations runs the module migrations of an upgrade and, when
++// x/wasm is new on this chain (its genesis just ran with wasmd's defaults),
++// sets ZETAPHY's parameters.
++func (app *EVMD) zetaphyWasmMigrations(c context.Context, fromVM module.VersionMap) (module.VersionMap, error) {
++	_, had := fromVM[wasmtypes.ModuleName]
++	vm, err := app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
++	if err != nil || had {
++		return vm, err
++	}
++	if err := app.WasmKeeper.SetParams(c, ZetaphyWasmParams()); err != nil {
++		return nil, err
++	}
++	sdk.UnwrapSDKContext(c).Logger().Info("CosmWasm added", "upload", "governance only", "instantiate", "everybody")
++	return vm, nil
++}
++
++// registerZetaphyV4 (from registerZetaphyUpgrades): "zetaphy-v4" turns on
++// what v3 does when it is not on yet, then adds x/wasm.
++func (app *EVMD) registerZetaphyV4() {
++	app.UpgradeKeeper.SetUpgradeHandler(ZetaphyV4UpgradeName,
++		func(c context.Context, _ upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
++			ctx := sdk.UnwrapSDKContext(c)
++			if !app.zetaphyV2(ctx, ctx.BlockHeight()+1) {
++				p := app.EVMKeeper.GetParams(ctx)
++				p.HistoryServeWindow = evmtypes.DefaultHistoryServeWindow
++				if err := app.EVMKeeper.SetParams(ctx, p); err != nil {
++					return nil, err
++				}
++				app.setZetaphyV2Height(ctx, ctx.BlockHeight()+1)
++			}
++			if a := app.secV3Height(ctx); a == 0 || a > ctx.BlockHeight()+1 {
++				app.setSecV3Height(ctx, ctx.BlockHeight()+1)
++			}
++			ctx.Logger().Info("ZETAPHY v4 (CosmWasm) scheduled", "from_height", ctx.BlockHeight()+1)
++			return app.zetaphyWasmMigrations(c, fromVM)
++		})
++}
++
++// zetaphyStoreUpgrades: the stores an upgrade to this binary adds. A chain
++// reaching any ZETAPHY upgrade with this binary has no wasm store yet (a
++// chain started with it never needs those upgrades).
++func zetaphyStoreUpgrades() *storetypes.StoreUpgrades {
++	return &storetypes.StoreUpgrades{Added: []string{wasmtypes.StoreKey}}
++}
++
++// wasmPinnedCodes loads pinned contracts into the VM's cache at start (they
++// are not persisted there).
++func (app *EVMD) wasmPinnedCodes(ctx sdk.Context) {
++	if err := app.WasmKeeper.InitializePinnedCodes(ctx); err != nil {
++		panic(fmt.Sprintf("failed to initialize pinned wasm codes: %s", err))
++	}
++}
 diff --git a/evmd/zetaphy_feeburn.go b/evmd/zetaphy_feeburn.go
 new file mode 100644
 index 0000000..a68e4a1
@@ -4936,10 +5810,10 @@ index 0000000..42ada54
 +}
 diff --git a/evmd/zetaphy_upgrade.go b/evmd/zetaphy_upgrade.go
 new file mode 100644
-index 0000000..57b38ee
+index 0000000..5acfd92
 --- /dev/null
 +++ b/evmd/zetaphy_upgrade.go
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,168 @@
 +package evmd
 +
 +// ZETAPHY v2 activation height.
@@ -4972,7 +5846,6 @@ index 0000000..57b38ee
 +	"github.com/cosmos/cosmos-sdk/client"
 +	"github.com/cosmos/cosmos-sdk/codec"
 +	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
-+	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 +	sdk "github.com/cosmos/cosmos-sdk/types"
 +	"github.com/cosmos/cosmos-sdk/types/module"
 +	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
@@ -5028,7 +5901,7 @@ index 0000000..57b38ee
 +			}
 +			app.setZetaphyV2Height(ctx, ctx.BlockHeight()+1)
 +			ctx.Logger().Info("ZETAPHY v2 features scheduled", "from_height", ctx.BlockHeight()+1)
-+			return app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
++			return app.zetaphyWasmMigrations(c, fromVM)
 +		})
 +
 +	app.UpgradeKeeper.SetUpgradeHandler(ZetaphyV3UpgradeName,
@@ -5044,19 +5917,21 @@ index 0000000..57b38ee
 +			}
 +			app.setSecV3Height(ctx, ctx.BlockHeight()+1)
 +			ctx.Logger().Info("ZETAPHY security core scheduled", "from_height", ctx.BlockHeight()+1)
-+			return app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
++			return app.zetaphyWasmMigrations(c, fromVM)
 +		})
++	app.registerZetaphyV4() // "zetaphy-v4": CosmWasm (zetaphy_cosmwasm.go)
 +
 +	info, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
 +	if err != nil {
 +		panic(err)
 +	}
-+	if (info.Name == ZetaphyV2UpgradeName || info.Name == ZetaphyV3UpgradeName) && !app.UpgradeKeeper.IsSkipHeight(info.Height) {
-+		// Stores the running binary does not have yet go here, e.g.
-+		// pqStoreKey and ratelimittypes.StoreKey when upgrading from a binary
-+		// built without the PQ patch. A chain started with the PQ patch
-+		// already has both.
-+		app.SetStoreLoader(upgradetypes.UpgradeStoreLoader(info.Height, &storetypes.StoreUpgrades{}))
++	if (info.Name == ZetaphyV2UpgradeName || info.Name == ZetaphyV3UpgradeName || info.Name == ZetaphyV4UpgradeName) &&
++		!app.UpgradeKeeper.IsSkipHeight(info.Height) {
++		// Stores the running binary does not have yet go here: the wasm
++		// store (a chain started with x/wasm never runs these upgrades).
++		// pqStoreKey and ratelimittypes.StoreKey are not: a chain started
++		// with the PQ patch already has both.
++		app.SetStoreLoader(upgradetypes.UpgradeStoreLoader(info.Height, zetaphyStoreUpgrades()))
 +	}
 +}
 +
