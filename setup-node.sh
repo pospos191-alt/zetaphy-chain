@@ -423,6 +423,9 @@ Wants=network-online.target
 
 [Service]
 User=$NODE_USER
+# The binary resolves a few paths from the working directory (upstream evmd
+# reads data/upgrade-info.json while building its CLI); "/" is not writable.
+WorkingDirectory=/home/$NODE_USER
 ExecStart=$START
 Restart=always
 RestartSec=5
@@ -438,13 +441,14 @@ UNIT
   systemctl daemon-reload
   systemctl enable --now zetaphyd
 else
-  as_node "nohup $START > /home/$NODE_USER/zetaphyd.log 2>&1 &"
+  as_node "cd /home/$NODE_USER && nohup $START > /home/$NODE_USER/zetaphyd.log 2>&1 &"
 fi
 
 # The genesis validator registers its vote key once the chain runs.
 if [ -z "$JOIN" ] && [ ! -f "$V.registered" ]; then
   for _ in $(seq 1 60); do
-    [ "$(z status --home "$NODE_HOME" 2>/dev/null | jq -r '.sync_info.latest_block_height // 0')" -ge 2 ] && break; sleep 2
+    h=$(z status --home "$NODE_HOME" 2>/dev/null | jq -r '.sync_info.latest_block_height // 0' 2>/dev/null || true)
+    [ "${h:-0}" -ge 2 ] 2>/dev/null && break; sleep 2
   done
   z tx pq-vote-key --from validator $K --home "$NODE_HOME" --chain-id "$CHAIN_ID" --gas 600000 \
     --gas-prices "1000000000$DENOM" -y -o json | grep -q '"code":0' && as_node "touch '$V.registered'" || echo "vote key not registered yet; run setup-node.sh again"
