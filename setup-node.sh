@@ -51,6 +51,7 @@ LOG="/var/log/zetaphy-setup.log"
 
 # Test hooks (leave unset on Oracle): ZETAPHYD_BIN=<prebuilt evmd>, NO_SYSTEMD=1
 ZETAPHYD_BIN="${ZETAPHYD_BIN:-}"
+[ -n "$ZETAPHYD_BIN" ] && ZETAPHYD_BIN=$(readlink -f "$ZETAPHYD_BIN")   # the script later runs from the node user's home
 NO_SYSTEMD="${NO_SYSTEMD:-}"
 # Optional: your own DNS name for the public RPC (an A record pointing at this
 # machine), e.g. PUBLIC_HOST=rpc.sawasdeecoin.com. Caddy serves it next to
@@ -126,11 +127,18 @@ zetaphy_preinstalls() {
 }
 if [ "${1:-}" = "--preinstalls" ]; then zetaphy_preinstalls; exit 0; fi
 
+# Commands run as the node user from its own home: started from another
+# user's home (e.g. ~/setup.sh in Cloud Shell) the node binary cannot create
+# its working files there ("mkdir data: permission denied").
+SELF=$(readlink -f "$0")
+node_home_dir() { cd "/home/$NODE_USER" 2>/dev/null || cd /tmp; }
+
 # bash setup-node.sh --become-validator <ZETAPHY>: on a synced node that
 # joined with JOIN=, stake that much from its "validator" key (the faucet
 # gives 10) and become a validator.
 if [ "${1:-}" = "--become-validator" ]; then
   amt=${2:?amount of ZETAPHY to stake}
+  node_home_dir
   [[ "$amt" =~ ^[0-9]+$ ]] || { echo "amount: whole ZETAPHY"; exit 1; }
   zv() { su -s /bin/bash "$NODE_USER" -c "$BIN $* --home $NODE_HOME"; }
   [ "$(zv status | jq -r .sync_info.catching_up)" = false ] || { echo "still syncing; try again later"; exit 1; }
@@ -188,6 +196,7 @@ fi
 
 step "3/8 user"
 id "$NODE_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$NODE_USER"
+node_home_dir
 as_node() { su -s /bin/bash "$NODE_USER" -c "$*"; }
 
 step "4/8 build zetaphyd"
@@ -209,7 +218,7 @@ elif [ ! -x "$BIN" ] || [ -n "${FORCE_BUILD:-}" ]; then
   # Under 3 GB of RAM (e.g. a 1 GB free VM): one compile at a time.
   [ "$mem_kb" -lt 3000000 ] && goenv="$goenv GOFLAGS=-p=1 GOGC=50"
   # The ZETAPHY changes (zetaphy_patch_source, above), as the node user.
-  install -m 644 "$0" /tmp/zetaphy-setup-node.sh
+  install -m 644 "$SELF" /tmp/zetaphy-setup-node.sh
   as_node "cd '$src' && $goenv bash /tmp/zetaphy-setup-node.sh --patch-source '$src'"
   as_node "cd '$src' && $goenv make install"
   install -m 755 "/home/${NODE_USER}/go/bin/evmd" "$BIN"
@@ -480,7 +489,7 @@ host="${ip//./-}.sslip.io"
 pubhost="${PUBLIC_HOST:-$host}"   # the name wallets are given
 # It also publishes what another machine needs to JOIN this chain.
 pub=/var/lib/zetaphy-public
-mkdir -p $pub && install -m 644 "$NODE_HOME/config/genesis.json" $pub/ && install -m 644 "$0" $pub/setup-node.sh
+mkdir -p $pub && install -m 644 "$NODE_HOME/config/genesis.json" $pub/ && install -m 644 "$SELF" $pub/setup-node.sh
 echo "$(z comet show-node-id --home "$NODE_HOME")@$ip:26656" > $pub/peer
 # Wallet settings for this node, for one-click "add network" buttons.
 jq -n --arg h "https://$pubhost" --arg c "$CHAIN_ID" --arg d "$DENOM" '
