@@ -498,6 +498,7 @@ if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]
   # https://$host/        EVM JSON-RPC (MetaMask and other EVM wallets)
   # https://$host/rpc/    CometBFT RPC   } Keplr, Leap, Cosmostation
   # https://$host/rest/   Cosmos REST    }
+  # wss://$host/ws        EVM JSON-RPC over WebSocket (eth_subscribe: new blocks, logs)
   # https://$host/zetaphy/  files: genesis, peer, setup script, wallet configs
   { apt_get install -y caddy >/dev/null && cat > /etc/caddy/Caddyfile <<CADDY
 $host${PUBLIC_HOST:+, $PUBLIC_HOST} {
@@ -519,6 +520,10 @@ $host${PUBLIC_HOST:+, $PUBLIC_HOST} {
 		}
 		handle_path /rpc/* {
 			reverse_proxy 127.0.0.1:26657
+		}
+		handle /ws {
+			rewrite * /
+			reverse_proxy 127.0.0.1:8546
 		}
 		reverse_proxy 127.0.0.1:8545
 	}
@@ -586,6 +591,7 @@ ZETAPHY testnet node is starting.
   Chain ID (EVM):      $EVM_CHAIN_ID
   MetaMask RPC URL:    http://$ip:8545
   HTTPS RPC (wallet):  https://$pubhost  (needs ports 80 and 443 open)
+  WebSocket RPC:       wss://$pubhost/ws  (eth_subscribe)
   Keplr / Leap:        RPC https://$pubhost/rpc  REST https://$pubhost/rest
                        (chain settings: https://$pubhost/zetaphy/keplr.json)
   Others join with:    JOIN=$host in setup-node.sh, then --become-validator 9
