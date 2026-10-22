@@ -141,6 +141,10 @@ if [ "${1:-}" = "--become-validator" ]; then
   exit 0
 fi
 
+# One run at a time: a second copy (started twice, or again after a lost SSH
+# session) would add the same keys and stop on an "overwrite?" prompt (EOF).
+exec 9>/run/zetaphy-setup.lock
+flock -n 9 || { echo "setup-node.sh is already running (tail -f $LOG)"; exit 1; }
 touch "$LOG" && chmod 640 "$LOG"
 exec > >(tee -a "$LOG") 2>&1
 step() { echo; echo "== $(date -u +%FT%TZ) $*"; }
@@ -225,8 +229,21 @@ su -s /bin/bash "$NODE_USER" -c "$BIN q wasm libwasmvm-version" # the VM loads (
 z() { su -s /bin/bash "$NODE_USER" -c "$BIN $*"; }
 K="--keyring-backend test --keyring-dir $KEYS_DIR"
 
+# A genesis that never got its validator (gentx) on a node that never made a
+# block is from a run that stopped part-way: set it aside and redo step 5.
+if [ -f "$NODE_HOME/config/genesis.json" ] && [ ! -d "$NODE_HOME/data/blockstore.db" ] \
+  && [ "$(jq -r '"\(.initial_height // 1)/\(.app_state.genutil.gen_txs // [] | length)"' "$NODE_HOME/config/genesis.json" 2>/dev/null)" = 1/0 ]; then
+  mv "$NODE_HOME/config/genesis.json" "$NODE_HOME/config/genesis.json.unfinished-$(date -u +%Y%m%dT%H%M%SZ)"
+  echo "genesis from an unfinished run moved aside"
+fi
 if [ ! -f "$NODE_HOME/config/genesis.json" ]; then
   step "5/8 keys and genesis"
+  # Keys left by a run that stopped before genesis was written have no coins
+  # and no chain; set them aside (not deleted) and start this step afresh.
+  if [ -d "$KEYS_DIR" ] && [ -n "$(ls -A "$KEYS_DIR")" ]; then
+    mv "$KEYS_DIR" "$KEYS_DIR.unfinished-$(date -u +%Y%m%dT%H%M%SZ)"
+    echo "keys from an unfinished run moved aside"
+  fi
   as_node "mkdir -p '$KEYS_DIR' && chmod 700 '$KEYS_DIR'"
   backup="$KEYS_DIR/MNEMONICS-KEEP-SECRET.txt"
   as_node "umask 077 && : > '$backup'"
