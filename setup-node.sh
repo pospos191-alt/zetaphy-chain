@@ -20,6 +20,10 @@ JOIN="${JOIN:-}"
 # a Google e2-micro; 0 turns it off. EGRESS_LIMIT_MB: where the guard stops.
 LOW_EGRESS="${LOW_EGRESS:-auto}"
 EGRESS_LIMIT_MB="${EGRESS_LIMIT_MB:-800}"
+# The EVM JSON-RPC is public only through https (Caddy and rpc-guard, which
+# allow the wallet and app methods and limit each IP). PUBLIC_HTTP_RPC=1 also
+# opens plain http://<ip>:8545, without those limits (the faucet stays https only).
+PUBLIC_HTTP_RPC="${PUBLIC_HTTP_RPC:-0}"
 
 set -euo pipefail
 
@@ -393,15 +397,17 @@ if [ -f "$NODE_HOME/config/seed-peer" ]; then
   peer=$(tr -cd 'a-f0-9@.:' < "$NODE_HOME/config/seed-peer")
   as_node "sed -i -E 's/^persistent_peers = .*/persistent_peers = \"$peer\"/' '$C'"
 fi
-# Public: EVM JSON-RPC 8545 (read + send signed txs) and P2P 26656.
-# Local only: CometBFT RPC 26657, REST 1317, gRPC 9090 (defaults). Cosmos
-# wallets (Keplr, Leap, Cosmostation) reach RPC and REST through Caddy (https).
-as_node "python3 - '$A' '$LOW_EGRESS' <<'PY'
+# Public: P2P 26656, and https (Caddy -> rpc-guard) for the RPCs.
+# Local only: EVM JSON-RPC 8545 (unless PUBLIC_HTTP_RPC=1), CometBFT RPC
+# 26657, REST 1317, gRPC 9090. Wallets (MetaMask, Keplr, Leap, Cosmostation)
+# reach them through Caddy (https).
+rpc_bind=127.0.0.1; [ "$PUBLIC_HTTP_RPC" = 1 ] && rpc_bind=0.0.0.0
+as_node "python3 - '$A' '$LOW_EGRESS' '$rpc_bind' <<'PY'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
 sec = re.search(r'(?ms)^\[json-rpc\].*?(?=^\[|\Z)', s).group(0)
 new = re.sub(r'(?m)^enable = .*', 'enable = true', sec)
-new = re.sub(r'(?m)^address = .*', 'address = \"0.0.0.0:8545\"', new)
+new = re.sub(r'(?m)^address = .*', 'address = \"' + sys.argv[3] + ':8545\"', new)
 new = re.sub(r'(?m)^ws-address = .*', 'ws-address = \"127.0.0.1:8546\"', new)
 new = re.sub(r'(?m)^api = .*', 'api = \"eth,net,web3,txpool,zetaphy\"', new)
 # The port is public: keep one caller from tying the node up.
@@ -457,7 +463,8 @@ PrivateTmp=true
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl enable --now zetaphyd
+  # restart, not just start: a second run (new binary or settings) takes effect
+  systemctl enable zetaphyd && systemctl restart zetaphyd
 else
   as_node "cd /home/$NODE_USER && nohup $START > /home/$NODE_USER/zetaphyd.log 2>&1 &"
 fi
@@ -475,7 +482,8 @@ fi
 step "8/8 firewall and https"
 # Oracle's Ubuntu images reject everything except SSH in iptables; open the public ports.
 if command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -q -- '-j REJECT'; then
-  for port in 8545 26656 80 443; do
+  ports="26656 80 443"; [ "$PUBLIC_HTTP_RPC" = 1 ] && ports="8545 $ports"
+  for port in $ports; do
     iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp --dport $port -j ACCEPT
   done
   command -v netfilter-persistent >/dev/null && netfilter-persistent save || true
@@ -509,6 +517,28 @@ if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]
   # https://$host/rest/   Cosmos REST    }
   # wss://$host/ws        EVM JSON-RPC over WebSocket (eth_subscribe: new blocks, logs)
   # https://$host/zetaphy/  files: genesis, peer, setup script, wallet configs
+  # The two RPCs go through rpc-guard (zetaphyd rpc-guard): allowed methods
+  # only (no websocket on /rpc), requests per minute and faucet grants per IP.
+  cat > /etc/systemd/system/zetaphy-rpc-guard.service <<UNIT
+[Unit]
+Description=ZETAPHY public RPC filter (Caddy -> rpc-guard -> node)
+After=zetaphyd.service
+
+[Service]
+User=$NODE_USER
+WorkingDirectory=/home/$NODE_USER
+ExecStart=$BIN rpc-guard --comet-listen 127.0.0.1:26667 --evm-listen 127.0.0.1:8547 --comet http://127.0.0.1:26657 --evm http://127.0.0.1:8545
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload && systemctl enable zetaphy-rpc-guard >/dev/null 2>&1 && systemctl restart zetaphy-rpc-guard \
+    || echo "rpc-guard did not start: systemctl status zetaphy-rpc-guard"
   { apt_get install -y caddy >/dev/null && cat > /etc/caddy/Caddyfile <<CADDY
 $host${PUBLIC_HOST:+, $PUBLIC_HOST} {
 	header ?Access-Control-Allow-Origin *
@@ -528,13 +558,13 @@ $host${PUBLIC_HOST:+, $PUBLIC_HOST} {
 			reverse_proxy 127.0.0.1:1317
 		}
 		handle_path /rpc/* {
-			reverse_proxy 127.0.0.1:26657
+			reverse_proxy 127.0.0.1:26667
 		}
 		handle /ws {
 			rewrite * /
 			reverse_proxy 127.0.0.1:8546
 		}
-		reverse_proxy 127.0.0.1:8545
+		reverse_proxy 127.0.0.1:8547
 	}
 }
 CADDY
@@ -598,8 +628,7 @@ cat <<INFO | tee "/home/$NODE_USER/NODE-INFO.txt"
 ZETAPHY testnet node is starting.
   Chain ID (Cosmos):   $CHAIN_ID
   Chain ID (EVM):      $EVM_CHAIN_ID
-  MetaMask RPC URL:    http://$ip:8545
-  HTTPS RPC (wallet):  https://$pubhost  (needs ports 80 and 443 open)
+  MetaMask RPC URL:    https://$pubhost  (needs ports 80 and 443 open)
   WebSocket RPC:       wss://$pubhost/ws  (eth_subscribe)
   Keplr / Leap:        RPC https://$pubhost/rpc  REST https://$pubhost/rest
                        (chain settings: https://$pubhost/zetaphy/keplr.json)
@@ -1400,7 +1429,7 @@ index 204345c..35824e7 100644
  }
  
 diff --git a/evmd/cmd/evmd/cmd/root.go b/evmd/cmd/evmd/cmd/root.go
-index 4da3349..8eda4d3 100644
+index 4da3349..6efd213 100644
 --- a/evmd/cmd/evmd/cmd/root.go
 +++ b/evmd/cmd/evmd/cmd/root.go
 @@ -22,6 +22,8 @@ import (
@@ -1412,7 +1441,15 @@ index 4da3349..8eda4d3 100644
  	"cosmossdk.io/log/v2"
  	confixcmd "cosmossdk.io/tools/confix/cmd"
  	"github.com/cosmos/cosmos-sdk/store/v2"
-@@ -204,7 +206,9 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
+@@ -174,6 +176,7 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
+ 		pruning.Cmd(sdkAppCreator, defaultNodeHome),
+ 		snapshot.Cmd(sdkAppCreator),
+ 		NewTestnetCmd(evmApp.BasicModuleManager, banktypes.GenesisBalancesIterator{}, appCreator{}),
++		evmd.RPCGuardCmd(), // ZETAPHY: the public RPC filter (setup-node.sh)
+ 	)
+ 
+ 	// add Cosmos EVM' flavored TM commands to start server, etc.
+@@ -204,7 +207,9 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
  	}
  }
  
@@ -1423,7 +1460,7 @@ index 4da3349..8eda4d3 100644
  
  func queryCommand() *cobra.Command {
  	cmd := &cobra.Command{
-@@ -249,6 +253,8 @@ func txCommand() *cobra.Command {
+@@ -249,6 +254,8 @@ func txCommand() *cobra.Command {
  		authcmd.GetEncodeCommand(),
  		authcmd.GetDecodeCommand(),
  		authcmd.GetSimulateCmd(),
@@ -4633,10 +4670,10 @@ index 0000000..81a5fff
 +}
 diff --git a/evmd/zetaphy_rpc.go b/evmd/zetaphy_rpc.go
 new file mode 100644
-index 0000000..161572e
+index 0000000..76340b8
 --- /dev/null
 +++ b/evmd/zetaphy_rpc.go
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,497 @@
 +package evmd
 +
 +// ZETAPHY JSON-RPC namespace "zetaphy" on the public EVM endpoint (8545),
@@ -4659,6 +4696,7 @@ index 0000000..161572e
 +	"encoding/json"
 +	"fmt"
 +	"math/big"
++	"net"
 +	"os"
 +	"path/filepath"
 +	"strings"
@@ -4850,6 +4888,11 @@ index 0000000..161572e
 +		return nil, fmt.Errorf("invalid address: %w", err)
 +	}
 +	to := common.BytesToAddress(addr)
++	// Only through this machine (rpc-guard behind Caddy counts calls per
++	// IP): not over websocket, not from another machine straight to 8545.
++	if p := gethrpc.PeerInfoFromContext(ctx); p.Transport != "http" || !loopbackPeer(p.RemoteAddr) {
++		return nil, fmt.Errorf("the faucet answers only through this node's https address")
++	}
 +	faucet.Lock()
 +	defer faucet.Unlock()
 +	key, err := a.faucetKey()
@@ -4904,6 +4947,15 @@ index 0000000..161572e
 +}
 +
 +func ptr[T any](v T) *T { return &v }
++
++func loopbackPeer(addr string) bool {
++	host, _, err := net.SplitHostPort(addr)
++	if err != nil {
++		host = addr
++	}
++	ip := net.ParseIP(host)
++	return ip != nil && ip.IsLoopback()
++}
 +
 +// ---- security core (zetaphy_security.go) ---------------------------------
 +//
@@ -5118,6 +5170,418 @@ index 0000000..161572e
 +		}
 +	}
 +	return out, nil
++}
+diff --git a/evmd/zetaphy_rpcguard.go b/evmd/zetaphy_rpcguard.go
+new file mode 100644
+index 0000000..dd3582c
+--- /dev/null
++++ b/evmd/zetaphy_rpcguard.go
+@@ -0,0 +1,406 @@
++package evmd
++
++// ZETAPHY: `zetaphyd rpc-guard`, a small filter between Caddy (the public
++// https door) and the node's own RPC servers. A caller on the internet can
++// use only what wallets and the ZETAPHY apps need:
++//
++//   - CometBFT RPC (Keplr, Leap, the explorer): the methods in cometMethods,
++//     asked as GET /<method>?… or as JSON-RPC POST (batches too). No
++//     websocket, no dump_consensus_state, net_info (peer IPs),
++//     unconfirmed_txs, genesis, unsafe_*.
++//   - EVM JSON-RPC: eth_*, net_*, web3_* and zetaphy_*. txpool_*, debug_*,
++//     admin_*, personal_* and the rest stay on the machine.
++//   - zetaphy_faucet: at most faucetPerDay calls a UTC day from one IP (an
++//     IPv6 /64 counts as one), on top of the node's own faucet limits.
++//   - everyone: at most perMinute requests a minute from one IP, and
++//     maxInFlight requests at a time in all.
++//
++// The request is decoded with encoding/json, as CometBFT and the EVM
++// JSON-RPC server decode it, so the method checked here is the method they
++// run. It listens on 127.0.0.1 only, and takes the caller's IP from
++// X-Forwarded-For only on connections from 127.0.0.1 (Caddy).
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httputil"
++	"net/url"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/spf13/cobra"
++)
++
++// CometBFT RPC methods open to the public (all read-only, except sending a
++// signed transaction).
++var cometMethods = map[string]bool{
++	"health": true, "status": true, "abci_info": true, "abci_query": true,
++	"block": true, "block_by_hash": true, "block_results": true, "blockchain": true,
++	"commit": true, "header": true, "header_by_hash": true,
++	"validators": true, "consensus_params": true,
++	"tx": true, "tx_search": true, "block_search": true,
++	"broadcast_tx_sync": true, "broadcast_tx_async": true, "check_tx": true,
++	"num_unconfirmed_txs": true,
++}
++
++// EVM JSON-RPC namespaces open to the public.
++var evmPrefixes = []string{"eth_", "net_", "web3_", "zetaphy_"}
++
++func evmMethodOK(m string) bool {
++	for _, p := range evmPrefixes {
++		if strings.HasPrefix(m, p) && len(m) > len(p) {
++			return true
++		}
++	}
++	return false
++}
++
++const (
++	guardBodyLimit = 1 << 20 // as CometBFT's max_body_bytes and the EVM http-body-limit
++	guardMaxBatch  = 20
++	faucetMethod   = "zetaphy_faucet"
++)
++
++// GuardConfig: what rpc-guard forwards where, and its limits.
++type GuardConfig struct {
++	Comet        string // CometBFT RPC, e.g. http://127.0.0.1:26657
++	EVM          string // EVM JSON-RPC, e.g. http://127.0.0.1:8545
++	PerMinute    int    // requests a minute from one IP (each side)
++	FaucetPerDay int    // zetaphy_faucet calls a UTC day from one IP
++	MaxInFlight  int    // requests being answered at once (each side)
++}
++
++// Guard holds the counters shared by the two filters.
++type Guard struct {
++	cfg    GuardConfig
++	comet  *url.URL
++	evm    *url.URL
++	minute *window
++	faucet *window
++	now    func() time.Time
++}
++
++// NewGuard checks the backend addresses.
++func NewGuard(cfg GuardConfig) (*Guard, error) {
++	c, err := url.Parse(cfg.Comet)
++	if err != nil || c.Host == "" {
++		return nil, fmt.Errorf("--comet: an http://host:port address")
++	}
++	e, err := url.Parse(cfg.EVM)
++	if err != nil || e.Host == "" {
++		return nil, fmt.Errorf("--evm: an http://host:port address")
++	}
++	if cfg.PerMinute < 1 || cfg.FaucetPerDay < 0 || cfg.MaxInFlight < 1 {
++		return nil, fmt.Errorf("limits must be positive")
++	}
++	return &Guard{
++		cfg: cfg, comet: c, evm: e,
++		minute: newWindow(time.Minute, 200_000),
++		faucet: newWindow(24*time.Hour, 200_000),
++		now:    time.Now,
++	}, nil
++}
++
++// window counts calls per key in fixed periods (minute, UTC day). It holds
++// at most max keys; a new key past that is refused (no reset an attacker
++// with many addresses could force).
++type window struct {
++	mu     sync.Mutex
++	period time.Duration
++	max    int
++	start  time.Time
++	n      map[string]int
++}
++
++func newWindow(period time.Duration, max int) *window {
++	return &window{period: period, max: max, n: map[string]int{}}
++}
++
++func (w *window) allow(key string, limit int, now time.Time) bool {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	if start := now.UTC().Truncate(w.period); !start.Equal(w.start) {
++		w.start, w.n = start, map[string]int{}
++	}
++	c, seen := w.n[key]
++	if c >= limit || (!seen && len(w.n) >= w.max) {
++		return false
++	}
++	w.n[key] = c + 1
++	return true
++}
++
++// ClientKey: the caller's IP as rpc-guard counts it. Behind Caddy (a
++// connection from 127.0.0.1) it is the last X-Forwarded-For entry, the one
++// Caddy itself added; an IPv6 address counts as its /64.
++func ClientKey(r *http.Request) string {
++	host, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err != nil {
++		host = r.RemoteAddr
++	}
++	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
++		if xff := r.Header.Values("X-Forwarded-For"); len(xff) > 0 {
++			parts := strings.Split(xff[len(xff)-1], ",")
++			if c := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); c != nil {
++				host = c.String()
++			}
++		}
++	}
++	ip := net.ParseIP(host)
++	if ip == nil {
++		return host
++	}
++	if v4 := ip.To4(); v4 != nil {
++		return v4.String()
++	}
++	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
++}
++
++type rpcCall struct {
++	Method string `json:"method"`
++}
++
++// rpcMethods: the method of each call in a JSON-RPC body (one call or a
++// batch), decoded the way the servers behind decode it.
++func rpcMethods(body []byte) ([]string, error) {
++	t := bytes.TrimLeft(body, " \t\r\n")
++	if len(t) > 0 && t[0] == '[' {
++		var calls []rpcCall
++		if err := json.Unmarshal(body, &calls); err != nil {
++			return nil, fmt.Errorf("invalid JSON-RPC batch")
++		}
++		if len(calls) == 0 || len(calls) > guardMaxBatch {
++			return nil, fmt.Errorf("a batch holds 1 to %d calls", guardMaxBatch)
++		}
++		out := make([]string, len(calls))
++		for i, c := range calls {
++			out[i] = c.Method
++		}
++		return out, nil
++	}
++	var c rpcCall
++	if err := json.Unmarshal(body, &c); err != nil {
++		return nil, fmt.Errorf("invalid JSON-RPC request")
++	}
++	return []string{c.Method}, nil
++}
++
++func refuse(w http.ResponseWriter, status int, msg string) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	b, _ := json.Marshal(map[string]any{
++		"jsonrpc": "2.0", "id": nil,
++		"error": map[string]any{"code": -32601, "message": msg},
++	})
++	_, _ = w.Write(b)
++}
++
++func proxyTo(target *url.URL) *httputil.ReverseProxy {
++	return &httputil.ReverseProxy{
++		Rewrite: func(p *httputil.ProxyRequest) {
++			p.Out.URL.Scheme, p.Out.URL.Host = target.Scheme, target.Host
++			p.Out.Host = target.Host
++			p.Out.Header.Del("X-Forwarded-For") // the backends do not need it
++		},
++		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, _ error) {
++			refuse(w, http.StatusBadGateway, "the node is not answering")
++		},
++	}
++}
++
++// readBody reads at most guardBodyLimit bytes and puts them back for the proxy.
++func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
++	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, guardBodyLimit))
++	if err != nil {
++		refuse(w, http.StatusRequestEntityTooLarge, "request too large")
++		return nil, false
++	}
++	r.Body = io.NopCloser(bytes.NewReader(b))
++	r.ContentLength = int64(len(b))
++	return b, true
++}
++
++// common: in-flight and per-minute limits, no websocket.
++func (g *Guard) common(sem chan struct{}, next func(http.ResponseWriter, *http.Request)) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("Upgrade") != "" {
++			refuse(w, http.StatusForbidden, "websocket is not open on this public RPC")
++			return
++		}
++		select {
++		case sem <- struct{}{}:
++			defer func() { <-sem }()
++		default:
++			refuse(w, http.StatusServiceUnavailable, "the node is busy; try again shortly")
++			return
++		}
++		if !g.minute.allow(ClientKey(r), g.cfg.PerMinute, g.now()) {
++			w.Header().Set("Retry-After", "60")
++			refuse(w, http.StatusTooManyRequests, "too many requests from this address; try again in a minute")
++			return
++		}
++		next(w, r)
++	})
++}
++
++// CometHandler filters CometBFT RPC requests.
++func (g *Guard) CometHandler() http.Handler {
++	px := proxyTo(g.comet)
++	return g.common(make(chan struct{}, g.cfg.MaxInFlight), func(w http.ResponseWriter, r *http.Request) {
++		name := strings.TrimPrefix(r.URL.Path, "/")
++		if name != "" {
++			// GET /<method>?… (CometBFT also takes form values by POST here)
++			if r.URL.RawPath != "" || !cometMethods[name] {
++				refuse(w, http.StatusForbidden, "method not available on this public RPC")
++				return
++			}
++			if r.Method != http.MethodGet && r.Method != http.MethodPost {
++				refuse(w, http.StatusMethodNotAllowed, "GET or POST")
++				return
++			}
++			if r.Method == http.MethodPost {
++				if _, ok := readBody(w, r); !ok {
++					return
++				}
++			}
++			r.URL.Path, r.URL.RawPath = "/"+name, ""
++			px.ServeHTTP(w, r)
++			return
++		}
++		if r.Method != http.MethodPost {
++			refuse(w, http.StatusForbidden, "method not available on this public RPC")
++			return
++		}
++		body, ok := readBody(w, r)
++		if !ok {
++			return
++		}
++		ms, err := rpcMethods(body)
++		if err != nil {
++			refuse(w, http.StatusBadRequest, err.Error())
++			return
++		}
++		for _, m := range ms {
++			if !cometMethods[m] {
++				refuse(w, http.StatusForbidden, "method not available on this public RPC: "+trimMethod(m))
++				return
++			}
++		}
++		r.URL.Path, r.URL.RawPath = "/", ""
++		px.ServeHTTP(w, r)
++	})
++}
++
++// EVMHandler filters EVM JSON-RPC requests.
++func (g *Guard) EVMHandler() http.Handler {
++	px := proxyTo(g.evm)
++	return g.common(make(chan struct{}, g.cfg.MaxInFlight), func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost {
++			refuse(w, http.StatusMethodNotAllowed, "JSON-RPC by POST")
++			return
++		}
++		body, ok := readBody(w, r)
++		if !ok {
++			return
++		}
++		ms, err := rpcMethods(body)
++		if err != nil {
++			refuse(w, http.StatusBadRequest, err.Error())
++			return
++		}
++		faucets := 0
++		for _, m := range ms {
++			if !evmMethodOK(m) {
++				refuse(w, http.StatusForbidden, "method not available on this public RPC: "+trimMethod(m))
++				return
++			}
++			if m == faucetMethod {
++				faucets++
++			}
++		}
++		if faucets > 1 {
++			refuse(w, http.StatusBadRequest, "one zetaphy_faucet call per request")
++			return
++		}
++		if faucets == 1 && !g.faucet.allow(ClientKey(r), g.cfg.FaucetPerDay, g.now()) {
++			refuse(w, http.StatusTooManyRequests, fmt.Sprintf("the faucet gives at most %d grants a day to one internet address; try again tomorrow (UTC)", g.cfg.FaucetPerDay))
++			return
++		}
++		r.URL.Path, r.URL.RawPath = "/", ""
++		px.ServeHTTP(w, r)
++	})
++}
++
++func trimMethod(m string) string {
++	if len(m) > 64 {
++		m = m[:64]
++	}
++	return strings.Map(func(c rune) rune {
++		if c < 0x20 || c > 0x7e {
++			return '?'
++		}
++		return c
++	}, m)
++}
++
++func guardServer(addr string, h http.Handler) *http.Server {
++	return &http.Server{
++		Addr: addr, Handler: h,
++		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
++		WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second,
++		MaxHeaderBytes: 16 << 10,
++	}
++}
++
++func loopbackAddr(addr string) error {
++	host, _, err := net.SplitHostPort(addr)
++	if err != nil {
++		return err
++	}
++	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
++		return fmt.Errorf("%s: rpc-guard listens on 127.0.0.1 only (Caddy is the public door)", addr)
++	}
++	return nil
++}
++
++// RPCGuardCmd is `zetaphyd rpc-guard` (a service of its own; setup-node.sh
++// installs it and points Caddy at it).
++func RPCGuardCmd() *cobra.Command {
++	var cfg GuardConfig
++	var cometListen, evmListen string
++	cmd := &cobra.Command{
++		Use:   "rpc-guard",
++		Short: "Public RPC filter for Caddy: allowed methods only, per-IP limits, faucet limit per IP",
++		Args:  cobra.NoArgs,
++		RunE: func(cmd *cobra.Command, _ []string) error {
++			for _, a := range []string{cometListen, evmListen} {
++				if err := loopbackAddr(a); err != nil {
++					return err
++				}
++			}
++			g, err := NewGuard(cfg)
++			if err != nil {
++				return err
++			}
++			errc := make(chan error, 2)
++			go func() { errc <- guardServer(cometListen, g.CometHandler()).ListenAndServe() }()
++			go func() { errc <- guardServer(evmListen, g.EVMHandler()).ListenAndServe() }()
++			cmd.Printf("rpc-guard: CometBFT %s -> %s, EVM %s -> %s\n", cometListen, cfg.Comet, evmListen, cfg.EVM)
++			return <-errc
++		},
++	}
++	f := cmd.Flags()
++	f.StringVar(&cometListen, "comet-listen", "127.0.0.1:26667", "where Caddy sends /rpc/")
++	f.StringVar(&evmListen, "evm-listen", "127.0.0.1:8547", "where Caddy sends EVM JSON-RPC")
++	f.StringVar(&cfg.Comet, "comet", "http://127.0.0.1:26657", "the node's CometBFT RPC")
++	f.StringVar(&cfg.EVM, "evm", "http://127.0.0.1:8545", "the node's EVM JSON-RPC")
++	f.IntVar(&cfg.PerMinute, "per-minute", 300, "requests a minute from one IP, on each side")
++	f.IntVar(&cfg.FaucetPerDay, "faucet-per-day", 3, "zetaphy_faucet calls a UTC day from one IP")
++	f.IntVar(&cfg.MaxInFlight, "max-in-flight", 64, "requests answered at once, on each side")
++	return cmd
 +}
 diff --git a/evmd/zetaphy_seccli.go b/evmd/zetaphy_seccli.go
 new file mode 100644
