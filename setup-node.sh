@@ -146,6 +146,47 @@ zetaphy_preinstalls() {
 }
 if [ "${1:-}" = "--preinstalls" ]; then zetaphy_preinstalls; exit 0; fi
 
+# A pinned chain (the mainnet: zetaphy-chain/mainnet/, docs/ZETAPHY-MAINNET-PROCEDURE.md) instead of the testnet:
+#   GENESIS_FILE=<final genesis.json> GENESIS_SHA256=<its published sha256> GENESIS_EVM_CHAIN_ID=<n>
+#   ZETAPHYD_BIN=<zetaphyd of the verified release>  [PUBLIC_RPC=1 on the public RPC host, never on the validator]
+#   [PEERS=<node id>@<ip>:26656: the one node to dial, e.g. the validator's sentry]
+# installs a node of that genesis only (chain id, coin and minimum gas price read from it): no testnet genesis, no
+# faucet, no keys (the validator's key is made beforehand, in a file keyring), no automatic vote-key tx, and no
+# https/RPC proxy unless PUBLIC_RPC=1. The choice is kept in $PINNED, so every later run (zetaphy-validator update,
+# upgrade-watch) stays on that chain and refuses any other genesis. Unset (and no $PINNED): the testnet, unchanged.
+PINNED=/etc/zetaphy/pinned-chain.env
+GENESIS_FILE="${GENESIS_FILE:-}"; GENESIS_SHA256="${GENESIS_SHA256:-}"; GENESIS_EVM_CHAIN_ID="${GENESIS_EVM_CHAIN_ID:-}"
+NET_NAME="testnet"; NET_TITLE="ZETAPHY Testnet"; IS_TESTNET=true; KEPLR_COIN="ZETAPHY"; EVM_SYMBOL="ZTPHY"
+MIN_GAS=1000000000; SERVE_PUBLIC=1
+if [ -n "$GENESIS_FILE$GENESIS_SHA256$GENESIS_EVM_CHAIN_ID" ] || [ -f "$PINNED" ]; then
+  pinned() { sed -n "s/^$1=\([0-9a-f]*\)\$/\1/p" "$PINNED" 2>/dev/null | head -1; }
+  if [ -f "$PINNED" ]; then
+    [ -z "$GENESIS_SHA256" ] || [ "$GENESIS_SHA256" = "$(pinned GENESIS_SHA256)" ] \
+      || { echo "refused: this node is pinned to genesis $(pinned GENESIS_SHA256) ($PINNED), not $GENESIS_SHA256"; exit 1; }
+    GENESIS_SHA256=$(pinned GENESIS_SHA256); GENESIS_EVM_CHAIN_ID=${GENESIS_EVM_CHAIN_ID:-$(pinned GENESIS_EVM_CHAIN_ID)}
+    PUBLIC_RPC=${PUBLIC_RPC:-$(pinned PUBLIC_RPC)}; GENESIS_FILE=${GENESIS_FILE:-$NODE_HOME/config/genesis.json}
+  fi
+  [[ "$GENESIS_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "GENESIS_SHA256: the 64-hex sha256 of the published genesis"; exit 1; }
+  [[ "$GENESIS_EVM_CHAIN_ID" =~ ^[1-9][0-9]{0,15}$ ]] && [ "$GENESIS_EVM_CHAIN_ID" != "$EVM_CHAIN_ID" ] \
+    || { echo "GENESIS_EVM_CHAIN_ID: the chain's EVM chain id (not the testnet's $EVM_CHAIN_ID)"; exit 1; }
+  [ -z "$JOIN" ] || { echo "JOIN is for the testnet; a pinned chain takes GENESIS_FILE (and PEERS)"; exit 1; }
+  [ -f "$GENESIS_FILE" ] && echo "$GENESIS_SHA256  $GENESIS_FILE" | sha256sum -c --quiet - 2>/dev/null \
+    || { echo "refused: $GENESIS_FILE is not the genesis with sha256 $GENESIS_SHA256"; exit 1; }
+  [ -n "$ZETAPHYD_BIN" ] || [ -x "$BIN" ] || { echo "a pinned chain installs the verified release: ZETAPHYD_BIN=<zetaphyd> (verify-release.sh)"; exit 1; }
+  [ ! -e "$NODE_HOME/config/faucet.key" ] || { echo "refused: $NODE_HOME/config/faucet.key exists (a testnet faucet): use a clean machine"; exit 1; }
+  PUBLIC_RPC=${PUBLIC_RPC:-0}; [[ "$PUBLIC_RPC" =~ ^[01]$ ]] || { echo "PUBLIC_RPC: 0 or 1"; exit 1; }
+  PEERS="${PEERS:-}"; [ -z "$PEERS" ] || [[ "$PEERS" =~ ^[0-9a-f]{40}@[0-9.]+:[0-9]+$ ]] || { echo "PEERS: <node id>@<ip>:<port>"; exit 1; }
+  g=$(python3 -I -c 'import decimal,json,sys; g=json.load(open(sys.argv[1])); a=g["app_state"]; d=a["staking"]["params"]["bond_denom"]
+m=[x for x in a["bank"]["denom_metadata"] if x["base"]==d]; print(g["chain_id"], d, m[0]["symbol"] if m else "", int(decimal.Decimal(a["feemarket"]["params"]["min_gas_price"])))' "$GENESIS_FILE") \
+    || { echo "refused: $GENESIS_FILE: cannot read chain id, bond denom and fee params"; exit 1; }
+  read -r p_chain p_denom p_sym p_gas <<<"$g"
+  [[ "$p_chain" =~ ^[a-z][a-z0-9]*_[0-9]+-[0-9]+$ ]] && [ "$p_chain" != "$CHAIN_ID" ] || { echo "refused: genesis chain id $p_chain"; exit 1; }
+  [[ "$p_denom" =~ ^[a-z][a-z0-9]{2,63}$ ]] && [[ "$p_sym" =~ ^[A-Z][A-Z0-9]{1,11}$ ]] && [[ "$p_gas" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "refused: genesis denom/symbol/min gas price ($p_denom/$p_sym/$p_gas)"; exit 1; }
+  CHAIN_ID=$p_chain; DENOM=$p_denom; EVM_CHAIN_ID=$GENESIS_EVM_CHAIN_ID; MIN_GAS=$p_gas; SERVE_PUBLIC=$PUBLIC_RPC
+  NET_NAME="$CHAIN_ID"; NET_TITLE="ZETAPHY"; IS_TESTNET=false; KEPLR_COIN=$p_sym; EVM_SYMBOL=$p_sym
+fi
+
 # Commands run as the node user from its own home: started from another
 # user's home (e.g. ~/setup.sh in Cloud Shell) the node binary cannot create
 # its working files there ("mkdir data: permission denied").
@@ -157,6 +198,7 @@ node_home_dir() { cd "/home/$NODE_USER" 2>/dev/null || cd /tmp; }
 # gives 10) and become a validator.
 if [ "${1:-}" = "--become-validator" ]; then
   amt=${2:?amount of ZETAPHY to stake}
+  [ -z "$GENESIS_FILE" ] || { echo "--become-validator is for the testnet (test keyring); a pinned chain: docs/ZETAPHY-MAINNET-PROCEDURE.md"; exit 1; }
   node_home_dir
   [[ "$amt" =~ ^[0-9]+$ ]] || { echo "amount: whole ZETAPHY"; exit 1; }
   zv() { su -s /bin/bash "$NODE_USER" -c "$BIN $* --home $NODE_HOME"; }
@@ -347,7 +389,26 @@ K="--keyring-backend test --keyring-dir $KEYS_DIR"
 
 # A genesis that never got its validator (gentx) on a node that never made a
 # block is from a run that stopped part-way: set it aside and redo step 5.
-if [ -f "$NODE_HOME/config/genesis.json" ] && [ ! -d "$NODE_HOME/data/blockstore.db" ] \
+# A pinned chain: its genesis only (GENESIS_FILE, checked against GENESIS_SHA256 above). The validator's
+# priv_validator_key.json (made with its gentx) is kept; a node that already made blocks of another genesis is refused.
+if [ -n "$GENESIS_FILE" ]; then
+  step "5/8 genesis of $CHAIN_ID (pinned, sha256 $GENESIS_SHA256)"
+  G="$NODE_HOME/config/genesis.json"
+  [ -f "$NODE_HOME/config/config.toml" ] || z init "$MONIKER" --chain-id "$CHAIN_ID" --home "$NODE_HOME" >/dev/null
+  if [ "$GENESIS_FILE" != "$G" ] && [ -f "$G" ] && ! echo "$GENESIS_SHA256  $G" | sha256sum -c --quiet - 2>/dev/null; then
+    [ -z "$(ls -A "$NODE_HOME/data/blockstore.db" 2>/dev/null)" ] || { echo "refused: this node has blocks of another genesis ($G)"; exit 1; }
+    mv "$G" "$G.replaced-$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+  [ -f "$G" ] || install -o "$NODE_USER" -g "$NODE_USER" -m 644 "$GENESIS_FILE" "$G"
+  echo "$GENESIS_SHA256  $G" | sha256sum -c --quiet - || { echo "refused: $G is not the pinned genesis"; exit 1; }
+  z genesis validate-genesis --home "$NODE_HOME"
+  z config set client chain-id "$CHAIN_ID" --home "$NODE_HOME"
+  [ -z "$PEERS" ] || echo "$PEERS" | as_node "cat > '$NODE_HOME/config/seed-peer'"
+  install -d -m 755 /etc/zetaphy
+  printf 'GENESIS_SHA256=%s\nGENESIS_EVM_CHAIN_ID=%s\nPUBLIC_RPC=%s\n' "$GENESIS_SHA256" "$EVM_CHAIN_ID" "$PUBLIC_RPC" > "$PINNED.tmp"
+  chmod 644 "$PINNED.tmp" && mv -f "$PINNED.tmp" "$PINNED"
+fi
+if [ -z "$GENESIS_FILE" ] && [ -f "$NODE_HOME/config/genesis.json" ] && [ ! -d "$NODE_HOME/data/blockstore.db" ] \
   && [ "$(jq -r '"\(.initial_height // 1)/\(.app_state.genutil.gen_txs // [] | length)"' "$NODE_HOME/config/genesis.json" 2>/dev/null)" = 1/0 ]; then
   mv "$NODE_HOME/config/genesis.json" "$NODE_HOME/config/genesis.json.unfinished-$(date -u +%Y%m%dT%H%M%SZ)"
   echo "genesis from an unfinished run moved aside"
@@ -472,7 +533,7 @@ V="$NODE_HOME/config/pq_vote_key.seed"
 as_node "sed -i -E 's/^timeout_commit = .*/timeout_commit = \"5s\"/' '$C'"            # ~5 s blocks
 # Cosmos EVM's own mempool requires CometBFT to hand transactions to the app.
 as_node "sed -i -E 's/^type = \"flood\"/type = \"app\"/' '$C'"
-as_node "sed -i -E 's/^minimum-gas-prices = .*/minimum-gas-prices = \"1000000000$DENOM\"/' '$A'"
+as_node "sed -i -E 's/^minimum-gas-prices = .*/minimum-gas-prices = \"$MIN_GAS$DENOM\"/' '$A'"
 as_node "sed -i -E 's/^evm-chain-id = .*/evm-chain-id = $EVM_CHAIN_ID/' '$A'"
 # Keep ~6 days of state, not all of it: disk stays small on free VMs.
 as_node "sed -i -E 's/^pruning = .*/pruning = \"custom\"/; s/^pruning-keep-recent = .*/pruning-keep-recent = \"100000\"/; s/^pruning-interval = .*/pruning-interval = \"10\"/' '$A'"
@@ -552,7 +613,7 @@ REVERT
   chmod 755 /usr/local/bin/zetaphy-start-guard-revert
   cat > /etc/systemd/system/zetaphyd.service <<UNIT
 [Unit]
-Description=ZETAPHY testnet node
+Description=ZETAPHY $NET_NAME node
 After=network-online.target
 Wants=network-online.target
 
@@ -586,7 +647,7 @@ else
 fi
 
 # The genesis validator registers its vote key once the chain runs.
-if [ -z "$JOIN" ] && [ ! -f "$V.registered" ]; then
+if [ -z "$JOIN" ] && [ -z "$GENESIS_FILE" ] && [ ! -f "$V.registered" ]; then
   for _ in $(seq 1 60); do
     h=$(z status --home "$NODE_HOME" 2>/dev/null | jq -r '.sync_info.latest_block_height // 0' 2>/dev/null || true)
     [ "${h:-0}" -ge 2 ] 2>/dev/null && break; sleep 2
@@ -628,7 +689,7 @@ UNIT
 }
 # Oracle's Ubuntu images reject everything except SSH in iptables; open the public ports.
 if command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -q -- '-j REJECT'; then
-  ports="26656 80 443"; [ "$PUBLIC_HTTP_RPC" = 1 ] && ports="8545 $ports"
+  ports="26656 80 443"; [ "$SERVE_PUBLIC" = 1 ] || ports=26656; [ "$PUBLIC_HTTP_RPC" = 1 ] && ports="8545 $ports"
   for port in $ports; do
     iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null || iptables -I INPUT 5 -p tcp --dport $port -j ACCEPT
   done
@@ -646,18 +707,18 @@ pub=/var/lib/zetaphy-public
 mkdir -p $pub && install -m 644 "$NODE_HOME/config/genesis.json" $pub/ && install -m 644 "$SELF" $pub/setup-node.sh
 echo "$(z comet show-node-id --home "$NODE_HOME")@$ip:26656" > $pub/peer
 # Wallet settings for this node, for one-click "add network" buttons.
-jq -n --arg h "https://$pubhost" --arg c "$CHAIN_ID" --arg d "$DENOM" '
-  {denom: $d, cur: {coinDenom: "ZETAPHY", coinMinimalDenom: $d, coinDecimals: 18}} as $x |
-  {chainId: $c, chainName: "ZETAPHY Testnet", rpc: ($h + "/rpc"), rest: ($h + "/rest"), bip44: {coinType: 60},
+jq -n --arg h "https://$pubhost" --arg c "$CHAIN_ID" --arg d "$DENOM" --arg n "$NET_TITLE" --arg coin "$KEPLR_COIN" '
+  {denom: $d, cur: {coinDenom: $coin, coinMinimalDenom: $d, coinDecimals: 18}} as $x |
+  {chainId: $c, chainName: $n, rpc: ($h + "/rpc"), rest: ($h + "/rest"), bip44: {coinType: 60},
    bech32Config: {bech32PrefixAccAddr: "zetaphy", bech32PrefixAccPub: "zetaphypub", bech32PrefixValAddr: "zetaphyvaloper",
      bech32PrefixValPub: "zetaphyvaloperpub", bech32PrefixConsAddr: "zetaphyvalcons", bech32PrefixConsPub: "zetaphyvalconspub"},
    currencies: [$x.cur], stakeCurrency: $x.cur,
    feeCurrencies: [$x.cur + {gasPriceStep: {low: 1000000000, average: 2000000000, high: 4000000000}}],
-   features: ["eth-address-gen", "eth-key-sign", "eth-secp256k1-cosmos", "force-enable-evm-ledger"], isTestnet: true, evm: {chainId: '"$EVM_CHAIN_ID"', rpc: $h}}' > $pub/keplr.json
-jq -n --arg h "https://$pubhost" --arg id "$(printf '0x%x' "$EVM_CHAIN_ID")" \
-  '{chainId: $id, chainName: "ZETAPHY Testnet", nativeCurrency: {name: "ZETAPHY", symbol: "ZTPHY", decimals: 18}, rpcUrls: [$h]}' > $pub/evm-chain.json
+   features: ["eth-address-gen", "eth-key-sign", "eth-secp256k1-cosmos", "force-enable-evm-ledger"], isTestnet: '"$IS_TESTNET"', evm: {chainId: '"$EVM_CHAIN_ID"', rpc: $h}}' > $pub/keplr.json
+jq -n --arg h "https://$pubhost" --arg id "$(printf '0x%x' "$EVM_CHAIN_ID")" --arg n "$NET_TITLE" --arg sym "$EVM_SYMBOL" \
+  '{chainId: $id, chainName: $n, nativeCurrency: {name: "ZETAPHY", symbol: $sym, decimals: 18}, rpcUrls: [$h]}' > $pub/evm-chain.json
 chmod 644 $pub/keplr.json $pub/evm-chain.json
-if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]]; then
+if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]] && [ "$SERVE_PUBLIC" = 1 ]; then
   # https://$host/        EVM JSON-RPC (MetaMask and other EVM wallets)
   # https://$host/rpc/    CometBFT RPC   } Keplr, Leap, Cosmostation
   # https://$host/rest/   Cosmos REST    }
@@ -797,6 +858,21 @@ if [ -n "$JOIN" ]; then
   me=$(z debug addr "$(z keys show validator -a $K --home "$NODE_HOME")" --home "$NODE_HOME" | awk '/Address hex/ {print $3}')
   curl -fsS "https://$JOIN" -H 'content-type: application/json' \
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"zetaphy_faucet\",\"params\":[\"$me\"]}" || true
+fi
+if [ -n "$GENESIS_FILE" ]; then
+  cat <<INFO | tee "/home/$NODE_USER/NODE-INFO.txt"
+
+ZETAPHY node of $CHAIN_ID is starting (genesis sha256 $GENESIS_SHA256, kept in $PINNED).
+  Chain ID (EVM):      $EVM_CHAIN_ID
+  Minimum gas price:   $MIN_GAS$DENOM
+  Public RPC:          $([ "$SERVE_PUBLIC" = 1 ] && echo "https://$pubhost (rpc-guard)" || echo "none on this machine (PUBLIC_RPC=0)")
+  P2P:                 $(cat $pub/peer)
+  No faucet, no keys made here. A validator registers its vote key with its own key:
+                       zetaphyd tx pq-vote-key --from <key> --keyring-backend file ... (the procedure, step 9)
+  Back up:             $NODE_HOME/config/priv_validator_key.json and pq_vote_key.seed, offline
+  Logs:                journalctl -u zetaphyd -f
+INFO
+  exit 0
 fi
 cat <<INFO | tee "/home/$NODE_USER/NODE-INFO.txt"
 
