@@ -24,6 +24,14 @@ EGRESS_LIMIT_MB="${EGRESS_LIMIT_MB:-800}"
 # allow the wallet and app methods and limit each IP). PUBLIC_HTTP_RPC=1 also
 # opens plain http://<ip>:8545, without those limits (the faucet stays https only).
 PUBLIC_HTTP_RPC="${PUBLIC_HTTP_RPC:-0}"
+# https key exchange. prefer (default): the hybrid post-quantum X25519MLKEM768
+# (ML-KEM-768 + X25519) with every client that offers it (current Chrome, Edge,
+# Firefox, Safari, Go >= 1.24, OpenSSL >= 3.5), X25519 / P-256 for the others
+# (older Node, curl and Go, many wallet apps), so nobody is cut off. require:
+# the hybrid only; clients without ML-KEM cannot connect. off: Ubuntu's caddy
+# with its defaults. The certificate stays classical (ECDSA) either way.
+TLS_PQ="${TLS_PQ:-prefer}"
+[[ "$TLS_PQ" =~ ^(prefer|require|off)$ ]] || { echo "TLS_PQ: prefer, require or off"; exit 1; }
 
 set -euo pipefail
 
@@ -34,7 +42,7 @@ DENOM="azetaphy"                   # 1 ZETAPHY = 10^18 azetaphy
 MONIKER="${MONIKER:-zetaphy-validator-0}"
 COSMOS_EVM_TAG="v0.7.3"
 COSMOS_EVM_COMMIT="c3ae9067a7eadcdea55a5192226916deb44c71c4"
-GO_VERSION="1.25.9"                # what cosmos/evm v0.7.3 go.mod requires
+GO_VERSION="1.26.11"               # Go 1.26 patch release the patched evmd/go.mod requires (security fixes)
 # IBC rate limits: ibc-apps rate-limiting, ported to ibc-go v11 by the patch below.
 RATELIMIT_MOD="github.com/cosmos/ibc-apps/modules/rate-limiting/v10@v10.7.0"
 RATELIMIT_SUM="h1:5X2o/xT1x1fltUrkhvDCOpFaRJK5/1M36/SCh873VOc="
@@ -46,6 +54,13 @@ RATELIMIT_SUM="h1:5X2o/xT1x1fltUrkhvDCOpFaRJK5/1M36/SCh873VOc="
 WASMVM_VERSION="v3.0.9"
 WASMVM_SO_SHA256_x86_64="0d41aa842c004a6aa138291d1f9f99818479fec7aef024d419e4ad244f858ee4"
 WASMVM_SO_SHA256_aarch64="7eeb256b7baecaf465c555260d4e21b6d2532f451a2c7b95fd8acef4c4da597e"
+# The https proxy for TLS_PQ: Caddy's official release (built with Go >= 1.24,
+# which has X25519MLKEM768), installed in /usr/local/bin next to Ubuntu's package
+# (2.6 on 24.04: no ML-KEM) and checked against these SHA-256 sums of the release
+# tarballs (their SHA-512 in the release's checksums file matched when pinned).
+CADDY_VERSION="v2.11.7"
+CADDY_SHA256_x86_64="727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b"
+CADDY_SHA256_aarch64="d8fc6d179a5d283028a472a5618564f6ad8a86fed513e64f032b3b0b7cc45e42"
 
 NODE_USER="zetaphy"
 NODE_HOME="/home/${NODE_USER}/.zetaphy"          # chain data + config (no keys)
@@ -204,8 +219,9 @@ node_home_dir
 as_node() { su -s /bin/bash "$NODE_USER" -c "$*"; }
 
 step "4/8 build zetaphyd"
+new_bin=""   # installed below, after libwasmvm and the pre-flight
 if [ -n "$ZETAPHYD_BIN" ]; then
-  install -m 755 "$ZETAPHYD_BIN" "$BIN"
+  new_bin=$ZETAPHYD_BIN
 elif [ ! -x "$BIN" ] || [ -n "${FORCE_BUILD:-}" ]; then
   # Any Go >= 1.21 can fetch the exact toolchain the source asks for (GOTOOLCHAIN),
   # verified against Go's checksum database. Ubuntu 24.04's golang-go is 1.22.
@@ -224,8 +240,9 @@ elif [ ! -x "$BIN" ] || [ -n "${FORCE_BUILD:-}" ]; then
   # The ZETAPHY changes (zetaphy_patch_source, above), as the node user.
   install -m 644 "$SELF" /tmp/zetaphy-setup-node.sh
   as_node "cd '$src' && $goenv bash /tmp/zetaphy-setup-node.sh --patch-source '$src'"
+  as_node "rm -f '/home/${NODE_USER}/go/bin/evmd'"   # a failed build must not leave an older evmd to install
   as_node "cd '$src' && $goenv make install"
-  install -m 755 "/home/${NODE_USER}/go/bin/evmd" "$BIN"
+  new_bin="/home/${NODE_USER}/go/bin/evmd"
   [ "$(as_node "cd '$src/evmd' && $goenv go list -m -f '{{.Version}}' github.com/CosmWasm/wasmvm/v3")" = "$WASMVM_VERSION" ] || { echo "wasmvm is not $WASMVM_VERSION"; exit 1; }
   wasmvm_so="$(as_node "cd '$src/evmd' && $goenv go list -m -f '{{.Dir}}' github.com/CosmWasm/wasmvm/v3")/internal/api/libwasmvm.$(uname -m).so"
 fi
@@ -243,6 +260,83 @@ if ! echo "$want  $lib" | sha256sum -c --quiet - 2>/dev/null; then
   fi
   echo "$want  $wasmvm_so" | sha256sum -c --quiet - || { echo "libwasmvm hash mismatch"; exit 1; }
   install -m 644 "$wasmvm_so" "$lib" && ldconfig
+fi
+# Pre-flight (evmd/zetaphy_upgradecheck.go): while this node's chain runs, the new
+# binary must be able to run its next block. The 2026-11-05 testnet halt at block
+# 239468 ("upgrade handler is missing for zetaphy-v5") was a binary without the
+# handler of an upgrade the chain had completed. A binary too old to have
+# upgrade-check is refused too. There is no silent skip: only
+# ZETAPHY_ALLOW_DOWNGRADE=<chain-id>:<height> installs a refused binary, on purpose
+# (e.g. a planned rollback, docs/ANTI-ROLLBACK-CHAIN.md). It must name this node's
+# chain and a height at most 100 blocks below its current one (the refusal prints
+# the value), and each use is logged to the journal (logger -t zetaphy-setup) and
+# to $LOG. The binary itself checks again at every start (zetaphy_antirollback.go).
+if [ -n "$new_bin" ]; then
+  rpc=$(sed -n '/^\[rpc\]/,/^\[/ s/^laddr = "tcp:\/\/[^:]*:\([0-9]*\)"$/\1/p' "$NODE_HOME/config/config.toml" 2>/dev/null | head -1 || true)
+  [ -z "${UPGRADE_CHECK:-}" ] || echo "UPGRADE_CHECK is no longer honored; the check always runs (ZETAPHY_ALLOW_DOWNGRADE=<chain-id>:<height> overrides it on purpose)"
+  if [ -f "$NODE_HOME/config/genesis.json" ] && st=$(curl -fsS -m 5 "http://127.0.0.1:${rpc:-26657}/status" 2>/dev/null); then
+    chk=$(mktemp /tmp/zetaphyd-check.XXXXXX) && install -m 755 "$new_bin" "$chk"
+    if ! as_node "cd ~ && '$chk' upgrade-check --node tcp://127.0.0.1:${rpc:-26657} --home '$NODE_HOME'"; then
+      rm -f "$chk"
+      net=$(echo "$st" | jq -r '.result.node_info.network // empty'); cur=$(echo "$st" | jq -r '.result.sync_info.latest_block_height // 0')
+      allow=${ZETAPHY_ALLOW_DOWNGRADE:-}; ah=${allow##*:}
+      if [ -n "$allow" ] && [ -n "$net" ] && [ "${allow%:*}" = "$net" ] && [[ "$ah" =~ ^[0-9]+$ ]] && [ "$ah" -le "$cur" ] && [ $((cur - ah)) -le 100 ]; then
+        msg="ZETAPHY_ALLOW_DOWNGRADE=$allow: installing a zetaphyd that FAILED upgrade-check on $net at block $cur (deliberate override by $(id -un), sha256 $(sha256sum "$new_bin" | cut -c1-16))"
+        logger -t zetaphy-setup -p user.crit "$msg" 2>/dev/null || true
+        echo "WARNING: $msg"
+      else
+        [ -z "$allow" ] || echo "ZETAPHY_ALLOW_DOWNGRADE=$allow does not match this node ($net at block $cur): ignored"
+        echo "refused: this zetaphyd cannot run the next block of the chain this node runs; $BIN was not changed"
+        echo "(only on purpose, e.g. a planned rollback: ZETAPHY_ALLOW_DOWNGRADE=$net:$cur; docs/ANTI-ROLLBACK-CHAIN.md)"
+        exit 1
+      fi
+    fi
+    rm -f "$chk"
+  fi
+  # A prebuilt binary (ZETAPHYD_BIN: zetaphy-validator update / upgrade-watch, after verify-release.sh) that
+  # carries the handler of the chain's scheduled or halted upgrade must be the one governance voted: when the
+  # plan's info pins checksums (cosmovisor format, {"binaries":{"linux/amd64":"<url>?checksum=sha256:<hex>"}},
+  # gov.sh propose-upgrade writes it), this binary's SHA-256 must be the pin for this platform (internal review
+  # 2026-11-10, Z-04). Only ZETAPHY_ALLOW_UNPINNED=<chain-id>:<upgrade name> installs another one, on purpose;
+  # each use is logged to the journal and to $LOG.
+  if [ -n "$ZETAPHYD_BIN" ] && [ -f "$NODE_HOME/config/genesis.json" ]; then
+    plat="linux/$(case "$(uname -m)" in x86_64) echo amd64 ;; aarch64) echo arm64 ;; *) uname -m ;; esac)"
+    pname=""; pinfo=""; ui="$NODE_HOME/data/upgrade-info.json"
+    if [ -n "${st:-}" ]; then   # the node answers: its scheduled plan
+      pj=$(as_node "cd ~ && '$new_bin' q upgrade plan --node tcp://127.0.0.1:${rpc:-26657} -o json" 2>/dev/null || true)
+      pname=$(jq -r '(.plan // .).name // empty' <<<"$pj" 2>/dev/null || true); pinfo=$(jq -r '(.plan // .).info // empty' <<<"$pj" 2>/dev/null || true)
+    elif [ -f "$ui" ] && [ -n "$(find "$ui" -mmin -60 2>/dev/null)" ]; then   # halted at a plan (rewritten at each restart)
+      pname=$(jq -r '.name // empty' "$ui" 2>/dev/null || true); pinfo=$(jq -r '.info // empty' "$ui" 2>/dev/null || true)
+    fi
+    if [ -n "$pname" ] && grep -aqF "$pname" "$new_bin"; then
+      got=$(sha256sum "$new_bin" | cut -d' ' -f1)
+      pins=$(jq -r 'if type == "object" and (.binaries | type) == "object" then "y" else empty end' <<<"$pinfo" 2>/dev/null || true)
+      pin=$(jq -r --arg p "$plat" '.binaries[$p] // empty' <<<"$pinfo" 2>/dev/null | grep -oE 'checksum=sha256:[0-9a-f]{64}' | cut -d: -f2 || true)
+      why=""
+      if [ -z "$pins" ]; then
+        echo "upgrade \"$pname\": its plan pins no binary checksum; this binary is installed on the release signature check alone"
+      elif [ -z "$pin" ]; then why="the plan of \"$pname\" pins no checksum for $plat"
+      elif [ "$pin" != "$got" ]; then why="this zetaphyd ($got) is not the one the plan of \"$pname\" pins for $plat ($pin)"
+      else echo "upgrade \"$pname\": zetaphyd matches the checksum governance voted ($plat)"
+      fi
+      if [ -n "$why" ]; then
+        net=$(jq -r '.chain_id // empty' "$NODE_HOME/config/genesis.json")
+        if [ -n "${ZETAPHY_ALLOW_UNPINNED:-}" ] && [ "$ZETAPHY_ALLOW_UNPINNED" = "$net:$pname" ]; then
+          msg="ZETAPHY_ALLOW_UNPINNED=$ZETAPHY_ALLOW_UNPINNED: installing although $why (deliberate override by $(id -un))"
+          logger -t zetaphy-setup -p user.crit "$msg" 2>/dev/null || true
+          echo "WARNING: $msg"
+        else
+          echo "refused: $why; $BIN was not changed"
+          echo "(only on purpose: ZETAPHY_ALLOW_UNPINNED=$net:$pname)"
+          exit 1
+        fi
+      fi
+    fi
+  fi
+  # The binary that ran until now stays as $BIN.prev: if the start guard refuses the new one (exit 78), the
+  # service puts it back once and starts again (zetaphy-start-guard-revert below; internal review 2026-11-12, Z-50).
+  if [ -x "$BIN" ] && ! cmp -s "$new_bin" "$BIN"; then install -m 755 "$BIN" "$BIN.prev"; fi
+  install -m 755 "$new_bin" "$BIN"
 fi
 "$BIN" version
 su -s /bin/bash "$NODE_USER" -c "$BIN q wasm libwasmvm-version" # the VM loads (CosmWasm)
@@ -318,7 +412,7 @@ elif [ ! -f "$NODE_HOME/config/genesis.json" ]; then
   # EIP-2935 serves 8191 blocks; the EVM keeper's ring must match.
   # Key 0f = the security core (Q-day, threat gate, IBC hold; all off until
   # voted on) from block 1; a running chain gets it with "zetaphy-v3".
-  jqg '.app_state.zetaphypq = (((.app_state.zetaphypq // []) | map(select(.key != "08" and .key != "0f"))) + [{"key":"08","value":"0000000000000001"},{"key":"0f","value":"0000000000000001"}]) | .app_state.evm.params.history_serve_window = "8191"'
+  jqg '.app_state.zetaphypq = (((.app_state.zetaphypq // []) | map(select(.key != "08" and .key != "0f" and .key != "20"))) + [{"key":"08","value":"0000000000000001"},{"key":"0f","value":"0000000000000001"},{"key":"20","value":"0000000000000001"}]) | .app_state.evm.params.history_serve_window = "8191"'
   # CosmWasm (stage 7): contract code is stored by a governance vote only
   # (gov.sh wasm-store); anyone instantiates it. `zetaphyd init` writes the
   # same; set here so it is explicit.
@@ -439,6 +533,23 @@ START="$BIN start --home $NODE_HOME --chain-id $CHAIN_ID --json-rpc.api eth,net,
 # Use systemd only when it is actually running (it may be installed but off,
 # e.g. on WSL without systemd=true); otherwise start the node in the background.
 if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ]; then
+  # Runs as root after zetaphyd stops. Only when the start guard refused (exit 78) and the binary that ran
+  # before is still there: it goes back in place (the refused one is kept as $BIN.refused), the event is logged
+  # at user.crit, and the node starts again. $BIN.prev is used up, so a second refusal leaves it stopped.
+  cat > /usr/local/bin/zetaphy-start-guard-revert <<REVERT
+#!/bin/bash
+[ "\${EXIT_STATUS:-}" = 78 ] || exit 0
+[ -x "$BIN.prev" ] && ! cmp -s "$BIN.prev" "$BIN" || { logger -t zetaphyd -p user.crit "ZETAPHY start guard refused $BIN; no previous binary to put back: the node stays stopped (journalctl -u zetaphyd)"; exit 0; }
+mv -f "$BIN" "$BIN.refused" && mv -f "$BIN.prev" "$BIN"
+# The install record (verify-release.sh --record) keeps the refused release as its floor and marks it refused.
+if [ -f /var/lib/zetaphy/installed-release.json ] && [ -f /usr/local/lib/zetaphy-validator/verify-release.sh ]; then
+  bash /usr/local/lib/zetaphy-validator/verify-release.sh --mark-refused --installed-bin "$BIN" --record-file /var/lib/zetaphy/installed-release.json \
+    || logger -t zetaphyd -p user.crit "ZETAPHY start guard revert: could not mark the refused release in the install record"
+fi
+logger -t zetaphyd -p user.crit "ZETAPHY start guard refused the new zetaphyd (kept as $BIN.refused); the previous binary is back in $BIN and the node starts again"
+systemctl --no-block start zetaphyd.service
+REVERT
+  chmod 755 /usr/local/bin/zetaphy-start-guard-revert
   cat > /etc/systemd/system/zetaphyd.service <<UNIT
 [Unit]
 Description=ZETAPHY testnet node
@@ -453,6 +564,11 @@ WorkingDirectory=/home/$NODE_USER
 ExecStart=$START
 Restart=always
 RestartSec=5
+# 78: the start guard refused (downgraded binary or rolled-back signing state,
+# docs/ANTI-ROLLBACK-CHAIN.md); restarting would not change that. The binary
+# that ran before (if a new one was just installed) is put back, once.
+RestartPreventExitStatus=78
+ExecStopPost=+/usr/local/bin/zetaphy-start-guard-revert
 LimitNOFILE=65535
 Environment=GOMEMLIMIT=$((mem_kb * 6 / 10 / 1024))MiB
 NoNewPrivileges=true
@@ -480,6 +596,36 @@ if [ -z "$JOIN" ] && [ ! -f "$V.registered" ]; then
 fi
 
 step "8/8 firewall and https"
+# TLS_PQ: installs Caddy $CADDY_VERSION from its release (SHA-256 checked) and points
+# the caddy service at it. Returns non-zero, changing nothing, when it cannot.
+pq_caddy() {
+  local arch sum tmp
+  case "$(uname -m)" in
+    x86_64) arch=amd64; sum=$CADDY_SHA256_x86_64 ;;
+    aarch64) arch=arm64; sum=$CADDY_SHA256_aarch64 ;;
+    *) return 1 ;;
+  esac
+  if ! /usr/local/bin/caddy version 2>/dev/null | grep -q "^$CADDY_VERSION "; then
+    tmp=$(mktemp -d)
+    if curl -fsSL -m 300 -o "$tmp/caddy.tar.gz" "https://github.com/caddyserver/caddy/releases/download/$CADDY_VERSION/caddy_${CADDY_VERSION#v}_linux_$arch.tar.gz" \
+      && echo "$sum  $tmp/caddy.tar.gz" | sha256sum -c --quiet - && tar -xzf "$tmp/caddy.tar.gz" -C "$tmp" caddy; then
+      install -m 755 "$tmp/caddy" /usr/local/bin/caddy
+      rm -rf "$tmp"
+    else
+      rm -rf "$tmp"
+      return 1
+    fi
+  fi
+  mkdir -p /etc/systemd/system/caddy.service.d
+  cat > /etc/systemd/system/caddy.service.d/zetaphy-pq.conf <<'UNIT'
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+UNIT
+  systemctl daemon-reload
+}
 # Oracle's Ubuntu images reject everything except SSH in iptables; open the public ports.
 if command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -q -- '-j REJECT'; then
   ports="26656 80 443"; [ "$PUBLIC_HTTP_RPC" = 1 ] && ports="8545 $ports"
@@ -539,8 +685,24 @@ WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload && systemctl enable zetaphy-rpc-guard >/dev/null 2>&1 && systemctl restart zetaphy-rpc-guard \
     || echo "rpc-guard did not start: systemctl status zetaphy-rpc-guard"
-  { apt_get install -y caddy >/dev/null && cat > /etc/caddy/Caddyfile <<CADDY
+  # Ubuntu's package gives the caddy user, the service and /etc/caddy; for TLS_PQ the
+  # service runs the pinned release instead (a drop-in: apt upgrades do not undo it).
+  tls_block=""
+  if apt_get install -y caddy >/dev/null; then
+    if [ "$TLS_PQ" != off ] && pq_caddy; then
+      case "$TLS_PQ" in
+        require) curves="x25519mlkem768" ;;
+        *) curves="x25519mlkem768 x25519 secp256r1" ;;  # hybrid first: Go's TLS server picks it whenever the client offers it
+      esac
+      tls_block=$(printf '\ttls {\n\t\tcurves %s\n\t}' "$curves")
+    else
+      { rm -f /etc/systemd/system/caddy.service.d/zetaphy-pq.conf; systemctl daemon-reload; } 2>/dev/null || true
+      [ "$TLS_PQ" = off ] || echo "post-quantum https: Caddy $CADDY_VERSION could not be installed; Ubuntu's caddy serves classical X25519"
+    fi
+  fi
+  { command -v caddy >/dev/null && cat > /etc/caddy/Caddyfile <<CADDY
 $host${PUBLIC_HOST:+, $PUBLIC_HOST} {
+$tls_block
 	header ?Access-Control-Allow-Origin *
 	header ?Access-Control-Allow-Headers "Content-Type"
 	header ?Access-Control-Allow-Methods "GET, POST, OPTIONS"
@@ -587,13 +749,26 @@ if [ "\$now" -ge "\$last" ]; then used=\$(( used + now - last )); else used=\$((
 if [ "\$m" != "\$month" ]; then m=\$month; used=0; fi
 echo "\$m \$now \$used" > \$S/state
 echo "\$(date -u +%FT%TZ) sent this month: \$(( used / 1048576 )) MB of $EGRESS_LIMIT_MB MB" > \$S/status
+# The rule closes 8545 to the outside only (! -i lo): the node's own tools, rpc-guard and
+# zetaphy-validator reach it on 127.0.0.1. The rule of older versions blocked loopback too:
+# it is removed on every run.
+for ipt in iptables ip6tables; do
+  command -v \$ipt >/dev/null || continue
+  while \$ipt -D INPUT -p tcp --dport 8545 -j DROP 2>/dev/null; do :; done
+done
 if [ "\$used" -ge "\$LIMIT" ]; then
   # applied on every run: a reboot drops the iptables rule and starts Caddy again
   systemctl stop caddy 2>/dev/null
-  iptables -C INPUT -p tcp --dport 8545 -j DROP 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 8545 -j DROP
+  for ipt in iptables ip6tables; do
+    command -v \$ipt >/dev/null || continue
+    \$ipt -C INPUT ! -i lo -p tcp --dport 8545 -j DROP 2>/dev/null || \$ipt -I INPUT 1 ! -i lo -p tcp --dport 8545 -j DROP
+  done
   [ -f \$S/paused ] || { touch \$S/paused; logger -t zetaphy-egress "public RPC paused: \$(( used / 1048576 )) MB sent this month"; }
 elif [ -f \$S/paused ]; then
-  iptables -D INPUT -p tcp --dport 8545 -j DROP 2>/dev/null
+  for ipt in iptables ip6tables; do
+    command -v \$ipt >/dev/null || continue
+    \$ipt -D INPUT ! -i lo -p tcp --dport 8545 -j DROP 2>/dev/null
+  done
   systemctl start caddy 2>/dev/null; rm -f \$S/paused
   logger -t zetaphy-egress "public RPC reopened for \$month"
 fi
@@ -636,6 +811,12 @@ ZETAPHY testnet node is starting.
   Currency symbol:     ZETAPHY
   Genesis keys:        $KEYS_DIR (testnet only; MNEMONICS-KEEP-SECRET.txt)
   Back up:             $NODE_HOME/config/priv_validator_key.json and pq_vote_key.seed
+                       (and the words in $KEYS_DIR/MNEMONICS-KEEP-SECRET.txt), offline
+  Then lock it down:   sudo zetaphy-validator secure   (deletes the plaintext words file once you
+                       confirm the backup; SSH keys only; security updates; asks first). Where
+                       zetaphy-validator is not installed (the chain's first node): verify a release,
+                       then run the join-validator.sh it names (docs/ANTI-ROLLBACK-OFFCHAIN.md,
+                       "Installs and upgrades take only verified releases"); never a script from main
   Logs:                journalctl -u zetaphyd -f
 INFO
 
@@ -1144,7 +1325,7 @@ index 0000000..62d63ad
 +	return pk.UnmarshalBinary(bytes.Clone(m.Key)) == nil
 +}
 diff --git a/evmd/app.go b/evmd/app.go
-index 204345c..35824e7 100644
+index 204345c..493dc28 100644
 --- a/evmd/app.go
 +++ b/evmd/app.go
 @@ -14,6 +14,10 @@ import (
@@ -1169,23 +1350,28 @@ index 204345c..35824e7 100644
  	"github.com/cosmos/evm/x/vm"
  	evmkeeper "github.com/cosmos/evm/x/vm/keeper"
  	vmrunner "github.com/cosmos/evm/x/vm/runner"
-@@ -179,6 +187,15 @@ type EVMD struct {
+@@ -179,6 +187,20 @@ type EVMD struct {
  	IBCKeeper      *ibckeeper.Keeper // IBC Keeper must be a pointer in the app, so we can SetRouter on it correctly
  	TransferKeeper *transferkeeper.Keeper
  	CallbackKeeper ibccallbackskeeper.ContractKeeper
 +	// ZETAPHY: per-denom, per-channel IBC flow limits set by governance
 +	RateLimitKeeper *ratelimitkeeper.Keeper
-+	pqHome          string // ZETAPHY: node home, for the ML-DSA vote key file
++	pqHome          string             // ZETAPHY: node home, for the ML-DSA vote key file
++	signRec         *zetaphySignRecord // ZETAPHY: config/zetaphy_sign_state.json (zetaphy_antirollback.go)
 +	// ZETAPHY security core (zetaphy_security.go)
 +	secPrecompile *securityPrecompile
-+	ibcHoldStack  *ibcHoldMiddleware
++	// ZETAPHY v5 (zetaphy_future.go)
++	aiPrecompile     *aiPrecompile
++	immunePrecompile *immunePrecompile
++	guardPrecompile  *guardPrecompile
++	ibcHoldStack     *ibcHoldMiddleware
 +	// ZETAPHY stage 7: CosmWasm contracts (zetaphy_cosmwasm.go)
 +	WasmKeeper     wasmkeeper.Keeper
 +	wasmNodeConfig wasmtypes.NodeConfig
  
  	// Cosmos EVM keepers
  	FeeMarketKeeper feemarketkeeper.Keeper
-@@ -238,9 +255,11 @@ func NewExampleApp(
+@@ -238,9 +260,11 @@ func NewExampleApp(
  		govtypes.StoreKey, consensusparamtypes.StoreKey,
  		upgradetypes.StoreKey, feegrant.StoreKey, evidencetypes.StoreKey, authzkeeper.StoreKey,
  		// ibc keys
@@ -1198,18 +1384,56 @@ index 204345c..35824e7 100644
  	)
  	oKeys := storetypes.NewObjectStoreKeys(banktypes.ObjectStoreKey, evmtypes.ObjectKey)
  
-@@ -487,6 +506,10 @@ func NewExampleApp(
+@@ -275,6 +299,9 @@ func NewExampleApp(
+ 		keys:              keys,
+ 		oKeys:             oKeys,
+ 	}
++	// ZETAPHY: the chain guard's circuit breaker on every routed message (zetaphy_chainguard.go);
++	// set before any service is registered, so hybrid handlers get it too.
++	app.MsgServiceRouter().SetCircuit(zetaphyCircuit{app})
+ 
+ 	// removed x/params: no ParamsKeeper initialization
+ 
+@@ -367,7 +394,8 @@ func NewExampleApp(
+ 	// register the staking hooks
+ 	// NOTE: stakingKeeper above is passed by reference, so that it will contain these hooks
+ 	app.StakingKeeper.SetHooks(
+-		stakingtypes.NewMultiStakingHooks(app.DistrKeeper.Hooks(), app.SlashingKeeper.Hooks()),
++		stakingtypes.NewMultiStakingHooks(app.DistrKeeper.Hooks(), app.SlashingKeeper.Hooks(),
++			powerCapHooks{app}), // ZETAPHY: voting-power cap (zetaphy_chainguard.go)
+ 	)
+ 
+ 	app.AuthzKeeper = authzkeeper.NewKeeper(
+@@ -412,7 +440,7 @@ func NewExampleApp(
+ 		app.AccountKeeper,
+ 		app.BankKeeper,
+ 		app.DistrKeeper,
+-		app.MsgServiceRouter(),
++		govGuardRouter{app: app, next: app.MsgServiceRouter()}, // ZETAPHY: the constitution, checked when a proposal runs (zetaphy_chainguard.go)
+ 		govConfig,
+ 		authAddr,
+ 		govkeeper.NewDefaultCalculateVoteResultsAndVotingPower(app.StakingKeeper),
+@@ -487,6 +515,12 @@ func NewExampleApp(
  
  	// enable virtual fee collection
  	app.EVMKeeper.EnableVirtualFeeCollection()
 +	app.EVMKeeper.SetRandomFn(app.prevRandao) // ZETAPHY: block.prevrandao from the PQ certificate (zetaphy_random.go)
 +	// ZETAPHY: the security precompile at 0x…0901 (zetaphy_secprecompile.go)
 +	app.secPrecompile = newSecurityPrecompile(app)
++	// ZETAPHY v5 (zetaphy_future.go): AI 0x…0902, immune 0x…0903, account guard 0x…0904
++	app.aiPrecompile, app.immunePrecompile, app.guardPrecompile = newAIPrecompile(app), newImmunePrecompile(app), newGuardPrecompile(app)
 +	app.EVMKeeper.SetZetaphyPrecompiles(app.zetaphyPrecompile)
  
  	app.Erc20Keeper = erc20keeper.NewKeeper(
  		keys[erc20types.StoreKey],
-@@ -530,9 +553,38 @@ func NewExampleApp(
+@@ -525,14 +559,44 @@ func NewExampleApp(
+ 		app.EVMKeeper,
+ 		app.Erc20Keeper,
+ 	)
+-	callbacksMiddleware := ibccallbacks.NewIBCMiddleware(app.CallbackKeeper, maxCallbackGas)
++	// ZETAPHY: the firewall checks each callback's state from the shield height on (zetaphy_shield.go)
++	callbacksMiddleware := ibccallbacks.NewIBCMiddleware(shieldCallbacks{ContractKeeper: app.CallbackKeeper, app: app}, maxCallbackGas)
+ 	callbacksMiddleware.SetICS4Wrapper(app.IBCKeeper.ChannelKeeper)
  	callbacksMiddleware.SetUnderlyingApplication(transferStack)
  	transferStack = callbacksMiddleware
  
@@ -1248,7 +1472,16 @@ index 204345c..35824e7 100644
  
  	// Create static IBC router, add transfer route, then set and seal it
  	ibcRouter := porttypes.NewRouter()
-@@ -579,10 +631,13 @@ func NewExampleApp(
+@@ -570,7 +634,7 @@ func NewExampleApp(
+ 		slashing.NewAppModule(appCodec, app.SlashingKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper, nil, app.interfaceRegistry),
+ 		distr.NewAppModule(appCodec, app.DistrKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper, nil),
+ 		staking.NewAppModule(appCodec, app.StakingKeeper, app.AccountKeeper, app.BankKeeper, nil),
+-		upgrade.NewAppModule(app.UpgradeKeeper, app.AccountKeeper.AddressCodec()),
++		newZetaphyUpgradeModule(upgrade.NewAppModule(app.UpgradeKeeper, app.AccountKeeper.AddressCodec()), app.UpgradeKeeper), // ZETAPHY: early binaries for listed upgrades (zetaphy_upgradeguard.go)
+ 		evidence.NewAppModule(app.EvidenceKeeper),
+ 		authzmodule.NewAppModule(appCodec, app.AuthzKeeper, app.AccountKeeper, app.BankKeeper, app.interfaceRegistry),
+ 		consensus.NewAppModule(appCodec, app.ConsensusParamsKeeper),
+@@ -579,10 +643,13 @@ func NewExampleApp(
  		ibc.NewAppModule(app.IBCKeeper),
  		ibctm.NewAppModule(tmLightClientModule),
  		transferModule,
@@ -1262,7 +1495,7 @@ index 204345c..35824e7 100644
  	)
  
  	// BasicModuleManager defines the module BasicManager which is in charge of setting up basic,
-@@ -598,6 +653,8 @@ func NewExampleApp(
+@@ -598,6 +665,8 @@ func NewExampleApp(
  			ibctransfertypes.ModuleName: transfer.AppModuleBasic{},
  		},
  	)
@@ -1271,7 +1504,7 @@ index 204345c..35824e7 100644
  	app.BasicModuleManager.RegisterLegacyAminoCodec(legacyAmino)
  	app.BasicModuleManager.RegisterInterfaces(interfaceRegistry)
  
-@@ -618,7 +675,7 @@ func NewExampleApp(
+@@ -618,7 +687,7 @@ func NewExampleApp(
  		minttypes.ModuleName,
  
  		// IBC modules
@@ -1280,7 +1513,7 @@ index 204345c..35824e7 100644
  
  		// Cosmos EVM BeginBlockers
  		erc20types.ModuleName, feemarkettypes.ModuleName,
-@@ -631,6 +688,7 @@ func NewExampleApp(
+@@ -631,6 +700,7 @@ func NewExampleApp(
  		authz.ModuleName, feegrant.ModuleName,
  		consensusparamtypes.ModuleName,
  		vestingtypes.ModuleName,
@@ -1288,7 +1521,7 @@ index 204345c..35824e7 100644
  	)
  
  	// NOTE: the feemarket module should go last in order of end blockers that are actually doing something,
-@@ -645,12 +703,13 @@ func NewExampleApp(
+@@ -645,12 +715,13 @@ func NewExampleApp(
  		evmtypes.ModuleName, erc20types.ModuleName, feemarkettypes.ModuleName,
  
  		// no-ops
@@ -1303,7 +1536,7 @@ index 204345c..35824e7 100644
  	)
  
  	// NOTE: The genutils module must occur after staking so that pools are
-@@ -670,9 +729,10 @@ func NewExampleApp(
+@@ -670,9 +741,10 @@ func NewExampleApp(
  		feemarkettypes.ModuleName,
  		erc20types.ModuleName,
  
@@ -1315,7 +1548,7 @@ index 204345c..35824e7 100644
  	}
  	app.ModuleManager.SetOrderInitGenesis(genesisModuleOrder...)
  	app.ModuleManager.SetOrderExportGenesis(genesisModuleOrder...)
-@@ -684,10 +744,14 @@ func NewExampleApp(
+@@ -684,10 +756,14 @@ func NewExampleApp(
  	if err = app.ModuleManager.RegisterServices(app.configurator); err != nil {
  		panic(fmt.Sprintf("failed to register services in module manager: %s", err.Error()))
  	}
@@ -1330,7 +1563,7 @@ index 204345c..35824e7 100644
  
  	autocliv1.RegisterQueryServer(app.GRPCQueryRouter(), runtimeservices.NewAutoCLIQueryService(app.ModuleManager.Modules))
  
-@@ -730,6 +794,10 @@ func NewExampleApp(
+@@ -730,6 +806,10 @@ func NewExampleApp(
  	if err := app.configureEVMMempool(appOpts, logger); err != nil {
  		panic(fmt.Sprintf("failed to configure EVM mempool: %s", err.Error()))
  	}
@@ -1341,7 +1574,7 @@ index 204345c..35824e7 100644
  
  	// In v0.46, the SDK introduces _postHandlers_. PostHandlers are like
  	// antehandlers, but are run _after_ the `runMsgs` execution. They are also
-@@ -751,6 +819,13 @@ func NewExampleApp(
+@@ -751,6 +831,13 @@ func NewExampleApp(
  	// upgrade.
  	app.setPostHandler()
  
@@ -1355,7 +1588,7 @@ index 204345c..35824e7 100644
  	// At startup, after all modules have been registered, check that all prot
  	// annotations are correct.
  	protoFiles, err := proto.MergedRegistry()
-@@ -777,6 +852,7 @@ func NewExampleApp(
+@@ -777,6 +864,7 @@ func NewExampleApp(
  
  		// set global evm variables from KV store
  		vmModule.HydrateGlobals(ctx)
@@ -1363,7 +1596,7 @@ index 204345c..35824e7 100644
  	}
  
  	vmrunner.SetRunner(bApp, txnrunner.NewSTMRunner(
-@@ -807,12 +883,14 @@ func (app *EVMD) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
+@@ -807,12 +895,14 @@ func (app *EVMD) setAnteHandler(txConfig client.TxConfig, maxGasWanted uint64) {
  		MaxTxGasWanted:         maxGasWanted,
  		DynamicFeeChecker:      true,
  		PendingTxListener:      app.onPendingTx,
@@ -1379,7 +1612,22 @@ index 204345c..35824e7 100644
  }
  
  func (app *EVMD) onPendingTx(hash common.Hash) {
-@@ -842,7 +920,21 @@ func (app *EVMD) Name() string { return app.BaseApp.Name() }
+@@ -833,8 +923,13 @@ func (app *EVMD) setPostHandler() {
+ 	if err != nil {
+ 		panic(err)
+ 	}
++	if postHandler != nil {
++		panic("ZETAPHY: the SDK post handler is no longer empty; chain it with shieldPostHandler")
++	}
+ 
+-	app.SetPostHandler(postHandler)
++	// ZETAPHY: the invariant firewall after txs whose messages can run EVM
++	// code (zetaphy_shield.go); does nothing below the shield height.
++	app.SetPostHandler(app.shieldPostHandler)
+ }
+ 
+ // Name returns the name of the App
+@@ -842,7 +937,23 @@ func (app *EVMD) Name() string { return app.BaseApp.Name() }
  
  // BeginBlocker application updates every begin block
  func (app *EVMD) BeginBlocker(ctx sdk.Context) (sdk.BeginBlock, error) {
@@ -1397,12 +1645,14 @@ index 204345c..35824e7 100644
 +	if err != nil {
 +		return bb, err
 +	}
++	app.breakerBeginBlock(ctx.WithEventManager(em))  // ZETAPHY v5: pause bridges the validators tripped (zetaphy_breaker.go)
++	app.firewallBeginBlock(ctx.WithEventManager(em)) // ZETAPHY: invariant firewall check point (zetaphy_firewall.go)
 +	bb.Events = append(em.ABCIEvents(), bb.Events...)
 +	return bb, nil
  }
  
  // EndBlocker application updates every end block
-@@ -869,10 +961,23 @@ func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci
+@@ -869,10 +980,24 @@ func (app *EVMD) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci
  		panic(err)
  	}
  
@@ -1425,14 +1675,23 @@ index 204345c..35824e7 100644
 +	if err := app.pqPreBlock(ctx, req); err != nil { // ZETAPHY: post-quantum vote certificate
 +		return nil, err
 +	}
++	app.zxPreBlock(ctx, req) // ZETAPHY v5: immune scores and breaker flags from the vote extensions (zetaphy_immune.go)
  	return app.ModuleManager.PreBlock(ctx)
  }
  
 diff --git a/evmd/cmd/evmd/cmd/root.go b/evmd/cmd/evmd/cmd/root.go
-index 4da3349..6efd213 100644
+index 4da3349..dda7f9e 100644
 --- a/evmd/cmd/evmd/cmd/root.go
 +++ b/evmd/cmd/evmd/cmd/root.go
-@@ -22,6 +22,8 @@ import (
+@@ -2,6 +2,7 @@ package cmd
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"os"
+ 
+ 	"github.com/spf13/cast"
+@@ -22,6 +23,8 @@ import (
  	"github.com/cosmos/evm/utils"
  	"github.com/cosmos/evm/x/vm/types"
  
@@ -1441,15 +1700,39 @@ index 4da3349..6efd213 100644
  	"cosmossdk.io/log/v2"
  	confixcmd "cosmossdk.io/tools/confix/cmd"
  	"github.com/cosmos/cosmos-sdk/store/v2"
-@@ -174,6 +176,7 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
+@@ -174,6 +177,9 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
  		pruning.Cmd(sdkAppCreator, defaultNodeHome),
  		snapshot.Cmd(sdkAppCreator),
  		NewTestnetCmd(evmApp.BasicModuleManager, banktypes.GenesisBalancesIterator{}, appCreator{}),
 +		evmd.RPCGuardCmd(), // ZETAPHY: the public RPC filter (setup-node.sh)
++		// ZETAPHY: pre-flight before installing a binary (zetaphy_upgradecheck.go)
++		evmd.UpgradeCheckCmd(evmApp),
  	)
  
  	// add Cosmos EVM' flavored TM commands to start server, etc.
-@@ -204,7 +207,9 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
+@@ -184,6 +190,21 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
+ 		addModuleInitFlags,
+ 	)
+ 
++	// ZETAPHY: the start guard runs for `start` only (zetaphy_antirollback.go).
++	for _, c := range rootCmd.Commands() {
++		if c.Name() != "start" {
++			continue
++		}
++		prev := c.PreRunE
++		c.PreRunE = func(cmd *cobra.Command, args []string) error {
++			evmd.ZetaphyStarting = true
++			if prev != nil {
++				return prev(cmd, args)
++			}
++			return nil
++		}
++	}
++
+ 	// add Cosmos EVM key commands
+ 	rootCmd.AddCommand(
+ 		cosmosevmcmd.KeyCommands(defaultNodeHome, true),
+@@ -204,7 +225,9 @@ func initRootCmd(rootCmd *cobra.Command, evmApp *evmd.EVMD) {
  	}
  }
  
@@ -1460,15 +1743,46 @@ index 4da3349..6efd213 100644
  
  func queryCommand() *cobra.Command {
  	cmd := &cobra.Command{
-@@ -249,6 +254,8 @@ func txCommand() *cobra.Command {
+@@ -223,6 +246,7 @@ func queryCommand() *cobra.Command {
+ 		authcmd.QueryTxCmd(),
+ 		sdkserver.QueryBlockCmd(),
+ 		sdkserver.QueryBlockResultsCmd(),
++		evmd.NeuroQueryCmd(), // ZETAPHY v5: q neuro model-at <height>
+ 	)
+ 
+ 	cmd.PersistentFlags().String(flags.FlagChainID, "", "The network chain ID")
+@@ -249,6 +273,8 @@ func txCommand() *cobra.Command {
  		authcmd.GetEncodeCommand(),
  		authcmd.GetDecodeCommand(),
  		authcmd.GetSimulateCmd(),
 +		evmd.PQVoteKeyCmd(), evmd.QuantumLockCmd(), evmd.PQEvidenceProposalCmd(), // ZETAPHY
-+		evmd.SecurityProposalCmd(), evmd.QDayCommitCmd(), evmd.QDayRevealCmd(), evmd.IBCHoldCancelCmd(), // ZETAPHY security core
++		evmd.SecurityProposalCmd(), evmd.QDayCommitCmd(), evmd.QDayRevealCmd(), evmd.IBCHoldCancelCmd(), evmd.CircuitCmd(), // ZETAPHY security core, chain guard
  	)
  
  	cmd.PersistentFlags().String(flags.FlagChainID, "", "The network chain ID")
+@@ -305,11 +331,21 @@ func newApp(
+ 		baseapp.SetChainID(chainID),
+ 	}
+ 
+-	return evmd.NewExampleApp(
++	app := evmd.NewExampleApp(
+ 		logger, db, true,
+ 		appOpts,
+ 		baseappOptions...,
+ 	)
++	// ZETAPHY: `start` refuses a downgraded binary or a rolled-back signing
++	// state before CometBFT starts (zetaphy_antirollback.go).
++	if evmd.ZetaphyStarting {
++		if err := app.ZetaphyStartGuard(appOpts); err != nil {
++			logger.Error(err.Error())
++			fmt.Fprintln(os.Stderr, err.Error())
++			os.Exit(78) // EX_CONFIG
++		}
++	}
++	return app
+ }
+ 
+ // appExport creates a new application (optionally at a given height) and exports state.
 diff --git a/evmd/config/permissions.go b/evmd/config/permissions.go
 index 312b521..6b8033d 100644
 --- a/evmd/config/permissions.go
@@ -1505,10 +1819,19 @@ index 9fdd8ef..e6ff55d 100644
  	if err != nil {
  		return servertypes.ExportedApp{}, err
 diff --git a/evmd/go.mod b/evmd/go.mod
-index e503386..cbc3a7e 100644
+index e503386..f20f59b 100644
 --- a/evmd/go.mod
 +++ b/evmd/go.mod
-@@ -4,20 +4,24 @@ go 1.25.9
+@@ -1,23 +1,32 @@
+ module github.com/cosmos/evm/evmd
+ 
+-go 1.25.9
++go 1.26.11
++
++// Go 1.26 rejects extra colons in a URL host by default; wasmd checks
++// MsgStoreAndInstantiateContract and legacy proposal sources with
++// url.ParseRequestURI, so keep Go 1.25's parse for the same accept/reject.
++godebug urlstrictcolons=0
  
  require (
  	cosmossdk.io/api v1.0.0
@@ -1536,18 +1859,33 @@ index e503386..cbc3a7e 100644
  	github.com/onsi/ginkgo/v2 v2.23.4
  	github.com/onsi/gomega v1.38.0
  	github.com/spf13/cast v1.10.0
-@@ -25,8 +29,9 @@ require (
+@@ -25,12 +34,13 @@ require (
  	github.com/spf13/pflag v1.0.10
  	github.com/spf13/viper v1.21.0
  	github.com/stretchr/testify v1.11.1
 -	golang.org/x/sync v0.20.0
-+	golang.org/x/sync v0.22.0
- 	google.golang.org/grpc v1.80.0
+-	google.golang.org/grpc v1.80.0
++	golang.org/x/sync v0.23.0
++	google.golang.org/grpc v1.83.2
 +	google.golang.org/protobuf v1.36.11
  )
  
  require (
-@@ -117,6 +122,7 @@ require (
+-	cel.dev/expr v0.25.1 // indirect
++	cel.dev/expr v0.25.2 // indirect
+ 	cloud.google.com/go v0.123.0 // indirect
+ 	cloud.google.com/go/auth v0.20.0 // indirect
+ 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
+@@ -46,7 +56,7 @@ require (
+ 	github.com/99designs/keyring v1.2.2 // indirect
+ 	github.com/DataDog/datadog-go v4.8.3+incompatible // indirect
+ 	github.com/DataDog/zstd v1.5.7 // indirect
+-	github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.32.0 // indirect
++	github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.35.0 // indirect
+ 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.56.0 // indirect
+ 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.56.0 // indirect
+ 	github.com/Microsoft/go-winio v0.6.2 // indirect
+@@ -117,6 +127,7 @@ require (
  	github.com/desertbit/timer v1.0.1 // indirect
  	github.com/dgraph-io/badger/v4 v4.9.1 // indirect
  	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
@@ -1555,7 +1893,16 @@ index e503386..cbc3a7e 100644
  	github.com/dlclark/regexp2 v1.7.0 // indirect
  	github.com/dop251/goja v0.0.0-20230605162241-28ee0ee714f3 // indirect
  	github.com/dunglas/httpsfv v1.1.0 // indirect
-@@ -154,6 +160,7 @@ require (
+@@ -139,7 +150,7 @@ require (
+ 	github.com/go-kit/kit v0.13.0 // indirect
+ 	github.com/go-kit/log v0.2.1 // indirect
+ 	github.com/go-logfmt/logfmt v0.6.1 // indirect
+-	github.com/go-logr/logr v1.4.3 // indirect
++	github.com/go-logr/logr v1.4.4 // indirect
+ 	github.com/go-logr/stdr v1.2.2 // indirect
+ 	github.com/go-ole/go-ole v1.3.0 // indirect
+ 	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
+@@ -154,6 +165,7 @@ require (
  	github.com/google/btree v1.1.3 // indirect
  	github.com/google/flatbuffers v25.2.10+incompatible // indirect
  	github.com/google/go-cmp v0.7.0 // indirect
@@ -1563,24 +1910,26 @@ index e503386..cbc3a7e 100644
  	github.com/google/orderedcode v0.0.1 // indirect
  	github.com/google/pprof v0.0.0-20250403155104-27863c87afa6 // indirect
  	github.com/google/s2a-go v0.1.9 // indirect
-@@ -164,7 +171,6 @@ require (
+@@ -164,8 +176,7 @@ require (
  	github.com/gorilla/mux v1.8.1 // indirect
  	github.com/gorilla/websocket v1.5.3 // indirect
  	github.com/grpc-ecosystem/go-grpc-middleware v1.4.0 // indirect
 -	github.com/grpc-ecosystem/grpc-gateway v1.16.0 // indirect
- 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
+-	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
++	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
  	github.com/gsterjov/go-libsecret v0.0.0-20161001094733-a6f4afe4910c // indirect
  	github.com/hashicorp/aws-sdk-go-base/v2 v2.0.0-beta.72 // indirect
-@@ -191,7 +197,7 @@ require (
+ 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
+@@ -191,7 +202,7 @@ require (
  	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
  	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
  	github.com/jmhodges/levigo v1.0.0 // indirect
 -	github.com/klauspost/compress v1.18.5 // indirect
-+	github.com/klauspost/compress v1.19.1 // indirect
++	github.com/klauspost/compress v1.20.2 // indirect
  	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
  	github.com/koron/go-ssdp v0.0.6 // indirect
  	github.com/kr/pretty v0.3.1 // indirect
-@@ -235,9 +241,10 @@ require (
+@@ -235,12 +246,13 @@ require (
  	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
  	github.com/oasisprotocol/curve25519-voi v0.0.0-20251114093237-2ab5a27a1729 // indirect
  	github.com/oklog/run v1.2.0 // indirect
@@ -1591,8 +1940,12 @@ index e503386..cbc3a7e 100644
 +	github.com/petermattis/goid v0.0.0-20260226131333-17d1149c6ac6 // indirect
  	github.com/pion/datachannel v1.5.10 // indirect
  	github.com/pion/dtls/v2 v2.2.12 // indirect
- 	github.com/pion/dtls/v3 v3.1.2 // indirect
-@@ -263,19 +270,20 @@ require (
+-	github.com/pion/dtls/v3 v3.1.2 // indirect
++	github.com/pion/dtls/v3 v3.1.4 // indirect
+ 	github.com/pion/ice/v4 v4.0.10 // indirect
+ 	github.com/pion/interceptor v0.1.40 // indirect
+ 	github.com/pion/logging v0.2.4 // indirect
+@@ -263,24 +275,25 @@ require (
  	github.com/planetscale/vtprotobuf v0.6.1-0.20240319094008-0393e58bdf10 // indirect
  	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
  	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
@@ -1619,38 +1972,113 @@ index e503386..cbc3a7e 100644
  	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
  	github.com/shirou/gopsutil/v4 v4.26.4 // indirect
  	github.com/spaolacci/murmur3 v1.1.0 // indirect
-@@ -342,22 +350,21 @@ require (
+ 	github.com/spf13/afero v1.15.0 // indirect
+-	github.com/spiffe/go-spiffe/v2 v2.6.0 // indirect
++	github.com/spiffe/go-spiffe/v2 v2.7.0 // indirect
+ 	github.com/stretchr/objx v0.5.3 // indirect
+ 	github.com/subosito/gotenv v1.6.0 // indirect
+ 	github.com/supranational/blst v0.3.16 // indirect
+@@ -303,36 +316,36 @@ require (
+ 	github.com/zondax/ledger-go v1.0.1 // indirect
+ 	go.etcd.io/bbolt v1.4.3 // indirect
+ 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+-	go.opentelemetry.io/contrib/bridges/otelslog v0.18.0 // indirect
+-	go.opentelemetry.io/contrib/detectors/gcp v1.43.0 // indirect
++	go.opentelemetry.io/contrib/bridges/otelslog v0.20.0 // indirect
++	go.opentelemetry.io/contrib/detectors/gcp v1.45.0 // indirect
+ 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.68.0 // indirect
+ 	go.opentelemetry.io/contrib/instrumentation/host v0.68.0 // indirect
+ 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0 // indirect
+ 	go.opentelemetry.io/contrib/instrumentation/runtime v0.68.0 // indirect
+-	go.opentelemetry.io/contrib/otelconf v0.23.0 // indirect
+-	go.opentelemetry.io/contrib/propagators/autoprop v0.68.0 // indirect
+-	go.opentelemetry.io/contrib/propagators/aws v1.43.0 // indirect
+-	go.opentelemetry.io/contrib/propagators/b3 v1.43.0 // indirect
+-	go.opentelemetry.io/contrib/propagators/jaeger v1.43.0 // indirect
+-	go.opentelemetry.io/contrib/propagators/ot v1.43.0 // indirect
+-	go.opentelemetry.io/otel v1.43.0 // indirect
+-	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.19.0 // indirect
+-	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.19.0 // indirect
+-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.43.0 // indirect
+-	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0 // indirect
+-	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0 // indirect
+-	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.43.0 // indirect
+-	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.43.0 // indirect
+-	go.opentelemetry.io/otel/exporters/stdout/stdoutlog v0.19.0 // indirect
+-	go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.43.0 // indirect
+-	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.43.0 // indirect
+-	go.opentelemetry.io/otel/log v0.19.0 // indirect
+-	go.opentelemetry.io/otel/metric v1.43.0 // indirect
+-	go.opentelemetry.io/otel/sdk v1.43.0 // indirect
+-	go.opentelemetry.io/otel/sdk/log v0.19.0 // indirect
+-	go.opentelemetry.io/otel/sdk/metric v1.43.0 // indirect
+-	go.opentelemetry.io/otel/trace v1.43.0 // indirect
+-	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
++	go.opentelemetry.io/contrib/otelconf v0.25.0 // indirect
++	go.opentelemetry.io/contrib/propagators/autoprop v0.70.0 // indirect
++	go.opentelemetry.io/contrib/propagators/aws v1.45.0 // indirect
++	go.opentelemetry.io/contrib/propagators/b3 v1.45.0 // indirect
++	go.opentelemetry.io/contrib/propagators/jaeger v1.45.0 // indirect
++	go.opentelemetry.io/contrib/propagators/ot v1.45.0 // indirect
++	go.opentelemetry.io/otel v1.45.0 // indirect
++	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.21.0 // indirect
++	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.21.0 // indirect
++	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.45.0 // indirect
++	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.45.0 // indirect
++	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.45.0 // indirect
++	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0 // indirect
++	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0 // indirect
++	go.opentelemetry.io/otel/exporters/stdout/stdoutlog v0.21.0 // indirect
++	go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.45.0 // indirect
++	go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.45.0 // indirect
++	go.opentelemetry.io/otel/log v0.21.0 // indirect
++	go.opentelemetry.io/otel/metric v1.45.0 // indirect
++	go.opentelemetry.io/otel/sdk v1.45.0 // indirect
++	go.opentelemetry.io/otel/sdk/log v0.21.0 // indirect
++	go.opentelemetry.io/otel/sdk/metric v1.45.0 // indirect
++	go.opentelemetry.io/otel/trace v1.45.0 // indirect
++	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
+ 	go.uber.org/automaxprocs v1.6.0 // indirect
+ 	go.uber.org/dig v1.19.0 // indirect
+ 	go.uber.org/fx v1.24.0 // indirect
+@@ -340,24 +353,23 @@ require (
+ 	go.uber.org/multierr v1.11.0 // indirect
+ 	go.uber.org/zap v1.27.1 // indirect
  	go.yaml.in/yaml/v2 v2.4.4 // indirect
- 	go.yaml.in/yaml/v3 v3.0.4 // indirect
+-	go.yaml.in/yaml/v3 v3.0.4 // indirect
++	go.yaml.in/yaml/v3 v3.0.5 // indirect
  	golang.org/x/arch v0.26.0 // indirect
 -	golang.org/x/crypto v0.50.0 // indirect
-+	golang.org/x/crypto v0.54.0 // indirect
- 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
+-	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
 -	golang.org/x/mod v0.34.0 // indirect
 -	golang.org/x/net v0.53.0 // indirect
-+	golang.org/x/mod v0.37.0 // indirect
-+	golang.org/x/net v0.57.0 // indirect
++	golang.org/x/crypto v0.57.0 // indirect
++	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
++	golang.org/x/mod v0.41.0 // indirect
++	golang.org/x/net v0.60.0 // indirect
  	golang.org/x/oauth2 v0.36.0 // indirect
 -	golang.org/x/sys v0.43.0 // indirect
 -	golang.org/x/telemetry v0.0.0-20260311193753-579e4da9a98c // indirect
 -	golang.org/x/term v0.42.0 // indirect
 -	golang.org/x/text v0.36.0 // indirect
-+	golang.org/x/sys v0.47.0 // indirect
-+	golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57 // indirect
-+	golang.org/x/term v0.45.0 // indirect
-+	golang.org/x/text v0.40.0 // indirect
++	golang.org/x/sys v0.48.0 // indirect
++	golang.org/x/telemetry v0.0.0-20260811182544-a038080d80e5 // indirect
++	golang.org/x/term v0.46.0 // indirect
++	golang.org/x/text v0.42.0 // indirect
  	golang.org/x/time v0.15.0 // indirect
 -	golang.org/x/tools v0.43.0 // indirect
-+	golang.org/x/tools v0.47.0 // indirect
++	golang.org/x/tools v0.49.0 // indirect
  	google.golang.org/api v0.276.0 // indirect
  	google.golang.org/genproto v0.0.0-20260414002931-afd174a4e478 // indirect
- 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
- 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
+-	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
+-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 -	google.golang.org/protobuf v1.36.11 // indirect
++	google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d // indirect
++	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
  	gopkg.in/yaml.v2 v2.4.0 // indirect
  	gopkg.in/yaml.v3 v3.0.1 // indirect
  	gotest.tools/v3 v3.5.2 // indirect
-@@ -372,6 +379,10 @@ replace (
+@@ -372,6 +384,10 @@ replace (
  	// use cosmos fork of keyring
  	github.com/99designs/keyring => github.com/cosmos/keyring v1.2.0
  	github.com/cosmos/evm => ../
@@ -1662,9 +2090,17 @@ index e503386..cbc3a7e 100644
  	// branch: release/1.17
  	github.com/ethereum/go-ethereum => github.com/cosmos/go-ethereum v1.17.2-cosmos-0
 diff --git a/evmd/go.sum b/evmd/go.sum
-index 92d6f82..193e955 100644
+index 92d6f82..16b731a 100644
 --- a/evmd/go.sum
 +++ b/evmd/go.sum
+@@ -1,5 +1,5 @@
+-cel.dev/expr v0.25.1 h1:1KrZg61W6TWSxuNZ37Xy49ps13NUovb66QLprthtwi4=
+-cel.dev/expr v0.25.1/go.mod h1:hrXvqGP6G6gyx8UAHSHJ5RGk//1Oj5nXQ2NI02Nrsg4=
++cel.dev/expr v0.25.2 h1:K6j46C81hXtZQfuX60cVWQFBJahKSE2gfRbNuvr5bFs=
++cel.dev/expr v0.25.2/go.mod h1:hrXvqGP6G6gyx8UAHSHJ5RGk//1Oj5nXQ2NI02Nrsg4=
+ cloud.google.com/go v0.26.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
+ cloud.google.com/go v0.34.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
+ cloud.google.com/go v0.123.0 h1:2NAUJwPR47q+E35uaJeYoNhuNEM9kM8SjgRgdeOJUSE=
 @@ -24,8 +24,8 @@ cloud.google.com/go/trace v1.13.0 h1:RfqsqPOiSCG8ql50UZt5F65KrVa1zbY9mJrO7xvZfbE
  cloud.google.com/go/trace v1.13.0/go.mod h1:r+bdAn16dKLSV1G2D5v3e58IlQlizfxWrUfjx7kM7X0=
  cosmossdk.io/api v1.0.0 h1:qTV8OPVEwcBPwp2b9p4Qy4noZyihJ+sOMaWL/VT+RCc=
@@ -1676,7 +2112,7 @@ index 92d6f82..193e955 100644
  cosmossdk.io/collections v1.4.0 h1:b373bkxCxKiRbapxZ42TRmcKJEnBVBebdQVk9I5IkkE=
  cosmossdk.io/collections v1.4.0/go.mod h1:gxbieVY3tjbvWlkm3yOXf7sGyDrVi12haZH+sek6whw=
  cosmossdk.io/core v1.1.0 h1:iJ7j2DjNsFzg4/z4ImNQYzy2D4LfMCsaQ8Lrz1KCmxk=
-@@ -51,6 +51,10 @@ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEK
+@@ -51,13 +51,17 @@ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEK
  github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
  github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
  github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
@@ -1687,6 +2123,15 @@ index 92d6f82..193e955 100644
  github.com/DataDog/datadog-go v3.2.0+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
  github.com/DataDog/datadog-go v4.8.3+incompatible h1:fNGaYSuObuQb5nzeTQqowRAd9bpDIRRV4/gUtIBjh8Q=
  github.com/DataDog/datadog-go v4.8.3+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
+ github.com/DataDog/zstd v1.5.7 h1:ybO8RBeh29qrxIhCA9E8gKY6xfONU9T6G6aP9DTKfLE=
+ github.com/DataDog/zstd v1.5.7/go.mod h1:g4AWEaM3yOg3HYfnJ3YIawPnVdXJh9QME85blwSAmyw=
+-github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.32.0 h1:rIkQfkCOVKc1OiRCNcSDD8ml5RJlZbH/Xsq7lbpynwc=
+-github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.32.0/go.mod h1:RD2SsorTmYhF6HkTmDw7KmPYQk8OBYwTkuasChwv7R4=
++github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.35.0 h1:bN1gA3of5bXtbnLsRPrwfmbbe7A5UWFlcTHseujLnpc=
++github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.35.0/go.mod h1:Yj5vHEz/aAepZGliRJsA6uvHAVAQyEwajq9ORCHPxzM=
+ github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.56.0 h1:O2sXMyJh8b7devAGdE+163xtRurt0RVpB6DIzX5vGfg=
+ github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.56.0/go.mod h1:hEpiGU18xf70qb3jbTcIggWAiEfX/cOIVc2OTe4OegA=
+ github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/cloudmock v0.56.0 h1:ZIT85vKP7LBS84XJ0WdJ3dPOX3iz4j3c0+lpajGQMyo=
 @@ -220,6 +224,8 @@ github.com/circonus-labs/circonus-gometrics v2.3.1+incompatible/go.mod h1:nmEj6D
  github.com/circonus-labs/circonusllhist v0.1.3/go.mod h1:kMXHVDlOchFAehlya5ePtbp5jckzBHf4XRpQvBOLI+I=
  github.com/clbanning/x2j v0.0.0-20191024224557-825249438eec/go.mod h1:jMjuTZXRI4dUb/I5gc9Hdhagfvm9+RyrPryS/auMzxE=
@@ -1705,14 +2150,36 @@ index 92d6f82..193e955 100644
  github.com/dlclark/regexp2 v1.4.1-0.20201116162257-a2a8dda75c91/go.mod h1:2pZnwuY/m+8K6iRw6wQdMtk+rH5tNGR1i55kozfMjCc=
  github.com/dlclark/regexp2 v1.7.0 h1:7lJfhqlPssTb1WQx4yvTHN0uElPEv52sbaECrAQxjAo=
  github.com/dlclark/regexp2 v1.7.0/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
+@@ -432,8 +440,8 @@ github.com/go-logfmt/logfmt v0.5.0/go.mod h1:wCYkCAKZfumFQihp8CzCvQ3paCTfi41vtzG
+ github.com/go-logfmt/logfmt v0.6.1 h1:4hvbpePJKnIzH1B+8OR/JPbTx37NktoI9LE2QZBBkvE=
+ github.com/go-logfmt/logfmt v0.6.1/go.mod h1:EV2pOAQoZaT1ZXZbqDl5hrymndi4SY9ED9/z6CO0XAk=
+ github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
+-github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
+-github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
++github.com/go-logr/logr v1.4.4 h1:tG4xh9yMsRCAiodLVTxyrkzSZ9+o0L1Kg/+cPVcbP/8=
++github.com/go-logr/logr v1.4.4/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
+ github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
+ github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
+ github.com/go-ole/go-ole v1.2.6/go.mod h1:pprOEPIfldk/42T2oK7lQ4v4JSDwmV0As9GaiUsvbm0=
+@@ -564,8 +572,8 @@ github.com/grpc-ecosystem/go-grpc-prometheus v1.2.0/go.mod h1:8NvIoxWQoOIhqOTXgf
+ github.com/grpc-ecosystem/grpc-gateway v1.9.5/go.mod h1:vNeuVxBJEsws4ogUvrchl83t/GYV9WGTSLVdBhOQFDY=
+ github.com/grpc-ecosystem/grpc-gateway v1.16.0 h1:gmcG1KaJ57LophUzW0Hy8NmPhnMZb4M0+kPpLofRdBo=
+ github.com/grpc-ecosystem/grpc-gateway v1.16.0/go.mod h1:BDjrQk3hbvj6Nolgz8mAMFbcEtjT1g+wF4CSlocrBnw=
+-github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 h1:HWRh5R2+9EifMyIHV7ZV+MIZqgz+PMpZ14Jynv3O2Zs=
+-github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0/go.mod h1:JfhWUomR1baixubs02l85lZYYOm7LV6om4ceouMv45c=
++github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 h1:5VipnvEpbqr2gA2VbM+nYVbkIF28c5ZQfqCBQ5g2xfk=
++github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0/go.mod h1:Hyl3n6Twe1hvtd9XUXDec4pTvgMSEixRuQKPTMH2bNs=
+ github.com/gsterjov/go-libsecret v0.0.0-20161001094733-a6f4afe4910c h1:6rhixN/i8ZofjG1Y75iExal34USq5p+wiN1tpie8IrU=
+ github.com/gsterjov/go-libsecret v0.0.0-20161001094733-a6f4afe4910c/go.mod h1:NMPJylDgVpX0MLRlPy15sqSwOFv/U1GZ2m21JhFfek0=
+ github.com/hashicorp/aws-sdk-go-base/v2 v2.0.0-beta.72 h1:vTCWu1wbdYo7PEZFem/rlr01+Un+wwVmI7wiegFdRLk=
 @@ -682,8 +690,8 @@ github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+o
  github.com/kkdai/bstream v0.0.0-20161212061736-f391b8402d23/go.mod h1:J+Gs4SYgM6CZQHDETBtE9HaSEkGmuNXF86RwHhHUvq4=
  github.com/klauspost/compress v1.10.3/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
  github.com/klauspost/compress v1.11.7/go.mod h1:aoV0uJVorq1K+umq18yTdKaF57EivdYsUV+/s2qKfXs=
 -github.com/klauspost/compress v1.18.5 h1:/h1gH5Ce+VWNLSWqPzOVn6XBO+vJbCNGvjoaGBFW2IE=
 -github.com/klauspost/compress v1.18.5/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
-+github.com/klauspost/compress v1.19.1 h1:VsB4HPswih7mmZ8WleSFQ75c/Ui1M4trX5oAsJnhSlk=
-+github.com/klauspost/compress v1.19.1/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
++github.com/klauspost/compress v1.20.2 h1:v5tiZvm1KGLyg5d5oXdXe3lsSPrbEUiKoXGia//I7Qo=
++github.com/klauspost/compress v1.20.2/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
  github.com/klauspost/cpuid/v2 v2.0.9/go.mod h1:FInQzS24/EEf25PyTYn52gqo7WaD8xa0213Md/qVLRg=
  github.com/klauspost/cpuid/v2 v2.2.4/go.mod h1:RVVoqg1df56z8g3pUjL/3lE5UfnlrJX8tyFgg4nqhuY=
  github.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=
@@ -1727,6 +2194,17 @@ index 92d6f82..193e955 100644
  github.com/pierrec/lz4 v1.0.2-0.20190131084431-473cd7ce01a1/go.mod h1:3/3N9NVKO0jef7pBehbT1qWhCMrIgbYNnFAZCqQ5LRc=
  github.com/pierrec/lz4 v2.0.5+incompatible/go.mod h1:pdkljMzZIN41W+lC3N2tnIh5sFi+IEE17M5jbnwPHcY=
  github.com/pingcap/errors v0.11.4 h1:lFuQV/oaUMGcD2tqt+01ROSmJs75VG1ToEOkZIZ4nE4=
+@@ -906,8 +914,8 @@ github.com/pion/datachannel v1.5.10/go.mod h1:p/jJfC9arb29W7WrxyKbepTU20CFgyx5oL
+ github.com/pion/dtls/v2 v2.2.7/go.mod h1:8WiMkebSHFD0T+dIU+UeBaoV7kDhOW5oDCzZ7WZ/F9s=
+ github.com/pion/dtls/v2 v2.2.12 h1:KP7H5/c1EiVAAKUmXyCzPiQe5+bCJrpOeKg/L05dunk=
+ github.com/pion/dtls/v2 v2.2.12/go.mod h1:d9SYc9fch0CqK90mRk1dC7AkzzpwJj6u2GU3u+9pqFE=
+-github.com/pion/dtls/v3 v3.1.2 h1:gqEdOUXLtCGW+afsBLO0LtDD8GnuBBjEy6HRtyofZTc=
+-github.com/pion/dtls/v3 v3.1.2/go.mod h1:Hw/igcX4pdY69z1Hgv5x7wJFrUkdgHwAn/Q/uo7YHRo=
++github.com/pion/dtls/v3 v3.1.4 h1:QhvtMflMfu9Kf0RcDC5BJBle4caPskByrKQR6uuYqpY=
++github.com/pion/dtls/v3 v3.1.4/go.mod h1:cr/qotLISUw/9C1m83ZPNZtj9WnXkYLpfCptPqbkInc=
+ github.com/pion/ice/v4 v4.0.10 h1:P59w1iauC/wPk9PdY8Vjl4fOFL5B+USq1+xbDcN6gT4=
+ github.com/pion/ice/v4 v4.0.10/go.mod h1:y3M18aPhIxLlcO/4dn9X8LzLLSma84cx6emMSu14FGw=
+ github.com/pion/interceptor v0.1.40 h1:e0BjnPcGpr2CFQgKhrQisBU7V3GXK6wrfYrGYaU6Jq4=
 @@ -971,8 +979,8 @@ github.com/prometheus/client_golang v1.3.0/go.mod h1:hJaj2vgQTGQmVCsAACORcieXFeD
  github.com/prometheus/client_golang v1.4.0/go.mod h1:e9GMxYsXl05ICDXkRhurwBS4Q3OK1iX/F2sw+iXX5zU=
  github.com/prometheus/client_golang v1.7.1/go.mod h1:PY5Wy2awLA44sXw4AOSfFBetzPP4j5+D6mVACh+pe2M=
@@ -1794,51 +2272,205 @@ index 92d6f82..193e955 100644
  github.com/shirou/gopsutil v3.21.11+incompatible h1:+1+c1VGhc88SSonWP6foOcLhvnKlUeu/erjjvaPEYiI=
  github.com/shirou/gopsutil v3.21.11+incompatible/go.mod h1:5b4v6he4MtMOwMlS0TUMTu2PcXUg8+E1lC7eC3UO/RA=
  github.com/shirou/gopsutil/v4 v4.26.4 h1:B4SXVbcwTyrocPHEmWBC4uCYr4Xcu3MK1TXqbprAOWY=
-@@ -1273,8 +1285,8 @@ golang.org/x/crypto v0.8.0/go.mod h1:mRqEX+O9/h5TFCrQhkgjo2yKi0yYA+9ecGkdQoHrywE
+@@ -1065,8 +1077,8 @@ github.com/spf13/pflag v1.0.10 h1:4EBh2KAYBwaONj6b2Ye1GiHfwjqyROoF4RwYO+vPwFk=
+ github.com/spf13/pflag v1.0.10/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=
+ github.com/spf13/viper v1.21.0 h1:x5S+0EU27Lbphp4UKm1C+1oQO+rKx36vfCoaVebLFSU=
+ github.com/spf13/viper v1.21.0/go.mod h1:P0lhsswPGWD/1lZJ9ny3fYnVqxiegrlNrEmgLjbTCAY=
+-github.com/spiffe/go-spiffe/v2 v2.6.0 h1:l+DolpxNWYgruGQVV0xsfeya3CsC7m8iBzDnMpsbLuo=
+-github.com/spiffe/go-spiffe/v2 v2.6.0/go.mod h1:gm2SeUoMZEtpnzPNs2Csc0D/gX33k1xIx7lEzqblHEs=
++github.com/spiffe/go-spiffe/v2 v2.7.0 h1:uXe1MflJoHw58wAUvxVlcM7WpKtijWG7I1UidcGh6g4=
++github.com/spiffe/go-spiffe/v2 v2.7.0/go.mod h1:47Q0Q9/AqGha8QLHp+kxpH4Wca7X7EnOtlIJy3mxZ3U=
+ github.com/streadway/amqp v0.0.0-20190404075320-75d898a42a94/go.mod h1:AZpEONHx3DKn8O/DFsRAY58/XVQiIPMTMB1SddzLXVw=
+ github.com/streadway/amqp v0.0.0-20190827072141-edfb9018d271/go.mod h1:AZpEONHx3DKn8O/DFsRAY58/XVQiIPMTMB1SddzLXVw=
+ github.com/streadway/handy v0.0.0-20190108123426-d5acb3125c2a/go.mod h1:qNTQ5P5JnDBl6z3cMAg/SywNDC5ABu5ApDIw6lUbRmI=
+@@ -1158,10 +1170,10 @@ go.opencensus.io v0.20.2/go.mod h1:6WKK9ahsWS3RSO+PY9ZHZUfv2irvY6gN279GOPZjmmk=
+ go.opencensus.io v0.22.2/go.mod h1:yxeiOL68Rb0Xd1ddK5vPZ/oVn4vY4Ynel7k9FzqtOIw=
+ go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
+ go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
+-go.opentelemetry.io/contrib/bridges/otelslog v0.18.0 h1:hhPGP3zvvy1xWT9RTy970wlniSxFttBIsAK1gvMguJM=
+-go.opentelemetry.io/contrib/bridges/otelslog v0.18.0/go.mod h1:twJF7inoMza6kxMcF8JOdL3mPmtOZu7GEr34CUNE6Dg=
+-go.opentelemetry.io/contrib/detectors/gcp v1.43.0 h1:62yY3dT7/ShwOxzA0RsKRgshBmfElKI4d/Myu2OxDFU=
+-go.opentelemetry.io/contrib/detectors/gcp v1.43.0/go.mod h1:RyaZMFY7yi1kAs45S6mbFGz8O8rqB0dTY14uzvG4LCs=
++go.opentelemetry.io/contrib/bridges/otelslog v0.20.0 h1:oEl2Pw/i4OQwhAuda2pAHFAcOMivA+Xa+iTccBfab/g=
++go.opentelemetry.io/contrib/bridges/otelslog v0.20.0/go.mod h1:yMSQaiiq5dpfrSJCYLBcqFeJkFFI67seT4ngvx6jfVo=
++go.opentelemetry.io/contrib/detectors/gcp v1.45.0 h1:9jR0ZPRok9ryaOQ2Wx8rg5F7Aon59mxrqbVI60/vlBk=
++go.opentelemetry.io/contrib/detectors/gcp v1.45.0/go.mod h1:VSme3o2fvSg5bVg0dRzyHaj4Z5EVhG+g2Fde6LKzmQA=
+ go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.68.0 h1:0Qx7VGBacMm9ZENQ7TnNObTYI4ShC+lHI16seduaxZo=
+ go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.68.0/go.mod h1:Sje3i3MjSPKTSPvVWCaL8ugBzJwik3u4smCjUeuupqg=
+ go.opentelemetry.io/contrib/instrumentation/host v0.68.0 h1:0BfTRAHtFpIlIY7cw1qg9nODUwblutIqx7Cn6NPD+2s=
+@@ -1170,57 +1182,59 @@ go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0 h1:CqXxU8V
+ go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0/go.mod h1:BuhAPThV8PBHBvg8ZzZ/Ok3idOdhWIodywz2xEcRbJo=
+ go.opentelemetry.io/contrib/instrumentation/runtime v0.68.0 h1:jhVIQEprwUTV+KfzzliLidclhoTOoHTgdz96kAyR8mU=
+ go.opentelemetry.io/contrib/instrumentation/runtime v0.68.0/go.mod h1:4HsdbLUbernaTnA8CNaNE+1g026SciXb3juRYe3l8EY=
+-go.opentelemetry.io/contrib/otelconf v0.23.0 h1:s3C7KdMYiutf4rC8hKFA0WOIDG+gIru8ajjQKS59ir8=
+-go.opentelemetry.io/contrib/otelconf v0.23.0/go.mod h1:0kN2tcccZS82e7IZlo045gkcL8/8dup1k25sf9ypGxM=
+-go.opentelemetry.io/contrib/propagators/autoprop v0.68.0 h1:wLGFvNBPqQhzBn0QRBZjrriH8lZ9gqtTz8ufHEjLg7k=
+-go.opentelemetry.io/contrib/propagators/autoprop v0.68.0/go.mod h1:evWK9nCqCzH8nhclTlpkdUzmxrmJQ2mrWCdKIvyOYec=
+-go.opentelemetry.io/contrib/propagators/aws v1.43.0 h1:EwnsB3cXRLAh7/Nr/9rMuGw73nfb3z6uAvVDjRrbeUg=
+-go.opentelemetry.io/contrib/propagators/aws v1.43.0/go.mod h1:CJjTym6F87tEdm61Qvnz5xrV8vKlH4C92djiqcn62k8=
+-go.opentelemetry.io/contrib/propagators/b3 v1.43.0 h1:CETqV3QLLPTy5yNrqyMr41VnAOOD4lsRved7n4QG00A=
+-go.opentelemetry.io/contrib/propagators/b3 v1.43.0/go.mod h1:Q4mCiCdziYzpNR0g+6UqVotAlCDZdzz6L8jwY4knOrw=
+-go.opentelemetry.io/contrib/propagators/jaeger v1.43.0 h1:peiLMz1+aqJE+3L4mOVtR9wlmv+yh/JVYXCBjqmzJJE=
+-go.opentelemetry.io/contrib/propagators/jaeger v1.43.0/go.mod h1:Agvif+4A8p/3UtZzJ0MCcDEuQwgtrzM71DueU41DCs8=
+-go.opentelemetry.io/contrib/propagators/ot v1.43.0 h1:Hh1HahlGc81AOE7siqi1tVOlbanY/UxMMWedpb0d5oQ=
+-go.opentelemetry.io/contrib/propagators/ot v1.43.0/go.mod h1:58MlyS7lghzYvAm5LN9gGmZpCMQEMB5vpZp9SRgOyE4=
+-go.opentelemetry.io/otel v1.43.0 h1:mYIM03dnh5zfN7HautFE4ieIig9amkNANT+xcVxAj9I=
+-go.opentelemetry.io/otel v1.43.0/go.mod h1:JuG+u74mvjvcm8vj8pI5XiHy1zDeoCS2LB1spIq7Ay0=
+-go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.19.0 h1:Dn8rkudDzY6KV9dr/D/bTUuWgqDf9xe0rr4G2elrn0Y=
+-go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.19.0/go.mod h1:gMk9F0xDgyN9M/3Ed5Y1wKcx/9mlU91NXY2SNq7RQuU=
+-go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.19.0 h1:HIBTQ3VO5aupLKjC90JgMqpezVXwFuq6Ryjn0/izoag=
+-go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.19.0/go.mod h1:ji9vId85hMxqfvICA0Jt8JqEdrXaAkcpkI9HPXya0ro=
+-go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.43.0 h1:8UQVDcZxOJLtX6gxtDt3vY2WTgvZqMQRzjsqiIHQdkc=
+-go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.43.0/go.mod h1:2lmweYCiHYpEjQ/lSJBYhj9jP1zvCvQW4BqL9dnT7FQ=
+-go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0 h1:w1K+pCJoPpQifuVpsKamUdn9U0zM3xUziVOqsGksUrY=
+-go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.43.0/go.mod h1:HBy4BjzgVE8139ieRI75oXm3EcDN+6GhD88JT1Kjvxg=
+-go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0 h1:88Y4s2C8oTui1LGM6bTWkw0ICGcOLCAI5l6zsD1j20k=
+-go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0/go.mod h1:Vl1/iaggsuRlrHf/hfPJPvVag77kKyvrLeD10kpMl+A=
+-go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.43.0 h1:RAE+JPfvEmvy+0LzyUA25/SGawPwIUbZ6u0Wug54sLc=
+-go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.43.0/go.mod h1:AGmbycVGEsRx9mXMZ75CsOyhSP6MFIcj/6dnG+vhVjk=
+-go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.43.0 h1:3iZJKlCZufyRzPzlQhUIWVmfltrXuGyfjREgGP3UUjc=
+-go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.43.0/go.mod h1:/G+nUPfhq2e+qiXMGxMwumDrP5jtzU+mWN7/sjT2rak=
+-go.opentelemetry.io/otel/exporters/stdout/stdoutlog v0.19.0 h1:GJkybS+crDMdExT/BUNCEgfrmfboztcS6PhvSo88HKM=
+-go.opentelemetry.io/otel/exporters/stdout/stdoutlog v0.19.0/go.mod h1:NuAyxRYIG2lKX3YQkB+83StTxM7s52PUUkRRiC0wnYI=
+-go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.43.0 h1:TC+BewnDpeiAmcscXbGMfxkO+mwYUwE/VySwvw88PfA=
+-go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.43.0/go.mod h1:J/ZyF4vfPwsSr9xJSPyQ4LqtcTPULFR64KwTikGLe+A=
+-go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.43.0 h1:mS47AX77OtFfKG4vtp+84kuGSFZHTyxtXIN269vChY0=
+-go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.43.0/go.mod h1:PJnsC41lAGncJlPUniSwM81gc80GkgWJWr3cu2nKEtU=
+-go.opentelemetry.io/otel/log v0.19.0 h1:KUZs/GOsw79TBBMfDWsXS+KZ4g2Ckzksd1ymzsIEbo4=
+-go.opentelemetry.io/otel/log v0.19.0/go.mod h1:5DQYeGmxVIr4n0/BcJvF4upsraHjg6vudJJpnkL6Ipk=
+-go.opentelemetry.io/otel/metric v1.43.0 h1:d7638QeInOnuwOONPp4JAOGfbCEpYb+K6DVWvdxGzgM=
+-go.opentelemetry.io/otel/metric v1.43.0/go.mod h1:RDnPtIxvqlgO8GRW18W6Z/4P462ldprJtfxHxyKd2PY=
+-go.opentelemetry.io/otel/sdk v1.43.0 h1:pi5mE86i5rTeLXqoF/hhiBtUNcrAGHLKQdhg4h4V9Dg=
+-go.opentelemetry.io/otel/sdk v1.43.0/go.mod h1:P+IkVU3iWukmiit/Yf9AWvpyRDlUeBaRg6Y+C58QHzg=
+-go.opentelemetry.io/otel/sdk/log v0.19.0 h1:scYVLqT22D2gqXItnWiocLUKGH9yvkkeql5dBDiXyko=
+-go.opentelemetry.io/otel/sdk/log v0.19.0/go.mod h1:vFBowwXGLlW9AvpuF7bMgnNI95LiW10szrOdvzBHlAg=
+-go.opentelemetry.io/otel/sdk/log/logtest v0.19.0 h1:BEbF7ZBB6qQloV/Ub1+3NQoOUnVtcGkU3XX4Ws3GQfk=
+-go.opentelemetry.io/otel/sdk/log/logtest v0.19.0/go.mod h1:Lua81/3yM0wOmoHTokLj9y9ADeA02v1naRrVrkAZuKk=
+-go.opentelemetry.io/otel/sdk/metric v1.43.0 h1:S88dyqXjJkuBNLeMcVPRFXpRw2fuwdvfCGLEo89fDkw=
+-go.opentelemetry.io/otel/sdk/metric v1.43.0/go.mod h1:C/RJtwSEJ5hzTiUz5pXF1kILHStzb9zFlIEe85bhj6A=
+-go.opentelemetry.io/otel/trace v1.43.0 h1:BkNrHpup+4k4w+ZZ86CZoHHEkohws8AY+WTX09nk+3A=
+-go.opentelemetry.io/otel/trace v1.43.0/go.mod h1:/QJhyVBUUswCphDVxq+8mld+AvhXZLhe+8WVFxiFff0=
++go.opentelemetry.io/contrib/otelconf v0.25.0 h1:rbVGzm5OsVQhdnjqv2hvKuJhVTVHux9Ltra+N4FKy7M=
++go.opentelemetry.io/contrib/otelconf v0.25.0/go.mod h1:2Pf2b8pJDpLtymJ9Sv0z0ANPAxDpZ7QLezLdIKNusww=
++go.opentelemetry.io/contrib/propagators/autoprop v0.70.0 h1:yNNN177cOlxAJ5F8l1YKiD6rJk9GOUi/HnRQbI83DeQ=
++go.opentelemetry.io/contrib/propagators/autoprop v0.70.0/go.mod h1:6dIm7zAgfmLdrSmO7TWOnZ/l2naqO5qTkD5PuIa0FLY=
++go.opentelemetry.io/contrib/propagators/aws v1.45.0 h1:XIsTznOtglVtajrcqKOfKJzMJtC6GsNYw7kWsnPPB8g=
++go.opentelemetry.io/contrib/propagators/aws v1.45.0/go.mod h1:VL8mj7NKnMqLp0jn45wtWgKkcTacucgvBIJoOg2rZHw=
++go.opentelemetry.io/contrib/propagators/b3 v1.45.0 h1:audI5r8RmWVSORhzA5Y57yGvEA1358PvGk0u0sMOTDA=
++go.opentelemetry.io/contrib/propagators/b3 v1.45.0/go.mod h1:SiENIek0FnzLni3/jSCiumyCA2mwP8uGaE1686SOJug=
++go.opentelemetry.io/contrib/propagators/jaeger v1.45.0 h1:e8U4utKt9oV2TfLKZFqUzz5shYKnUf3DISalTpLs4lA=
++go.opentelemetry.io/contrib/propagators/jaeger v1.45.0/go.mod h1:lx91c/ZlmgS2rjGOuXB+Mmq+f0QxzC9UjYUuJwR4tvQ=
++go.opentelemetry.io/contrib/propagators/ot v1.45.0 h1:BLFjHG1OjCEDaBk4os2+X1D6/uEhZxSY9jVUxmG7S+U=
++go.opentelemetry.io/contrib/propagators/ot v1.45.0/go.mod h1:mGksO7kOmOSsRGbVA28x7kHNL4YrH5uJoTNuws70NDU=
++go.opentelemetry.io/otel v1.45.0 h1:pdrWmLHofpubmArBv1LgFSv1Z0Ie/ppdZzu+kUN5EeU=
++go.opentelemetry.io/otel v1.45.0/go.mod h1:XZxIqPapzEYnhNSScF5DIqXhm/rYi0FzCe2XddAwZfQ=
++go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.21.0 h1:WseeVYf5dJZTsyPiyW5L14k5qsSibqXAMTSiFEDiWr0=
++go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.21.0/go.mod h1:SiLZnQS6Qk2eCpvr2CH/XMAOa64TWGXxEZJZCpD2Lmc=
++go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.21.0 h1:fvNHGyo3CdRv/DQveXqhqBxnKTDyRaC5sMSQxilX/A0=
++go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.21.0/go.mod h1:zyGrjRKL2B/6+Jc/m4/otPoZqV2MY9ZjC/aBraRO7zc=
++go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.45.0 h1:klTViGcsvLCd1xN3rZzfZ12NslC/OimbmR+k+A006RI=
++go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.45.0/go.mod h1:jRsK04CWmXuY8A0O+wMpSf+t90RHZ53o5Qmxn2PQPfk=
++go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.45.0 h1:pnxy6c/kvNBWdNNFzqpjuJLm9Hjhgk/Q0nY221rwuk0=
++go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.45.0/go.mod h1:qw6YsFapotRwoDhXRZvljzaOvCQB7UfnafEJagpN2TA=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.45.0 h1:QRefszxJmfPdjXUUm3j6iDzY03mTPXMjqErFqQ67vUg=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.45.0/go.mod h1:Tiz03lTBVBrm7eWZBOidzEaYaJa8tjwGUGv6d8mlTyk=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0 h1:fG5MCxGz8+2VtrN/WgqSpJFctVz24gpxj8CxkKmc8Ww=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0/go.mod h1:BmAYTn+3ysbRe+IU2msxmf5Rx3g6DHvex+tWI3LdhYI=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0 h1:QBajQ2SrwQijzHyZbQlPsuIzpl/ll8DY6wPWsajeGcI=
++go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0/go.mod h1:08ZQLjrPLQ6R4kAXvuOvODEer5Yh4CoFvll5qB2BCI8=
++go.opentelemetry.io/otel/exporters/stdout/stdoutlog v0.21.0 h1:2lpf4hnrasYIsUyEXwnTZq5lsxrMm4T2Bwb06IctAZQ=
++go.opentelemetry.io/otel/exporters/stdout/stdoutlog v0.21.0/go.mod h1:YWOW6h7jwApz9Pl76ie/izUsSPj0s2MdIlpqbPqaf3U=
++go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.45.0 h1:dm9iyzn6tioYZtwqaiBSU0TSI8Yu/8dTIbfG0+B49DY=
++go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.45.0/go.mod h1:xAvxYjYK28qvt+yu4BYZ/zMmAjwMXINXD6JiMyeB8iI=
++go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.45.0 h1:lsA/S1bxgdbyFGkTj+3meEdJ6ADVU7QoFstV6MXgE68=
++go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.45.0/go.mod h1:L7u+MirGoB1bjeLH66+xDykF4RC8C3RN7lIFpBiewUo=
++go.opentelemetry.io/otel/log v0.21.0 h1:SLsVDGmtyBrdw8/a2Z0bOIxou/+bN4z56GebH7T0LvA=
++go.opentelemetry.io/otel/log v0.21.0/go.mod h1:iReetQrZL9Wyg84cCkOoCmqDHS5RCFfyxC7J+r8fn8g=
++go.opentelemetry.io/otel/metric v1.45.0 h1:7Eg1uH7CJ5cXv9is6tnBe1FI6rj1nwUdbFypRm3br/M=
++go.opentelemetry.io/otel/metric v1.45.0/go.mod h1:HAPbm1nd3p1PmFH7v2dR+6BjXxw+Lq4a2+pndMAm08s=
++go.opentelemetry.io/otel/metric/x v0.67.0 h1:PcicCNZFkZ4bXfSooXdo3WN7RBOVOtjVdo1wD358Uns=
++go.opentelemetry.io/otel/metric/x v0.67.0/go.mod h1:FBjCWZe6wgcqxcMtjdGiClDKXb2YxxXii0CXftE4QtI=
++go.opentelemetry.io/otel/sdk v1.45.0 h1:4VVSMgQ83dUgW2aoX5f6JgLvHwIvzcuLnF9lUdCSpCw=
++go.opentelemetry.io/otel/sdk v1.45.0/go.mod h1:Sr40LgXV7DsKMMJMKOhUWOgMWTfAaqvm2kF0g7ilwuA=
++go.opentelemetry.io/otel/sdk/log v0.21.0 h1:QsE7XSR0ktQdKmRKGnR+f1ObGF32WG+7MER/P9KgmYc=
++go.opentelemetry.io/otel/sdk/log v0.21.0/go.mod h1:m9mApjCoD2/1QuKCAptjv+BrG9WKOvQLVdNx+iBldTo=
++go.opentelemetry.io/otel/sdk/log/logtest v0.21.0 h1:X+JBBgKlswCGYsmgL0CnoUUtlE//VB345c84jYAYkdQ=
++go.opentelemetry.io/otel/sdk/log/logtest v0.21.0/go.mod h1:HD1575K8e6sIFBBDd5tZB3t9DlMytWXq9FuR+Y4rfjE=
++go.opentelemetry.io/otel/sdk/metric v1.45.0 h1:oVFszMfyj1Am6s24Vtc7wBb8BKLcwepJjNEYILuiE3o=
++go.opentelemetry.io/otel/sdk/metric v1.45.0/go.mod h1:vUWUxDZvu1WVRj8JA8S0AdhsPrZoDpA2DdZauIh4mDA=
++go.opentelemetry.io/otel/trace v1.45.0 h1:l/mP6Uv7oNO7/TblbhpbgMidxhq1uO/rPsikOyVhxag=
++go.opentelemetry.io/otel/trace v1.45.0/go.mod h1:qoJJA2xNMnxRrdISU/kLtfUH2wNeQbiv+jhs/CxI8bc=
+ go.opentelemetry.io/proto/otlp v0.7.0/go.mod h1:PqfVotwruBrMGOCsRd/89rSnXhoiJIqeYNgFYFoEGnI=
+-go.opentelemetry.io/proto/otlp v1.10.0 h1:IQRWgT5srOCYfiWnpqUYz9CVmbO8bFmKcwYxpuCSL2g=
+-go.opentelemetry.io/proto/otlp v1.10.0/go.mod h1:/CV4QoCR/S9yaPj8utp3lvQPoqMtxXdzn7ozvvozVqk=
++go.opentelemetry.io/proto/otlp v1.11.0 h1:5rrYs0Ykyj50sdU/JU0x8etU+LubXWb+gED6TbEdMIk=
++go.opentelemetry.io/proto/otlp v1.11.0/go.mod h1:SmVizdCOAm3XBtG1g1NnOdhW6jtddT72hLMhv8VwA8E=
+ go.uber.org/atomic v1.3.2/go.mod h1:gD2HeocX3+yG+ygLZcrzQJaqmWj9AIm7n08wl/qW/PE=
+ go.uber.org/atomic v1.4.0/go.mod h1:gD2HeocX3+yG+ygLZcrzQJaqmWj9AIm7n08wl/qW/PE=
+ go.uber.org/atomic v1.5.0/go.mod h1:sABNBOSYdrvTF6hTgEIbc7YasKWGhgEQZyfxyTvoXHQ=
+@@ -1249,8 +1263,9 @@ go.uber.org/zap v1.27.1 h1:08RqriUEv8+ArZRYSTXy1LeBScaMpVSTBhCeaZYfMYc=
+ go.uber.org/zap v1.27.1/go.mod h1:GB2qFLM7cTU87MWRP2mPIjqfIDnGu+VIO4V/SdhGo2E=
+ go.yaml.in/yaml/v2 v2.4.4 h1:tuyd0P+2Ont/d6e2rl3be67goVK4R6deVxCUX5vyPaQ=
+ go.yaml.in/yaml/v2 v2.4.4/go.mod h1:gMZqIpDtDqOfM0uNfy0SkpRhvUryYH0Z6wdMYcacYXQ=
+-go.yaml.in/yaml/v3 v3.0.4 h1:tfq32ie2Jv2UxXFdLJdh3jXuOzWiL1fo0bu/FbuKpbc=
+ go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
++go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
++go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
+ golang.org/x/arch v0.0.0-20210923205945-b76863e36670/go.mod h1:5om86z9Hs0C8fWVUuoMHwpExlXzs5Tkyp9hOrfG7pp8=
+ golang.org/x/arch v0.3.0/go.mod h1:5om86z9Hs0C8fWVUuoMHwpExlXzs5Tkyp9hOrfG7pp8=
+ golang.org/x/arch v0.26.0 h1:jZ6dpec5haP/fUv1kLCbuJy6dnRrfX6iVK08lZBFpk4=
+@@ -1273,13 +1288,13 @@ golang.org/x/crypto v0.8.0/go.mod h1:mRqEX+O9/h5TFCrQhkgjo2yKi0yYA+9ecGkdQoHrywE
  golang.org/x/crypto v0.9.0/go.mod h1:yrmDGqONDYtNj3tH8X9dzUun2m2lzPa9ngI6/RUPGR0=
  golang.org/x/crypto v0.12.0/go.mod h1:NF0Gs7EO5K4qLn+Ylc+fih8BSTeIjAP05siRnAh98yw=
  golang.org/x/crypto v0.18.0/go.mod h1:R0j02AL6hcrfOiy9T4ZYp/rcWeMxM3L6QYxlOuEG1mg=
 -golang.org/x/crypto v0.50.0 h1:zO47/JPrL6vsNkINmLoo/PH1gcxpls50DNogFvB5ZGI=
 -golang.org/x/crypto v0.50.0/go.mod h1:3muZ7vA7PBCE6xgPX7nkzzjiUq87kRItoJQM1Yo8S+Q=
-+golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=
-+golang.org/x/crypto v0.54.0/go.mod h1:KWL8ny2AZdGR2cWmzeHrp2azQPGogOv+HeQaVEXC2dk=
++golang.org/x/crypto v0.57.0 h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=
++golang.org/x/crypto v0.57.0/go.mod h1:Fdz0i5U6CoizGwLda9DttjSk6qlZo25zYNtR+ycvuZA=
  golang.org/x/exp v0.0.0-20190121172915-509febef88a4/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
  golang.org/x/exp v0.0.0-20190306152737-a1d7652674e8/go.mod h1:CJ0aWSM057203Lf6IL+f9T1iT9GByDxfZKAQTCR3kQA=
  golang.org/x/exp v0.0.0-20200331195152-e8c3332aa8e5/go.mod h1:4M0jN8W1tt0AVLNr8HDosyJCDCDuyL9N9+3m7wDWgKw=
-@@ -1295,8 +1307,8 @@ golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+-golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 h1:jiDhWWeC7jfWqR9c/uplMOqJ0sbNlNWv0UkzE0vX1MA=
+-golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90/go.mod h1:xE1HEv6b+1SCZ5/uscMRjUBKtIxworgEcEi+/n9NQDQ=
++golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 h1:ex206bKw+v3K0dm3andkrIF+ijyQKJG1pLgwQ2PYdQM=
++golang.org/x/exp v0.0.0-20260727155853-b88d891fe743/go.mod h1:EdfpwwqSu+0Li0mzskwHU6FWDV3t9Q+RZDo3QMUtL3Q=
+ golang.org/x/image v0.0.0-20190227222117-0694c2d4d067/go.mod h1:kZ7UVZpmo3dzQBMxlp+ypCbDeSB+sBbTgSJuh5dn5js=
+ golang.org/x/image v0.0.0-20190802002840-cff245a6509b/go.mod h1:FeLwcggjj3mMvU+oOTbSwawSJRM1uh48EjtB4UJZlP0=
+ golang.org/x/lint v0.0.0-20181026193005-c67002cb31c3/go.mod h1:UVdnD1Gm6xHRNCYTkRU2/jEulfH38KcIWyp/GAMgvoE=
+@@ -1295,8 +1310,8 @@ golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
  golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
  golang.org/x/mod v0.6.0-dev.0.20220419223038-86c51ed26bb4/go.mod h1:jJ57K6gSWd91VN4djpZkiMVwK6gcyfeH4XE8wZrZaV4=
  golang.org/x/mod v0.8.0/go.mod h1:iBbtSCu2XBx23ZKBPSOrRkjjQPZFPuis4dIYUhu/chs=
 -golang.org/x/mod v0.34.0 h1:xIHgNUUnW6sYkcM5Jleh05DvLOtwc6RitGHbDk4akRI=
 -golang.org/x/mod v0.34.0/go.mod h1:ykgH52iCZe79kzLLMhyCUzhMci+nQj+0XkbXpNYtVjY=
-+golang.org/x/mod v0.37.0 h1:vF1DjpVEshcIqoEaauuHebaLk1O1forxjxBaVn884JQ=
-+golang.org/x/mod v0.37.0/go.mod h1:m8S8VeM9r4dzDwjrKO0a1sZP3YjeMamRRlD+fmR2Q/0=
++golang.org/x/mod v0.41.0 h1:qJmnOUb4YB+FsEuM3HcWucdZASCPGhsX6uljO6pog0c=
++golang.org/x/mod v0.41.0/go.mod h1:Ek9pY8RKWXwsWvd3rQiHYtMqkjSUV+s1Rj7j4H5Ur6o=
  golang.org/x/net v0.0.0-20180719180050-a680a1efc54d/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
  golang.org/x/net v0.0.0-20180724234803-3673e40ba225/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
  golang.org/x/net v0.0.0-20180826012351-8a410e7b638d/go.mod h1:mL1N/T3taQHkDXs73rZJwtUhF3w3ftmwwsq0BUmARs4=
-@@ -1333,8 +1345,8 @@ golang.org/x/net v0.9.0/go.mod h1:d48xBJpPfHeWQsugry2m+kC02ZBRGRgulfHnEXEuWns=
+@@ -1333,8 +1348,8 @@ golang.org/x/net v0.9.0/go.mod h1:d48xBJpPfHeWQsugry2m+kC02ZBRGRgulfHnEXEuWns=
  golang.org/x/net v0.10.0/go.mod h1:0qNGK6F8kojg2nk9dLZ2mShWaEBan6FAoqfSigmmuDg=
  golang.org/x/net v0.14.0/go.mod h1:PpSgVXXLK0OxS0F31C1/tv6XNguvCrnXIDrFMspZIUI=
  golang.org/x/net v0.20.0/go.mod h1:z8BVo6PvndSri0LbOE3hAn0apkU+1YvI6E70E9jsnvY=
 -golang.org/x/net v0.53.0 h1:d+qAbo5L0orcWAr0a9JweQpjXF19LMXJE8Ey7hwOdUA=
 -golang.org/x/net v0.53.0/go.mod h1:JvMuJH7rrdiCfbeHoo3fCQU24Lf5JJwT9W3sJFulfgs=
-+golang.org/x/net v0.57.0 h1:K5+3DljvIuDG9/Jv9rvyMywYNFCQ9RSUY6OOTTkT+tE=
-+golang.org/x/net v0.57.0/go.mod h1:KpXc8iv+r3XplLAG/f7Jsf9RPszJzdR0f58q9vGOuEU=
++golang.org/x/net v0.60.0 h1:79p50tfZlm0J9YfoDsSi639qSXNGVwEzOPLCxM2FsYU=
++golang.org/x/net v0.60.0/go.mod h1:2DA/G1UfVbCpQPeWTmMPGY7Cs2PkBkwu743bVX5PIVg=
  golang.org/x/oauth2 v0.0.0-20180821212333-d2e6202438be/go.mod h1:N/0e6XlmueqKjAGxoOufVs8QHGRruUQn6yWY3a++T0U=
  golang.org/x/oauth2 v0.0.0-20190226205417-e64efc72b421/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
  golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d/go.mod h1:gOpvHmFTYa4IltrdGE7lF6nIHvwfUNPOp7c8zoXwtLw=
-@@ -1351,8 +1363,8 @@ golang.org/x/sync v0.0.0-20201207232520-09787c993a3a/go.mod h1:RxMgew5VJxzue5/jJ
+@@ -1351,8 +1366,8 @@ golang.org/x/sync v0.0.0-20201207232520-09787c993a3a/go.mod h1:RxMgew5VJxzue5/jJ
  golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
  golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
  golang.org/x/sync v0.1.0/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
 -golang.org/x/sync v0.20.0 h1:e0PTpb7pjO8GAtTs2dQ6jYa5BWYlMuX047Dco/pItO4=
 -golang.org/x/sync v0.20.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
-+golang.org/x/sync v0.22.0 h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=
-+golang.org/x/sync v0.22.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
++golang.org/x/sync v0.23.0 h1:KameEIfc1IkluZyXWLn39Wd4tURc6GbCiISGiZm2bQk=
++golang.org/x/sync v0.23.0/go.mod h1:sUUOizhqBxiL6pEWpqNLUiaJn1ShEbZ6BBqskPbjZm0=
  golang.org/x/sys v0.0.0-20180823144017-11551d06cbcc/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
  golang.org/x/sys v0.0.0-20180830151530-49385e6e1522/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
  golang.org/x/sys v0.0.0-20180905080454-ebe1bf3edb33/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
-@@ -1415,10 +1427,10 @@ golang.org/x/sys v0.8.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+@@ -1415,10 +1430,10 @@ golang.org/x/sys v0.8.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
  golang.org/x/sys v0.11.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
  golang.org/x/sys v0.16.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
  golang.org/x/sys v0.21.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
@@ -1846,55 +2478,81 @@ index 92d6f82..193e955 100644
 -golang.org/x/sys v0.43.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
 -golang.org/x/telemetry v0.0.0-20260311193753-579e4da9a98c h1:6a8FdnNk6bTXBjR4AGKFgUKuo+7GnR3FX5L7CbveeZc=
 -golang.org/x/telemetry v0.0.0-20260311193753-579e4da9a98c/go.mod h1:TpUTTEp9frx7rTdLpC9gFG9kdI7zVLFTFFlqaH2Cncw=
-+golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
-+golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
-+golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57 h1:nwGZBCt+FnXUrGsj5vjzAsEmkcaFvd82BbOjECiFYZc=
-+golang.org/x/telemetry v0.0.0-20260625142307-59b4966ccb57/go.mod h1:3AWMyWHS+caVoiEXpiq6+tzKA40J4vQT3MYr80ZtQpc=
++golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
++golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
++golang.org/x/telemetry v0.0.0-20260811182544-a038080d80e5 h1:ZUSxONxc981v7AW7QUg+I9WwZzSTTJ019ENBYr5pV/Q=
++golang.org/x/telemetry v0.0.0-20260811182544-a038080d80e5/go.mod h1:LVehoXe41cL5SCVQilsV7Gg6BNG+Js6P9PhSbYTIUkQ=
  golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1/go.mod h1:bj7SfCRtBDWHUb9snDiAeCFNEtKQo2Wmx5Cou7ajbmo=
  golang.org/x/term v0.0.0-20210927222741-03fcf44c2211/go.mod h1:jbD1KX2456YbFQfuXm/mYQcufACuNUgVhRMnK/tPxf8=
  golang.org/x/term v0.5.0/go.mod h1:jMB1sMXY+tzblOD4FWmEbocvup2/aLOaQEp7JmGp78k=
-@@ -1427,8 +1439,8 @@ golang.org/x/term v0.7.0/go.mod h1:P32HKFT3hSsZrRxla30E9HqToFYAQPCMs/zFMBUFqPY=
+@@ -1427,8 +1442,8 @@ golang.org/x/term v0.7.0/go.mod h1:P32HKFT3hSsZrRxla30E9HqToFYAQPCMs/zFMBUFqPY=
  golang.org/x/term v0.8.0/go.mod h1:xPskH00ivmX89bAKVGSKKtLOWNx2+17Eiy94tnKShWo=
  golang.org/x/term v0.11.0/go.mod h1:zC9APTIj3jG3FdV/Ons+XE1riIZXG4aZ4GTHiPZJPIU=
  golang.org/x/term v0.16.0/go.mod h1:yn7UURbUtPyrVJPGPq404EukNFxcm/foM+bV/bfcDsY=
 -golang.org/x/term v0.42.0 h1:UiKe+zDFmJobeJ5ggPwOshJIVt6/Ft0rcfrXZDLWAWY=
 -golang.org/x/term v0.42.0/go.mod h1:Dq/D+snpsbazcBG5+F9Q1n2rXV8Ma+71xEjTRufARgY=
-+golang.org/x/term v0.45.0 h1:NwWyBmoJCbfTHpxrWoZ9C6/VxOf7ic219I8xZZFdrf0=
-+golang.org/x/term v0.45.0/go.mod h1:9aqxs0blBcrm/n0L9QW0aRVD+ktan8ssZromtqJC43w=
++golang.org/x/term v0.46.0 h1:3+OXuTbaKDgwk8jTi3aSLHRlmWqHEUDUtxnbFigO4YE=
++golang.org/x/term v0.46.0/go.mod h1:+K02xbkittuwc0Am4abfA3Fc+XRGXkvBXNO88NCXPoc=
  golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
  golang.org/x/text v0.3.2/go.mod h1:bEr9sfX3Q8Zfm5fL9x+3itogRgK3+ptLWKqgva+5dAk=
  golang.org/x/text v0.3.3/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
-@@ -1441,8 +1453,8 @@ golang.org/x/text v0.8.0/go.mod h1:e1OnstbJyHTd6l/uOt8jFFHp6TRDWZR/bV3emEE/zU8=
+@@ -1441,8 +1456,8 @@ golang.org/x/text v0.8.0/go.mod h1:e1OnstbJyHTd6l/uOt8jFFHp6TRDWZR/bV3emEE/zU8=
  golang.org/x/text v0.9.0/go.mod h1:e1OnstbJyHTd6l/uOt8jFFHp6TRDWZR/bV3emEE/zU8=
  golang.org/x/text v0.12.0/go.mod h1:TvPlkZtksWOMsz7fbANvkp4WM8x/WCo/om8BMLbz+aE=
  golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=
 -golang.org/x/text v0.36.0 h1:JfKh3XmcRPqZPKevfXVpI1wXPTqbkE5f7JA92a55Yxg=
 -golang.org/x/text v0.36.0/go.mod h1:NIdBknypM8iqVmPiuco0Dh6P5Jcdk8lJL0CUebqK164=
-+golang.org/x/text v0.40.0 h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=
-+golang.org/x/text v0.40.0/go.mod h1:hpnzDAfGV753zIKo+wk3u1bVKCGPbrnF7+7LBF/UHVY=
++golang.org/x/text v0.42.0 h1:JbOZXgfeCPU9gacVtYliJqOhD+zhrEqK4LfdpmlUZqI=
++golang.org/x/text v0.42.0/go.mod h1:ojzP1Z+2QtioaF8DTtO8K5q7JWVVYwZKenzujK0Zd0E=
  golang.org/x/time v0.0.0-20180412165947-fbb02b2291d2/go.mod h1:tRJNPiyCQ0inRvYxbN9jk5I+vvW/OXSQhTDSoE431IQ=
  golang.org/x/time v0.0.0-20191024005414-555d28b269f0/go.mod h1:tRJNPiyCQ0inRvYxbN9jk5I+vvW/OXSQhTDSoE431IQ=
  golang.org/x/time v0.15.0 h1:bbrp8t3bGUeFOx08pvsMYRTCVSMk89u4tKbNOZbp88U=
-@@ -1468,8 +1480,8 @@ golang.org/x/tools v0.0.0-20200619180055-7c47624df98f/go.mod h1:EkVYQZoAsY45+roY
+@@ -1468,8 +1483,8 @@ golang.org/x/tools v0.0.0-20200619180055-7c47624df98f/go.mod h1:EkVYQZoAsY45+roY
  golang.org/x/tools v0.0.0-20210106214847-113979e3529a/go.mod h1:emZCQorbCU4vsT4fOWvOPXz4eW1wZW4PmDk9uLelYpA=
  golang.org/x/tools v0.1.12/go.mod h1:hNGJHUnrk76NpqgfD5Aqm5Crs+Hm0VOH/i9J2+nxYbc=
  golang.org/x/tools v0.6.0/go.mod h1:Xwgl3UAJ/d3gWutnCtw505GrjyAbvKui8lOU390QaIU=
 -golang.org/x/tools v0.43.0 h1:12BdW9CeB3Z+J/I/wj34VMl8X+fEXBxVR90JeMX5E7s=
 -golang.org/x/tools v0.43.0/go.mod h1:uHkMso649BX2cZK6+RpuIPXS3ho2hZo4FVwfoy1vIk0=
-+golang.org/x/tools v0.47.0 h1:7Kn5x/d1svx/PzryTsqeoZN4TZwqeH5pGWjefhLi/1Q=
-+golang.org/x/tools v0.47.0/go.mod h1:dFHnyTvFWY212G+h7ZY4Vsp/K3U4/7W9TyVaAul8uCA=
++golang.org/x/tools v0.49.0 h1:3NI7VXzL9+1WZD52Dx2ttoPwD5DWrFGpl9mFZDlmisI=
++golang.org/x/tools v0.49.0/go.mod h1:SJNXV9DBKT0UbdttsQjbfJlAE/q+y36++zo3uL3N0Oo=
  golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
  golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
  golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+@@ -1495,10 +1510,10 @@ google.golang.org/genproto v0.0.0-20210126160654-44e461bb6506/go.mod h1:FWY/as6D
+ google.golang.org/genproto v0.0.0-20220314164441-57ef72a4c106/go.mod h1:hAL49I2IFola2sVEjAn7MEwsja0xp51I0tlGAf9hz4E=
+ google.golang.org/genproto v0.0.0-20260414002931-afd174a4e478 h1:aLsVTW0lZ8+IY5u/ERjZSCvAmhuR7slKzyha3YikDNA=
+ google.golang.org/genproto v0.0.0-20260414002931-afd174a4e478/go.mod h1:YJAzKjfHIUHb9T+bfu8L7mthAp7VVXQBUs1PLdBWS7M=
+-google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 h1:yQugLulqltosq0B/f8l4w9VryjV+N/5gcW0jQ3N8Qec=
+-google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478/go.mod h1:C6ADNqOxbgdUUeRTU+LCHDPB9ttAMCTff6auwCVa4uc=
+-google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 h1:RmoJA1ujG+/lRGNfUnOMfhCy5EipVMyvUE+KNbPbTlw=
+-google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
++google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d h1:FarXi840EJWSHYTN3ERkADbPWjl307+FGrA22KAVjjc=
++google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d/go.mod h1:K/+WGbmBY7aNW1HDw1fJnKYo10i0DkAX6pows00dLig=
++google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d h1:IL4hdHzcUv2l/gcg98/Rj3FbtE6axwqslOW8SW0C+S0=
++google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
+ google.golang.org/grpc v1.17.0/go.mod h1:6QZJwpn2B+Zp71q/5VxRsJ6NXXVCE5NRUHRo+f3cWCs=
+ google.golang.org/grpc v1.19.0/go.mod h1:mqu4LbDTu4XGKhr4mRzUsmM4RtVoemTSY81AxZiDr8c=
+ google.golang.org/grpc v1.20.0/go.mod h1:chYK+tFQF0nDUGJgXMSgLCQk3phJEuONr2DCgLDdAQM=
+@@ -1516,8 +1531,8 @@ google.golang.org/grpc v1.33.1/go.mod h1:fr5YgcSWrqhRRxogOsw7RzIpsmvOZ6IcH4kBYTp
+ google.golang.org/grpc v1.36.0/go.mod h1:qjiiYl8FncCW8feJPdyg3v6XW24KsRHe+dy9BAGRRjU=
+ google.golang.org/grpc v1.45.0/go.mod h1:lN7owxKUQEqMfSyQikvvk5tf/6zMPsrK+ONuO11+0rQ=
+ google.golang.org/grpc v1.49.0/go.mod h1:ZgQEeidpAuNRZ8iRrlBKXZQP1ghovWIVhdJRyCDK+GI=
+-google.golang.org/grpc v1.80.0 h1:Xr6m2WmWZLETvUNvIUmeD5OAagMw3FiKmMlTdViWsHM=
+-google.golang.org/grpc v1.80.0/go.mod h1:ho/dLnxwi3EDJA4Zghp7k2Ec1+c2jqup0bFkw07bwF4=
++google.golang.org/grpc v1.83.2 h1:EManeRomTObA0BU7I8vXgg/78uE5MJ9M8B39EX2WscU=
++google.golang.org/grpc v1.83.2/go.mod h1:YPI1hK3kDked6iHvgX3tR0y+nX/qpMFKhPgFsokw1S8=
+ google.golang.org/protobuf v0.0.0-20200109180630-ec00e32a8dfd/go.mod h1:DFci5gLYBciE7Vtevhsrf46CRTquxDuWsQurQQe4oz8=
+ google.golang.org/protobuf v0.0.0-20200221191635-4d8936d0db64/go.mod h1:kwYJMbMJ01Woi6D6+Kah6886xMZcty6N08ah7+eCXa0=
+ google.golang.org/protobuf v0.0.0-20200228230310-ab0ca4ff8a60/go.mod h1:cfTl7dwQJ+fmap5saPgwCLgHXTUD7jkjRqWcaiX5VyM=
 diff --git a/evmd/mempool.go b/evmd/mempool.go
-index d6af75f..843b34a 100644
+index d6af75f..1c4fec7 100644
 --- a/evmd/mempool.go
 +++ b/evmd/mempool.go
 @@ -52,6 +52,7 @@ func (app *EVMD) configureEVMMempool(appOpts servertypes.AppOptions, logger log.
  	)
  
  	app.EVMMempool = mempool
-+	mempool.SetZetaphyCheck(app.threatMempoolCheck) // ZETAPHY: the threat gate at submission
++	mempool.SetZetaphyCheck(app.zetaphyMempoolCheck) // ZETAPHY: the threat gate and the v5 account guard at submission
  
  	// create ABCI handlers
  	proposalHandler := baseapp.NewDefaultProposalHandler(mempool, NewNoCheckProposalTxVerifier(app.BaseApp))
@@ -1909,6 +2567,1946 @@ index d6af75f..843b34a 100644
  	app.SetInsertTxHandler(insertTxHandler)
  	app.SetReapTxsHandler(reapTxsHandler)
  	app.SetCheckTxHandler(checkTxHandler)
+diff --git a/evmd/zetaphy_aimodel.go b/evmd/zetaphy_aimodel.go
+new file mode 100644
+index 0000000..ac86d04
+--- /dev/null
++++ b/evmd/zetaphy_aimodel.go
+@@ -0,0 +1,276 @@
++package evmd
++
++// ZETAPHY v5 AI precompile at 0x…0902: a small gradient-boosted tree model
++// (GBDT) that governance stores in chain state, evaluated with integers only,
++// so every node gets the same answer.
++//
++//	score(bytes features) view returns (uint16 bps)
++//	    features: the model's feature vector, each an int32 (big-endian,
++//	    4 bytes; the exporter's scale is 1e4); returns the calibrated
++//	    probability in basis points (0..10000). Reverts when no model is set
++//	    or the length is not 4 × the model's feature count.
++//	model() view returns (bytes32 sha256, uint16 features, uint16 trees, uint32 nodes)
++//
++// Model format "ZGB1" (zetaphy-chain/tools/gbdt-export.mjs makes it from
++// Neuro's ml/model.json):
++//
++//	"ZGB1" | features u16 | trees u16 | base int32
++//	per tree: nodes u16, then per node (14 bytes):
++//	    feature u16 (0xFFFF: leaf) | threshold int32 | left u16 | right u16 | value int32
++//
++// A row goes left when x[feature] <= threshold. Values and base are logits
++// × 1e4 with the calibration already folded in. Children must come after
++// their parent, so every walk ends within the tree's node count.
++// Limits: 64 KiB, 512 trees, 255 nodes per tree, 1024 features.
++//
++// Gas: 2,000 + 6 per input word (RequiredGas), then 40 per tree and 8 per
++// node visited. The model is read without KV gas and parsed once per
++// version (cached by its sha256).
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"sync"
++
++	"github.com/ethereum/go-ethereum/accounts/abi"
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core/vm"
++
++	cmn "github.com/cosmos/evm/precompiles/common"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++)
++
++const (
++	gbdtMaxBytes    = 64 << 10
++	gbdtMaxTrees    = 512
++	gbdtMaxNodes    = 255
++	gbdtMaxFeatures = 1024
++	gbdtNodeSize    = 14
++	gbdtLeaf        = 0xFFFF
++)
++
++type gbdtNode struct {
++	feature     uint16
++	threshold   int32
++	left, right uint16
++	value       int32
++}
++
++type gbdtModel struct {
++	hash     [32]byte
++	features int
++	base     int64
++	trees    [][]gbdtNode
++	nodes    int
++}
++
++// parseGBDT checks and decodes a model.
++func parseGBDT(b []byte) (*gbdtModel, error) {
++	if len(b) > gbdtMaxBytes {
++		return nil, fmt.Errorf("model larger than %d bytes", gbdtMaxBytes)
++	}
++	if len(b) < 12 || string(b[:4]) != "ZGB1" {
++		return nil, errors.New(`model: want "ZGB1" header`)
++	}
++	m := &gbdtModel{hash: sha256.Sum256(b), features: int(binary.BigEndian.Uint16(b[4:]))}
++	nt := int(binary.BigEndian.Uint16(b[6:]))
++	m.base = int64(int32(binary.BigEndian.Uint32(b[8:]))) // #nosec G115 -- two's complement int32
++	if m.features == 0 || m.features > gbdtMaxFeatures || nt == 0 || nt > gbdtMaxTrees {
++		return nil, fmt.Errorf("model: 1..%d features and 1..%d trees", gbdtMaxFeatures, gbdtMaxTrees)
++	}
++	p := 12
++	for t := 0; t < nt; t++ {
++		if p+2 > len(b) {
++			return nil, fmt.Errorf("model: tree %d truncated", t)
++		}
++		n := int(binary.BigEndian.Uint16(b[p:]))
++		p += 2
++		if n == 0 || n > gbdtMaxNodes || p+n*gbdtNodeSize > len(b) {
++			return nil, fmt.Errorf("model: tree %d: 1..%d nodes, all present", t, gbdtMaxNodes)
++		}
++		tree := make([]gbdtNode, n)
++		for i := range tree {
++			q := b[p+i*gbdtNodeSize:]
++			nd := gbdtNode{feature: binary.BigEndian.Uint16(q), threshold: int32(binary.BigEndian.Uint32(q[2:])), // #nosec G115 -- int32
++				left: binary.BigEndian.Uint16(q[6:]), right: binary.BigEndian.Uint16(q[8:]), value: int32(binary.BigEndian.Uint32(q[10:]))} // #nosec G115 -- int32
++			if nd.feature != gbdtLeaf {
++				if int(nd.feature) >= m.features {
++					return nil, fmt.Errorf("model: tree %d node %d: feature %d out of range", t, i, nd.feature)
++				}
++				if int(nd.left) <= i || int(nd.right) <= i || int(nd.left) >= n || int(nd.right) >= n {
++					return nil, fmt.Errorf("model: tree %d node %d: children must come after the node", t, i)
++				}
++			}
++			tree[i] = nd
++		}
++		p += n * gbdtNodeSize
++		m.trees = append(m.trees, tree)
++		m.nodes += n
++	}
++	if p != len(b) {
++		return nil, errors.New("model: trailing bytes")
++	}
++	return m, nil
++}
++
++// eval returns the raw margin (logit × 1e4) and the number of nodes visited.
++func (m *gbdtModel) eval(x []int32) (int64, int) {
++	z, visited := m.base, 0
++	for _, t := range m.trees {
++		i := 0
++		for {
++			visited++
++			nd := t[i]
++			if nd.feature == gbdtLeaf {
++				z += int64(nd.value)
++				break
++			}
++			if x[nd.feature] <= nd.threshold {
++				i = int(nd.left)
++			} else {
++				i = int(nd.right)
++			}
++		}
++	}
++	return z, visited
++}
++
++// sigmoidTable[i] = round(10000 / (1 + e^-((i-32)/4))): z from -8 to 8 by 0.25.
++var sigmoidTable = [65]int64{3, 4, 6, 7, 9, 12, 15, 19, 25, 32, 41, 52, 67, 86, 110, 141, 180, 230, 293, 373, 474, 601, 759, 953,
++	1192, 1480, 1824, 2227, 2689, 3208, 3775, 4378, 5000, 5622, 6225, 6792, 7311, 7773, 8176, 8520, 8808, 9047, 9241, 9399, 9526,
++	9627, 9707, 9770, 9820, 9859, 9890, 9914, 9933, 9948, 9959, 9968, 9975, 9981, 9985, 9988, 9991, 9993, 9994, 9996, 9997}
++
++// sigmoidBps: the logistic function of z (logit × 1e4) in basis points,
++// piecewise linear between the table's points (integers only).
++func sigmoidBps(z int64) uint16 {
++	const step = 2500 // 0.25 in logit × 1e4
++	if z <= -32*step {
++		return 0
++	}
++	if z >= 32*step {
++		return 10000
++	}
++	u := z + 32*step
++	i, r := u/step, u%step
++	v := sigmoidTable[i] + (sigmoidTable[i+1]-sigmoidTable[i])*r/step
++	return uint16(v) // #nosec G115 -- 0..10000
++}
++
++const aiPrecompileABIJSON = `[
++ {"type":"function","name":"score","stateMutability":"view","inputs":[{"name":"features","type":"bytes"}],"outputs":[{"name":"bps","type":"uint16"}]},
++ {"type":"function","name":"model","stateMutability":"view","inputs":[],"outputs":[{"name":"sha256","type":"bytes32"},{"name":"features","type":"uint16"},{"name":"trees","type":"uint16"},{"name":"nodes","type":"uint32"}]},
++ {"type":"function","name":"modelEpochs","stateMutability":"view","inputs":[],"outputs":[{"name":"registry","type":"address"}]}
++]`
++
++// AIABI is the AI precompile's ABI.
++var AIABI = func() abi.ABI {
++	a, err := abi.JSON(bytes.NewReader([]byte(aiPrecompileABIJSON)))
++	if err != nil {
++		panic(err)
++	}
++	return a
++}()
++
++type aiPrecompile struct {
++	cmn.Precompile
++	app   *EVMD
++	mu    sync.Mutex
++	cache *gbdtModel
++}
++
++func newAIPrecompile(app *EVMD) *aiPrecompile {
++	return &aiPrecompile{Precompile: cmn.Precompile{
++		KvGasConfig: storetypes.KVGasConfig(), TransientKVGasConfig: storetypes.TransientGasConfig(),
++		ContractAddress: AIPrecompileAddress,
++	}, app: app}
++}
++
++func (*aiPrecompile) Name() string { return "zetaphy-ai" }
++
++func (p *aiPrecompile) RequiredGas(input []byte) uint64 {
++	return 2000 + 6*uint64((len(input)+31)/32) // #nosec G115 -- input length
++}
++
++func (p *aiPrecompile) Run(evm *vm.EVM, contract *vm.Contract, readonly bool) ([]byte, error) {
++	return p.RunNativeAction(evm, contract, func(ctx sdk.Context) ([]byte, error) {
++		method, args, err := cmn.SetupABI(AIABI, contract, readonly, func(*abi.Method) bool { return false })
++		if err != nil {
++			return nil, err
++		}
++		if v := contract.Value(); v != nil && !v.IsZero() {
++			return nil, errors.New("the AI precompile takes no value")
++		}
++		if method.Name == "modelEpochs" { // the Neuro ModelEpochs registry governance set (zetaphy_modelat.go)
++			reg, _ := p.app.modelEpochsAddr(ctx)
++			return method.Outputs.Pack(reg)
++		}
++		m := p.model(ctx)
++		switch method.Name {
++		case "model":
++			if m == nil {
++				return method.Outputs.Pack(common.Hash{}, uint16(0), uint16(0), uint32(0))
++			}
++			return method.Outputs.Pack(common.Hash(m.hash), uint16(m.features), uint16(len(m.trees)), uint32(m.nodes)) // #nosec G115 -- limits above
++		case "score":
++			if m == nil {
++				return nil, errors.New("no model is set (governance: security-proposal ai-model)")
++			}
++			x, err := gbdtFeatures(args[0].([]byte), m.features)
++			if err != nil {
++				return nil, err
++			}
++			ctx.GasMeter().ConsumeGas(40*uint64(len(m.trees)), "zetaphy ai trees") // #nosec G115 -- limits above
++			z, visited := m.eval(x)
++			ctx.GasMeter().ConsumeGas(8*uint64(visited), "zetaphy ai nodes") // #nosec G115 -- limits above
++			return method.Outputs.Pack(sigmoidBps(z))
++		}
++		return nil, fmt.Errorf("unknown method %s", method.Name)
++	})
++}
++
++func gbdtFeatures(b []byte, n int) ([]int32, error) {
++	if len(b) != 4*n {
++		return nil, fmt.Errorf("features: want %d int32 values (%d bytes), got %d bytes", n, 4*n, len(b))
++	}
++	x := make([]int32, n)
++	for i := range x {
++		x[i] = int32(binary.BigEndian.Uint32(b[4*i:])) // #nosec G115 -- int32
++	}
++	return x, nil
++}
++
++// model: the stored model, parsed once per content.
++func (p *aiPrecompile) model(ctx sdk.Context) *gbdtModel {
++	raw := p.app.secRaw(ctx).Get(aiModelKey)
++	if len(raw) == 0 {
++		return nil
++	}
++	h := sha256.Sum256(raw)
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if p.cache != nil && p.cache.hash == h {
++		return p.cache
++	}
++	m, err := parseGBDT(raw) // checked when governance set it
++	if err != nil {
++		return nil
++	}
++	p.cache = m
++	return m
++}
++
++// AIScore evaluates the stored model for a feature vector outside the EVM
++// (the immune system may use it; tests). ok is false without a model.
++func (app *EVMD) AIScore(ctx sdk.Context, features []int32) (uint16, bool) {
++	m := app.aiPrecompile.model(ctx)
++	if m == nil || len(features) != m.features {
++		return 0, false
++	}
++	z, _ := m.eval(features)
++	return sigmoidBps(z), true
++}
+diff --git a/evmd/zetaphy_antirollback.go b/evmd/zetaphy_antirollback.go
+new file mode 100644
+index 0000000..a16394a
+--- /dev/null
++++ b/evmd/zetaphy_antirollback.go
+@@ -0,0 +1,408 @@
++package evmd
++
++// ZETAPHY anti-rollback start guard (docs/ANTI-ROLLBACK-CHAIN.md).
++//
++// `zetaphyd start` runs two checks on the node's own files before CometBFT
++// opens its databases, joins the network or signs anything. A refusal exits
++// with a message that says what is wrong and how to override it on purpose.
++// Nothing here is part of consensus: it reads local files and the committed
++// state, and writes one file outside the chain data.
++//
++//  1. Downgrade guard (L1-1). The committed x/upgrade state says which upgrade
++//     the chain completed last and which plan is scheduled; the binary must be
++//     able to run the next block under x/upgrade's rules (zetaphyUpgradeCheck,
++//     the same rules as `zetaphyd upgrade-check`). x/upgrade itself checks the
++//     last completed upgrade only at the first block it executes, after the
++//     node has connected and voted; this refuses before.
++//
++//  2. Signing-state guard (L1-2). For a validator with a local key (not a
++//     remote signer), data/priv_validator_state.json must not be behind what
++//     this validator has signed already:
++//       - the highest height whose commit in the local block store carries
++//         this validator's signature (the newest 1,000 blocks are looked at);
++//       - the sign record config/zetaphy_sign_state.json: the height of every
++//         precommit this node extended (ExtendVote, called just before CometBFT
++//         signs it), kept outside data/ so that putting back an old copy of
++//         data/ (snapshot, backup) does not roll it back too. It is tied to the
++//         chain id and to the sha256 of genesis.json: a new chain in the same
++//         home does not inherit it.
++//     A state file that is behind is what restoring an old snapshot leaves; a
++//     validator started on it can sign a second, different block at a height
++//     it signed before (double sign, slashed and tombstoned).
++//
++// Override: ZETAPHY_ALLOW_DOWNGRADE=<chain-id>:<height>, where height is the
++// node's last committed block height (the refusal message prints both). It
++// must match exactly, so it is good for one start on that state only; it is
++// logged at error level on every use. On an override of guard 2 the sign
++// record is reset to the state file's height.
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
++
++	"github.com/spf13/cast"
++
++	cmtcfg "github.com/cometbft/cometbft/config"
++	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
++	cmtstore "github.com/cometbft/cometbft/store"
++	cmttypes "github.com/cometbft/cometbft/types"
++
++	"github.com/cosmos/cosmos-sdk/client/flags"
++	servertypes "github.com/cosmos/cosmos-sdk/server/types"
++	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
++)
++
++// ZetaphyAllowDowngradeEnv names the deliberate override of both start checks.
++const ZetaphyAllowDowngradeEnv = "ZETAPHY_ALLOW_DOWNGRADE"
++
++// zetaphySignStateFn: the sign record, in config/ (not data/).
++const zetaphySignStateFn = "zetaphy_sign_state.json"
++
++// zetaphySignScanBlocks: how many of the newest blocks guard 2 looks at.
++const zetaphySignScanBlocks = 1000
++
++// ZetaphyStarting is set by the start command (cmd/evmd/cmd/root.go) so the
++// app creator runs the start guard for `start` only (not for export,
++// rollback, snapshots, ...).
++var ZetaphyStarting bool
++
++type zetaphySignState struct {
++	ChainID       string `json:"chain_id"`
++	GenesisSHA256 string `json:"genesis_sha256"`
++	Height        int64  `json:"height"`
++	// ConsAddress: the validator key (hex) the record is for; a record of
++	// another key does not count. Empty in records written before it existed.
++	ConsAddress string `json:"cons_address,omitempty"`
++}
++
++// zetaphySignRecord keeps config/zetaphy_sign_state.json up to date from
++// ExtendVote. Written only when the height grows.
++type zetaphySignRecord struct {
++	mu      sync.Mutex
++	path    string
++	genFile string
++	loaded  bool
++	st      zetaphySignState
++}
++
++func newZetaphySignRecord(home string) *zetaphySignRecord {
++	return &zetaphySignRecord{
++		path:    filepath.Join(home, "config", zetaphySignStateFn),
++		genFile: filepath.Join(home, "config", "genesis.json"),
++	}
++}
++
++func fileSHA256(p string) (string, error) {
++	bz, err := os.ReadFile(filepath.Clean(p))
++	if err != nil {
++		return "", err
++	}
++	s := sha256.Sum256(bz)
++	return hex.EncodeToString(s[:]), nil
++}
++
++func readSignState(p string) (zetaphySignState, bool) {
++	var st zetaphySignState
++	bz, err := os.ReadFile(filepath.Clean(p))
++	if err != nil || json.Unmarshal(bz, &st) != nil {
++		return zetaphySignState{}, false
++	}
++	return st, true
++}
++
++func writeSignState(p string, st zetaphySignState) error {
++	bz, err := json.Marshal(st)
++	if err != nil {
++		return err
++	}
++	// write, fsync, rename, fsync the directory: a crash leaves the old
++	// record or the new one, never a truncated file
++	tmp := p + ".tmp"
++	f, err := os.OpenFile(filepath.Clean(tmp), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
++	if err != nil {
++		return err
++	}
++	if _, err := f.Write(bz); err != nil {
++		_ = f.Close()
++		return err
++	}
++	if err := f.Sync(); err != nil {
++		_ = f.Close()
++		return err
++	}
++	if err := f.Close(); err != nil {
++		return err
++	}
++	if err := os.Rename(tmp, p); err != nil {
++		return err
++	}
++	if d, err := os.Open(filepath.Dir(filepath.Clean(p))); err == nil {
++		_ = d.Sync()
++		_ = d.Close()
++	}
++	return nil
++}
++
++// note records that this node extended (and is about to sign) a precommit
++// at height h of chain chainID. Errors only make the record older, which
++// the block-store check partly covers; they never stop the node.
++func (r *zetaphySignRecord) note(chainID string, h int64, cons []byte) {
++	if r == nil {
++		return
++	}
++	ca := hex.EncodeToString(cons)
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if !r.loaded {
++		gen, err := fileSHA256(r.genFile)
++		if err != nil {
++			return
++		}
++		r.loaded = true
++		st, ok := readSignState(r.path)
++		if !ok || st.ChainID != chainID || st.GenesisSHA256 != gen || (st.ConsAddress != "" && st.ConsAddress != ca) {
++			st = zetaphySignState{ChainID: chainID, GenesisSHA256: gen}
++		}
++		r.st = st
++	}
++	if r.st.ConsAddress != "" && r.st.ConsAddress != ca { // the validator key changed while running
++		r.st = zetaphySignState{ChainID: r.st.ChainID, GenesisSHA256: r.st.GenesisSHA256}
++	}
++	if h <= r.st.Height || chainID != r.st.ChainID {
++		return
++	}
++	r.st.Height, r.st.ConsAddress = h, ca
++	_ = writeSignState(r.path, r.st)
++}
++
++// ---- the checks
++
++// zetaphyOverride: "<chain-id>:<height>" from the environment, matched
++// against this node. ok reports a matching override; err a set but wrong one.
++func zetaphyOverride(chainID string, height int64) (ok bool, err error) {
++	v := strings.TrimSpace(os.Getenv(ZetaphyAllowDowngradeEnv))
++	if v == "" {
++		return false, nil
++	}
++	i := strings.LastIndex(v, ":")
++	if i <= 0 {
++		return false, fmt.Errorf("%s=%q: want <chain-id>:<height>", ZetaphyAllowDowngradeEnv, v)
++	}
++	h, perr := strconv.ParseInt(v[i+1:], 10, 64)
++	if perr != nil || v[:i] != chainID || h != height {
++		return false, fmt.Errorf("%s=%q does not match this node (chain %s at committed height %d); it is ignored", ZetaphyAllowDowngradeEnv, v, chainID, height)
++	}
++	return true, nil
++}
++
++// zetaphyDowngradeCheck is guard 1 on the committed state.
++func (app *EVMD) zetaphyDowngradeCheck() error {
++	h := app.LastBlockHeight()
++	if h == 0 {
++		return nil // nothing committed yet
++	}
++	ctx := app.NewUncachedContext(false, cmtproto.Header{Height: h, ChainID: app.ChainID()})
++	last, _, err := app.UpgradeKeeper.GetLastCompletedUpgrade(ctx)
++	if err != nil {
++		return fmt.Errorf("reading the completed upgrades: %w", err)
++	}
++	var plan *upgradetypes.Plan
++	if p, err := app.UpgradeKeeper.GetUpgradePlan(ctx); err == nil && p.Name != "" {
++		if !(p.ShouldExecute(h+1) && app.UpgradeKeeper.IsSkipHeight(p.Height)) {
++			plan = &p
++		}
++	}
++	return zetaphyUpgradeCheck(last, plan, h, app.UpgradeKeeper.HasHandler)
++}
++
++type zetaphyPVFiles struct {
++	key, state, remote, dbBackend, dbDir, genesis string
++}
++
++func zetaphyPVConfig(home string, opts servertypes.AppOptions) zetaphyPVFiles {
++	c := cmtcfg.DefaultConfig()
++	get := func(k, def string) string {
++		if opts != nil {
++			if v := cast.ToString(opts.Get(k)); v != "" {
++				return v
++			}
++		}
++		return def
++	}
++	abs := func(p string) string {
++		if filepath.IsAbs(p) {
++			return p
++		}
++		return filepath.Join(home, p)
++	}
++	return zetaphyPVFiles{
++		key:       abs(get("priv_validator_key_file", c.PrivValidatorKey)),
++		state:     abs(get("priv_validator_state_file", c.PrivValidatorState)),
++		remote:    get("priv_validator_laddr", ""),
++		dbBackend: get("db_backend", c.DBBackend),
++		dbDir:     abs(get("db_dir", c.DBPath)),
++		genesis:   abs(get("genesis_file", c.Genesis)),
++	}
++}
++
++// pvStateHeight reads the height of data/priv_validator_state.json
++// (CometBFT writes int64 as a JSON string).
++func pvStateHeight(p string) (int64, bool, error) {
++	bz, err := os.ReadFile(filepath.Clean(p))
++	if errors.Is(err, os.ErrNotExist) {
++		return 0, false, nil
++	}
++	if err != nil {
++		return 0, false, err
++	}
++	var s struct {
++		Height json.RawMessage `json:"height"`
++	}
++	if err := json.Unmarshal(bz, &s); err != nil {
++		return 0, false, fmt.Errorf("%s: %w", p, err)
++	}
++	h, err := strconv.ParseInt(strings.Trim(string(s.Height), `"`), 10, 64)
++	if err != nil {
++		return 0, false, fmt.Errorf("%s: height: %w", p, err)
++	}
++	return h, true, nil
++}
++
++// blockStoreSignedHeight: the highest height, among the newest
++// zetaphySignScanBlocks of the local block store, whose commit has a
++// signature of addr. 0 when none (or no block store yet).
++func blockStoreSignedHeight(f zetaphyPVFiles, addr []byte) (int64, error) {
++	if _, err := os.Stat(filepath.Join(f.dbDir, "blockstore.db")); err != nil {
++		return 0, nil //nolint:nilerr // no block store: a new node
++	}
++	c := cmtcfg.DefaultConfig()
++	c.DBBackend, c.DBPath = f.dbBackend, f.dbDir
++	db, err := cmtcfg.DefaultDBProvider(&cmtcfg.DBContext{ID: "blockstore", Config: c})
++	if err != nil {
++		return 0, fmt.Errorf("opening the block store: %w", err)
++	}
++	bs := cmtstore.NewBlockStore(db)
++	defer bs.Close()
++	top, base := bs.Height(), bs.Base()
++	signed := func(cm *cmttypes.Commit) bool {
++		if cm == nil {
++			return false
++		}
++		for _, s := range cm.Signatures {
++			if s.BlockIDFlag == cmttypes.BlockIDFlagCommit && string(s.ValidatorAddress) == string(addr) {
++				return true
++			}
++		}
++		return false
++	}
++	if top > 0 && signed(bs.LoadSeenCommit(top)) {
++		return top, nil
++	}
++	for h := top; h >= base && h > 0 && top-h < zetaphySignScanBlocks; h-- {
++		if signed(bs.LoadBlockCommit(h)) { // the commit of h, stored with block h+1
++			return h, nil
++		}
++	}
++	return 0, nil
++}
++
++// zetaphySignCheck is guard 2. It returns the heights it compared (for the
++// override path) and the refusal, if any.
++func (app *EVMD) zetaphySignCheck(home string, f zetaphyPVFiles) (pvH, signedH int64, why string, err error) {
++	if f.remote != "" {
++		app.Logger().Info("ZETAPHY start guard: remote signer (priv_validator_laddr); its own state protects it, not checked here")
++		return 0, 0, "", nil
++	}
++	addr, err := pqConsAddrFile(f.key)
++	if err != nil {
++		return 0, 0, "", nil //nolint:nilerr // no key file: not a validator node
++	}
++	pvH, exists, err := pvStateHeight(f.state)
++	if err != nil {
++		return 0, 0, "", err
++	}
++	bsH, err := blockStoreSignedHeight(f, addr)
++	if err != nil {
++		return 0, 0, "", err
++	}
++	signedH, why = bsH, fmt.Sprintf("the block store has this validator's signature at height %d", bsH)
++	if gen, gerr := fileSHA256(f.genesis); gerr == nil {
++		if st, ok := readSignState(filepath.Join(home, "config", zetaphySignStateFn)); ok &&
++			st.ChainID == app.ChainID() && st.GenesisSHA256 == gen && (st.ConsAddress == "" || st.ConsAddress == hex.EncodeToString(addr)) && st.Height > signedH {
++			signedH, why = st.Height, fmt.Sprintf("config/%s says this node signed a precommit at height %d", zetaphySignStateFn, st.Height)
++		}
++	}
++	if signedH > 0 && (!exists || pvH < signedH) {
++		state := fmt.Sprintf("is at height %d", pvH)
++		if !exists {
++			state = "is missing"
++		}
++		return pvH, signedH, fmt.Sprintf("%s %s, but %s: an old copy of the signing state (restored snapshot?) would let this validator sign the same height twice (double sign)", f.state, state, why), nil
++	}
++	return pvH, signedH, "", nil
++}
++
++func pqConsAddrFile(p string) ([]byte, error) {
++	pv, err := os.ReadFile(filepath.Clean(p))
++	if err != nil {
++		return nil, err
++	}
++	var k struct{ Address string }
++	if err := json.Unmarshal(pv, &k); err != nil {
++		return nil, err
++	}
++	a, err := hex.DecodeString(k.Address)
++	if err == nil && len(a) == 0 {
++		err = errors.New("no address")
++	}
++	return a, err
++}
++
++// ZetaphyStartGuard runs both checks (the start command calls it through
++// the app creator, before CometBFT starts). nil: start.
++func (app *EVMD) ZetaphyStartGuard(opts servertypes.AppOptions) error {
++	home := cast.ToString(opts.Get(flags.FlagHome))
++	chainID, h := app.ChainID(), app.LastBlockHeight()
++	override, oerr := zetaphyOverride(chainID, h)
++	if oerr != nil {
++		app.Logger().Error("ZETAPHY start guard: " + oerr.Error())
++	}
++	hint := fmt.Sprintf("only if you mean it (e.g. a planned rollback): start once with %s=%s:%d", ZetaphyAllowDowngradeEnv, chainID, h)
++
++	if err := app.zetaphyDowngradeCheck(); err != nil {
++		if !override {
++			return fmt.Errorf("ZETAPHY start guard: refused to start: %w. Install the binary the chain needs; %s", err, hint)
++		}
++		app.Logger().Error("ZETAPHY START GUARD OVERRIDDEN (" + ZetaphyAllowDowngradeEnv + "): starting a binary that fails the downgrade check: " + err.Error())
++	}
++	if home == "" {
++		return nil
++	}
++	f := zetaphyPVConfig(home, opts)
++	pvH, _, why, err := app.zetaphySignCheck(home, f)
++	if err != nil {
++		return fmt.Errorf("ZETAPHY start guard: refused to start: cannot check the signing state: %w", err)
++	}
++	if why != "" {
++		if !override {
++			return fmt.Errorf("ZETAPHY start guard: refused to start: %s. Put back the newest %s (never an older one); %s", why, filepath.Base(f.state), hint)
++		}
++		app.Logger().Error("ZETAPHY START GUARD OVERRIDDEN (" + ZetaphyAllowDowngradeEnv + "): " + why + "; the sign record is reset to the state file's height")
++		if gen, gerr := fileSHA256(f.genesis); gerr == nil {
++			st := zetaphySignState{ChainID: chainID, GenesisSHA256: gen, Height: pvH}
++			if a, aerr := pqConsAddrFile(f.key); aerr == nil {
++				st.ConsAddress = hex.EncodeToString(a)
++			}
++			_ = writeSignState(filepath.Join(home, "config", zetaphySignStateFn), st)
++		}
++	}
++	return nil
++}
+diff --git a/evmd/zetaphy_breaker.go b/evmd/zetaphy_breaker.go
+new file mode 100644
+index 0000000..69f3dd0
+--- /dev/null
++++ b/evmd/zetaphy_breaker.go
+@@ -0,0 +1,343 @@
++package evmd
++
++// ZETAPHY v5 bridge circuit breaker.
++//
++// Governance watches up to breakerMax bridge contracts (BridgeGuard, the
++// Saphan lock boxes, …) by naming the event that marks an outflow:
++//
++//	{"bridge":"0x…","topic":"0x<event topic0>","recipient_topic":2,"amount_word":0,
++//	 "min_volume":"1000000000000000000000","vol_mult_bps":50000,"new_ratio_bps":5000,
++//	 "baseline_shift":7,"enabled":true}
++//
++// e.g. BridgeGuard's Outbound(bytes32 indexed route, address indexed from,
++// uint256 amount): recipient in topic 2, amount in data word 0.
++//
++// Every block, each node adds up (deterministically, from the receipts' logs)
++// per bridge: the outflow volume, the number of outflows and how many went to
++// a recipient never seen before. A baseline is the exponential moving average
++// of the per-block volume (alpha = 2^-baseline_shift, idle blocks count as 0).
++//
++// Each validator then judges block N in its vote on N+1 and flags the bridge
++// when, in N, volume >= min_volume, volume >= baseline × vol_mult_bps / 1e4
++// and new recipients / outflows >= new_ratio_bps / 1e4. If validators with
++// more than 2/3 of the power flag it (checked in block N+2 with their
++// signatures, zetaphy_immune.go), the chain calls the bridge's pause() from
++// the breaker address (BreakerAddress) at the start of block N+2. Governance
++// must have made that address a guardian/pauser of the bridge (for
++// BridgeGuard: setGuardian(BreakerAddress, true)). The breaker fires once,
++// then stays tripped: unpause is the bridge's own governance-only function,
++// and "breaker-rearm" (governance) lets it fire again.
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"fmt"
++	"math/big"
++
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core"
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++
++	errorsmod "cosmossdk.io/errors"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
++
++	"github.com/cosmos/evm/x/vm/statedb"
++)
++
++// BreakerAddress calls pause() on a tripped bridge (a module address: no key).
++var BreakerAddress = common.BytesToAddress(authtypes.NewModuleAddress("zetaphy-breaker"))
++
++// breakerPauseSelector: pause().
++var breakerPauseSelector = []byte{0x84, 0x56, 0xcb, 0x59}
++
++const breakerPauseGas = 300_000
++
++type breakerCfg struct {
++	Bridge         string `json:"bridge"`
++	Topic          string `json:"topic"`
++	RecipientTopic uint8  `json:"recipient_topic"` // 1..3; 0: the event has no recipient (new_ratio is then ignored)
++	AmountWord     uint8  `json:"amount_word"`     // data word with the amount
++	MinVolume      string `json:"min_volume"`      // smallest units
++	VolMultBps     uint32 `json:"vol_mult_bps"`    // >= 10000
++	NewRatioBps    uint16 `json:"new_ratio_bps"`   // 0..10000
++	BaselineShift  uint8  `json:"baseline_shift"`  // 1..10 (default 7: ~128 blocks)
++	Enabled        bool   `json:"enabled"`
++
++	bridge    common.Address
++	topicHash common.Hash
++	minVolume *big.Int
++}
++
++func (c *breakerCfg) check() error {
++	if !common.IsHexAddress(c.Bridge) {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "breaker: bridge must be a 0x address")
++	}
++	c.bridge = common.HexToAddress(c.Bridge)
++	if !c.Enabled {
++		return nil
++	}
++	tb := common.FromHex(c.Topic)
++	if len(tb) != 32 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "breaker: topic must be 32 bytes (the event's topic0)")
++	}
++	c.topicHash = common.BytesToHash(tb)
++	if c.RecipientTopic > 3 || c.AmountWord > 15 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "breaker: recipient_topic 0..3, amount_word 0..15")
++	}
++	v, ok := new(big.Int).SetString(c.MinVolume, 10)
++	if !ok || v.Sign() <= 0 || v.BitLen() > 255 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "breaker: min_volume must be a positive whole number")
++	}
++	c.minVolume = v
++	if c.VolMultBps < 10000 || c.NewRatioBps > 10000 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "breaker: vol_mult_bps >= 10000, new_ratio_bps <= 10000")
++	}
++	if c.BaselineShift == 0 {
++		c.BaselineShift = 7
++	}
++	if c.BaselineShift > 10 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "breaker: baseline_shift 1..10")
++	}
++	return nil
++}
++
++func breakerKey(pfx byte, b common.Address) []byte { return append([]byte{pfx}, b.Bytes()...) }
++
++func (app *EVMD) setBreaker(ctx sdk.Context, c breakerCfg) error {
++	if err := c.check(); err != nil {
++		return err
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if !c.Enabled {
++		for _, p := range []byte{breakerCfgPfx, breakerStatsPfx, breakerTripPfx, breakerPausePfx} {
++			st.Delete(breakerKey(p, c.bridge))
++		}
++		return nil
++	}
++	if app.breakerConfig(ctx, c.bridge) == nil && len(app.breakerConfigs(ctx)) >= breakerMax {
++		return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "breaker: at most %d bridges", breakerMax)
++	}
++	if len(app.EVMKeeper.GetCode(ctx, app.EVMKeeper.GetCodeHash(ctx, c.bridge))) == 0 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "breaker: no contract at that address")
++	}
++	c.Bridge, c.Topic = c.bridge.Hex(), c.topicHash.Hex()
++	bz, _ := json.Marshal(c)
++	st.Set(breakerKey(breakerCfgPfx, c.bridge), bz)
++	return nil
++}
++
++func (app *EVMD) breakerConfig(ctx sdk.Context, b common.Address) *breakerCfg {
++	raw := app.secRaw(ctx).Get(breakerKey(breakerCfgPfx, b))
++	if raw == nil {
++		return nil
++	}
++	var c breakerCfg
++	if json.Unmarshal(raw, &c) != nil || c.check() != nil || !c.Enabled {
++		return nil
++	}
++	return &c
++}
++
++// breakerConfigs: the watched bridges, by address.
++func (app *EVMD) breakerConfigs(ctx sdk.Context) []*breakerCfg {
++	var out []*breakerCfg
++	p := []byte{breakerCfgPfx}
++	it := app.secRaw(ctx).Iterator(p, storetypes.PrefixEndBytes(p))
++	defer it.Close()
++	for ; it.Valid() && len(out) < breakerMax; it.Next() {
++		if c := app.breakerConfig(ctx, common.BytesToAddress(it.Key()[1:])); c != nil {
++			out = append(out, c)
++		}
++	}
++	return out
++}
++
++// breakerStats: the last block with outflows and the baseline before it.
++type breakerStats struct {
++	height               int64
++	volume               *big.Int
++	count, newRecipients uint32
++	baseline             *big.Int // EMA of per-block volume up to height-1
++}
++
++func (app *EVMD) breakerStatsOf(ctx sdk.Context, b common.Address) breakerStats {
++	s := breakerStats{volume: new(big.Int), baseline: new(big.Int)}
++	v := app.secRaw(ctx).Get(breakerKey(breakerStatsPfx, b))
++	if len(v) != 8+32+4+4+32 {
++		return s
++	}
++	s.height = int64(binary.BigEndian.Uint64(v)) // #nosec G115 -- block heights
++	s.volume.SetBytes(v[8:40])
++	s.count, s.newRecipients = binary.BigEndian.Uint32(v[40:]), binary.BigEndian.Uint32(v[44:])
++	s.baseline.SetBytes(v[48:80])
++	return s
++}
++
++func (s breakerStats) bytes() []byte {
++	out := u64(uint64(s.height)) // #nosec G115 -- block heights
++	out = append(out, common.LeftPadBytes(s.volume.Bytes(), 32)...)
++	out = binary.BigEndian.AppendUint32(out, s.count)
++	out = binary.BigEndian.AppendUint32(out, s.newRecipients)
++	return append(out, common.LeftPadBytes(s.baseline.Bytes(), 32)...)
++}
++
++var maxU256 = new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
++
++// roll moves the stats to block h: the old block's volume and the idle
++// blocks in between go into the baseline.
++func (s *breakerStats) roll(h int64, shift uint8) {
++	if s.height == h {
++		return
++	}
++	if s.height > 0 {
++		// baseline += (volume - baseline) >> shift, then idle blocks decay it
++		d := new(big.Int).Sub(s.volume, s.baseline)
++		s.baseline.Add(s.baseline, d.Rsh(d, uint(shift)))
++		if d.Sign() < 0 && s.baseline.Sign() < 0 {
++			s.baseline.SetInt64(0)
++		}
++		for i := s.height + 1; i < h && s.baseline.Sign() > 0; i++ {
++			if i-s.height > int64(16)<<shift {
++				s.baseline.SetInt64(0)
++				break
++			}
++			s.baseline.Sub(s.baseline, new(big.Int).Rsh(s.baseline, uint(shift)))
++		}
++	}
++	s.height, s.volume, s.count, s.newRecipients = h, new(big.Int), 0, 0
++}
++
++// breakerNoteLogs counts a successful tx's outflows of watched bridges.
++func (app *EVMD) breakerNoteLogs(ctx sdk.Context, logs []*ethtypes.Log) {
++	if len(logs) == 0 || !app.futV5(ctx, ctx.BlockHeight()) || ctx.ExecMode() != sdk.ExecModeFinalize {
++		return
++	}
++	var cfgs []*breakerCfg
++	loaded := false
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	for _, l := range logs {
++		if l == nil || len(l.Topics) == 0 {
++			continue
++		}
++		if !loaded {
++			cfgs, loaded = app.breakerConfigs(ctx), true
++			if len(cfgs) == 0 {
++				return
++			}
++		}
++		for _, c := range cfgs {
++			if l.Address != c.bridge || l.Topics[0] != c.topicHash {
++				continue
++			}
++			w := int(c.AmountWord)
++			if len(l.Data) < 32*(w+1) || (c.RecipientTopic > 0 && len(l.Topics) <= int(c.RecipientTopic)) {
++				continue
++			}
++			amt := new(big.Int).SetBytes(l.Data[32*w : 32*(w+1)])
++			s := app.breakerStatsOf(ctx, c.bridge)
++			s.roll(ctx.BlockHeight(), c.BaselineShift)
++			s.volume.Add(s.volume, amt)
++			if s.volume.Cmp(maxU256) > 0 {
++				s.volume.Set(maxU256)
++			}
++			s.count++
++			if c.RecipientTopic > 0 {
++				seen := append(breakerKey(breakerSeenPfx, c.bridge), l.Topics[c.RecipientTopic][12:]...)
++				if !st.Has(seen) {
++					st.Set(seen, []byte{})
++					s.newRecipients++
++				}
++			}
++			st.Set(breakerKey(breakerStatsPfx, c.bridge), s.bytes())
++		}
++	}
++}
++
++// BreakerFlag is the default validator rule for block stats s.
++func BreakerFlag(c *breakerCfg, s breakerStats) bool {
++	if s.volume.Cmp(c.minVolume) < 0 {
++		return false
++	}
++	// volume × 1e4 >= baseline × vol_mult_bps
++	l := new(big.Int).Mul(s.volume, big.NewInt(10000))
++	r := new(big.Int).Mul(s.baseline, big.NewInt(int64(c.VolMultBps)))
++	if l.Cmp(r) < 0 {
++		return false
++	}
++	if c.RecipientTopic == 0 || s.count == 0 {
++		return true
++	}
++	return uint64(s.newRecipients)*10000 >= uint64(c.NewRatioBps)*uint64(s.count)
++}
++
++// breakerFlags: the bridges this validator flags for block h (state after h).
++func (app *EVMD) breakerFlags(ctx sdk.Context, h int64) []common.Address {
++	var out []common.Address
++	for _, c := range app.breakerConfigs(ctx) {
++		if app.secRaw(ctx).Has(breakerKey(breakerTripPfx, c.bridge)) {
++			continue // already tripped: nothing more to say
++		}
++		if s := app.breakerStatsOf(ctx, c.bridge); s.height == h && BreakerFlag(c, s) {
++			out = append(out, c.bridge)
++		}
++	}
++	return out
++}
++
++func (app *EVMD) breakerSchedulePause(ctx sdk.Context, b common.Address, powerBps int64) {
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if app.breakerConfig(ctx, b) == nil || st.Has(breakerKey(breakerTripPfx, b)) {
++		return
++	}
++	st.Set(breakerKey(breakerPausePfx, b), []byte{})
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_breaker_flagged", sdk.NewAttribute("bridge", b.Hex()), sdk.NewAttribute("power_bps", fmt.Sprint(powerBps))))
++}
++
++// breakerBeginBlock calls pause() on bridges the validators tripped. A
++// failing call (no pauser role, out of gas) is recorded, never fatal.
++func (app *EVMD) breakerBeginBlock(ctx sdk.Context) {
++	if !app.futV5(ctx, ctx.BlockHeight()) {
++		return
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	p := []byte{breakerPausePfx}
++	it := st.Iterator(p, storetypes.PrefixEndBytes(p))
++	var due []common.Address
++	for ; it.Valid() && len(due) < breakerMax; it.Next() {
++		due = append(due, common.BytesToAddress(it.Key()[1:]))
++	}
++	_ = it.Close()
++	for _, b := range due {
++		st.Delete(breakerKey(breakerPausePfx, b))
++		ok := app.breakerCallPause(ctx, b)
++		st.Set(breakerKey(breakerTripPfx, b), append(u64(uint64(ctx.BlockHeight())), map[bool]byte{false: 0, true: 1}[ok])) // #nosec G115 -- block heights
++		ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_breaker_pause", sdk.NewAttribute("bridge", b.Hex()), sdk.NewAttribute("ok", fmt.Sprint(ok))))
++	}
++}
++
++func (app *EVMD) breakerCallPause(ctx sdk.Context, b common.Address) (ok bool) {
++	c, write := ctx.CacheContext()
++	c = c.WithGasMeter(storetypes.NewInfiniteGasMeter()).WithKVGasConfig(storetypes.GasConfig{}).
++		WithTransientKVGasConfig(storetypes.GasConfig{})
++	defer func() {
++		if r := recover(); r != nil {
++			ok = false
++		}
++	}()
++	sdb := statedb.New(c, app.EVMKeeper, statedb.NewEmptyTxConfig())
++	res, err := app.EVMKeeper.ApplyMessage(c, sdb, core.Message{
++		From: BreakerAddress, To: &b, Value: new(big.Int), GasLimit: breakerPauseGas, Data: bytes.Clone(breakerPauseSelector),
++		GasPrice: new(big.Int), GasFeeCap: new(big.Int), GasTipCap: new(big.Int), AccessList: ethtypes.AccessList{},
++		SkipNonceChecks: true,
++	}, nil, true, false, true)
++	if err != nil || res == nil || res.Failed() {
++		return false
++	}
++	write()
++	return true
++}
+diff --git a/evmd/zetaphy_chainguard.go b/evmd/zetaphy_chainguard.go
+new file mode 100644
+index 0000000..b24f7c6
+--- /dev/null
++++ b/evmd/zetaphy_chainguard.go
+@@ -0,0 +1,889 @@
++package evmd
++
++// ZETAPHY chain guard ("zetaphy-guard" upgrade; docs/ANTI-ROLLBACK-CHAIN.md).
++//
++// Four protocol rules against crypto downgrade and takeover, all kept in the
++// zetaphypq store (no new store) and set by governance through MsgSetFuture:
++//
++//   - Signature algorithms (T): an on-chain list of the account signature
++//     algorithms this binary knows (secp256k1, eth_secp256k1, mldsa44) with a
++//     version that only goes up. Governance may retire an algorithm (its
++//     signatures are refused from then on, in Cosmos txs, multisig sub-keys
++//     and Ethereum txs) and may enable one that is not retired; a retired
++//     algorithm can never be enabled again, and mldsa44 (the only
++//     post-quantum one) cannot be retired. Once Q-day has passed, MsgSetQDay
++//     is refused: it could only bring ECDSA back. Quantum locks stay as they
++//     are: no message unlocks one, and control only moves to another ML-DSA-44
++//     account (checkPQController).
++//   - Voting-power cap (S): no delegation or self-bond may take a validator
++//     above max_bps of the active set's power (default 3333, under 1/3),
++//     checked only while the active set has at least 4 validators, so a 1-,
++//     2- or 3-validator chain (the testnet, CI devnets) is never refused.
++//     Staking hooks see every path (Cosmos messages, authz, the staking
++//     precompile, gentxs). Only additions are checked: undelegating from, or
++//     slashing, a validator above the cap is never blocked.
++//   - Circuit breaker (S): governance names a circuit authority, which must be
++//     a multisig account (threshold >= 2 of >= 2 keys, checked from its
++//     on-chain public key when it acts); it or governance trips or resets
++//     message types. A tripped type fails in every path the message router
++//     serves (top-level txs, authz MsgExec, governance proposals, ICA), and
++//     is refused at CheckTx. Governance, upgrade, unjail and the chain's own
++//     consensus messages (certificates, vote extensions, vote keys,
++//     MsgSetFuture) can never be tripped, so governance can always reset it.
++//     From the zetaphy-shield height more types are protected and the
++//     authority's trips lapse (setCircuitShield, zetaphy_shield.go).
++//   - Constitution (P): off by default. When governance turns it on, the
++//     values in force become floors (or ceilings) that later proposals cannot
++//     cross, checked when a proposal is submitted (Cosmos txs) and again when
++//     it executes (every path): no wasm sudo (arbitrary contract state and
++//     balances); no higher inflation, max supply or lower blocks-per-year
++//     (arbitrary mint); no change of the bond, mint or EVM denom (rewrites
++//     balances); no shorter unbonding, voting periods, Q-day reveal delay or
++//     IBC hold delay, no lower quorum, thresholds or double-sign slash
++//     (timelocks and guards); no higher or removed power cap; and the
++//     constitution itself cannot be turned off.
++//
++// Activation: "zetaphy-guard" sets key 0x40 to the upgrade height + 1 (a new
++// chain may carry 0x40 in genesis). Below it every path above returns
++// exactly what the binary without it returned, reading 0x40 without gas, so
++// the upgrade may run early (zetaphyEarlyUpgrades) and a mixed old/new
++// validator set agrees on every block before the height. It needs v5
++// (MsgSetFuture).
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"sort"
++	"strings"
++	"time"
++
++	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
++	gogoproto "github.com/cosmos/gogoproto/proto"
++
++	errorsmod "cosmossdk.io/errors"
++	sdkmath "cosmossdk.io/math"
++
++	"github.com/cosmos/cosmos-sdk/baseapp"
++	"github.com/cosmos/cosmos-sdk/crypto/keys/multisig"
++	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
++	cryptotypes "github.com/cosmos/cosmos-sdk/crypto/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	"github.com/cosmos/cosmos-sdk/types/module"
++	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
++	"github.com/cosmos/cosmos-sdk/x/authz"
++	govv1 "github.com/cosmos/cosmos-sdk/x/gov/types/v1"
++	minttypes "github.com/cosmos/cosmos-sdk/x/mint/types"
++	slashingtypes "github.com/cosmos/cosmos-sdk/x/slashing/types"
++	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
++	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
++
++	"github.com/cosmos/evm/crypto/ethsecp256k1"
++	"github.com/cosmos/evm/crypto/mldsa44"
++	evmtypes "github.com/cosmos/evm/x/vm/types"
++)
++
++// ZetaphyGuardUpgradeName turns the chain guard on for a running chain.
++const ZetaphyGuardUpgradeName = "zetaphy-guard"
++
++// Keys of the zetaphypq store used by the chain guard.
++var (
++	guardHeightKey   = []byte{0x40} // height (8) from which the chain guard applies
++	sigAlgosKey      = []byte{0x41} // sigAlgos (JSON)
++	powerCapKey      = []byte{0x42} // max share of the active set's power, bps (8); absent: powerCapDefaultBps
++	circuitAuthKey   = []byte{0x43} // circuit authority (20)
++	circuitTripPfx   = byte(0x44)   // || message type URL -> height it was tripped (8)
++	constitutionKey  = []byte{0x45} // constitution (JSON)
++	powerStashPfx    = byte(0x46)   // || validator (20) -> its tokens before a delegation change (scratch, never committed)
++	powerCapDefault  = uint64(3333)
++	circuitTripMax   = 32
++	sigAlgoMLDSA44   = "mldsa44"
++	sigAlgoEth       = "eth_secp256k1"
++	sigAlgoSecp      = "secp256k1"
++	sigAlgosKnown    = []string{sigAlgoEth, sigAlgoMLDSA44, sigAlgoSecp} // sorted
++	sigAlgosPQ       = map[string]bool{sigAlgoMLDSA44: true}
++	circuitProtected = []string{"/cosmos.gov.", "/cosmos.upgrade.", "/zetaphy.pq.v1.MsgSetFuture", "/zetaphy.pq.v1.MsgPQCertificate",
++		"/zetaphy.pq.v1.MsgZXVotes", "/zetaphy.pq.v1.MsgPQVoteKey", "/cosmos.slashing.v1beta1.MsgUnjail", "/cosmos.consensus."}
++)
++
++// guardKeyKnown: chain-guard prefixes a genesis may carry (not the scratch 0x46).
++func guardKeyKnown(p byte) bool { return p >= 0x40 && p <= 0x45 }
++
++// Errors of the chain guard (codespace "zetaphy").
++var (
++	ErrSigAlgo      = errorsmod.Register("zetaphy", 41, "signature algorithm retired")
++	ErrPowerCap     = errorsmod.Register("zetaphy", 42, "voting power cap")
++	ErrCircuit      = errorsmod.Register("zetaphy", 43, "circuit breaker")
++	ErrConstitution = errorsmod.Register("zetaphy", 44, "constitution")
++)
++
++func (app *EVMD) guardHeight(ctx sdk.Context) int64 {
++	return int64(readU64(app.secRaw(ctx).Get(guardHeightKey))) // #nosec G115 -- block heights
++}
++
++func (app *EVMD) setGuardHeight(ctx sdk.Context, h int64) {
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(guardHeightKey, u64(uint64(h))) // #nosec G115 -- block heights
++}
++
++// guardActive: this block runs with the chain guard (read without gas).
++func (app *EVMD) guardActive(ctx sdk.Context) bool {
++	a := app.guardHeight(ctx)
++	return a > 0 && ctx.BlockHeight() >= a && app.futV5(ctx, ctx.BlockHeight())
++}
++
++// registerZetaphyGuard (from registerZetaphyUpgrades): "zetaphy-guard" makes
++// the chain guard exist from the block after the upgrade. No store is added.
++func (app *EVMD) registerZetaphyGuard() {
++	app.UpgradeKeeper.SetUpgradeHandler(ZetaphyGuardUpgradeName,
++		func(c context.Context, _ upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
++			ctx := sdk.UnwrapSDKContext(c)
++			if a := app.guardHeight(ctx); a == 0 || a > ctx.BlockHeight()+1 {
++				app.setGuardHeight(ctx, ctx.BlockHeight()+1)
++			}
++			ctx.Logger().Info("ZETAPHY chain guard scheduled (algorithm list, power cap, circuit breaker; constitution off)", "from_height", ctx.BlockHeight()+1)
++			return app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
++		})
++}
++
++// ---- governance kinds of MsgSetFuture
++
++// setGuardKind handles the chain-guard kinds; done is false for any other
++// kind (setFuture goes on as before). Called only while guardActive.
++func (app *EVMD) setGuardKind(ctx sdk.Context, m *MsgSetFuture) (done bool, res gogoproto.Message, err error) {
++	gov := m.Authority == govAuthority()
++	switch m.Kind {
++	case "sig-algos", "power-cap", "circuit-authority", "constitution":
++		if !gov {
++			return true, nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only governance can change chain-guard settings")
++		}
++	case "circuit-trip", "circuit-reset":
++		if !gov {
++			if err := app.checkCircuitAuthority(ctx, m.Authority); err != nil {
++				return true, nil, err
++			}
++		}
++	default:
++		return false, nil, nil
++	}
++	switch m.Kind {
++	case "sig-algos":
++		err = app.setSigAlgos(ctx, m.Data)
++	case "power-cap":
++		err = app.setPowerCap(ctx, m.Data)
++	case "circuit-authority":
++		err = app.setCircuitAuthority(ctx, m.Data)
++	case "circuit-trip", "circuit-reset":
++		if app.shieldActive(ctx) {
++			err = app.setCircuitShield(ctx, m.Kind == "circuit-trip", gov, m.Data) // zetaphy_shield.go
++		} else {
++			err = app.setCircuit(ctx, m.Kind == "circuit-trip", m.Data)
++		}
++	case "constitution":
++		err = app.setConstitution(ctx, m.Data)
++	}
++	if err != nil {
++		return true, nil, err
++	}
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_guard_set", sdk.NewAttribute("kind", m.Kind),
++		sdk.NewAttribute("authority", m.Authority), sdk.NewAttribute("data", string(m.Data))))
++	return true, &MsgPQResponse{}, nil
++}
++
++// ---- T: signature algorithms
++
++type sigAlgos struct {
++	Version uint64   `json:"version"`
++	Enabled []string `json:"enabled"`
++	Retired []string `json:"retired"`
++}
++
++func (app *EVMD) sigAlgos(ctx sdk.Context) sigAlgos {
++	var s sigAlgos
++	if bz := app.secRaw(ctx).Get(sigAlgosKey); len(bz) == 0 || json.Unmarshal(bz, &s) != nil {
++		return sigAlgos{Enabled: append([]string{}, sigAlgosKnown...), Retired: []string{}}
++	}
++	return s
++}
++
++func strIn(xs []string, x string) bool {
++	for _, y := range xs {
++		if y == x {
++			return true
++		}
++	}
++	return false
++}
++
++func sortedSet(xs []string) []string {
++	out := []string{}
++	for _, x := range xs {
++		if !strIn(out, x) {
++			out = append(out, x)
++		}
++	}
++	sort.Strings(out)
++	return out
++}
++
++// setSigAlgos: {"version": current+1, "enable": [...], "retire": [...]}.
++func (app *EVMD) setSigAlgos(ctx sdk.Context, data []byte) error {
++	var in struct {
++		Version uint64   `json:"version"`
++		Enable  []string `json:"enable"`
++		Retire  []string `json:"retire"`
++	}
++	if err := futJSON(data, &in); err != nil {
++		return err
++	}
++	cur := app.sigAlgos(ctx)
++	if in.Version != cur.Version+1 {
++		return errorsmod.Wrapf(ErrSigAlgo, "version must be %d (the list only moves forward, one version at a time)", cur.Version+1)
++	}
++	if len(in.Enable)+len(in.Retire) == 0 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "sig-algos: nothing to enable or retire")
++	}
++	en, ret := append([]string{}, cur.Enabled...), append([]string{}, cur.Retired...)
++	for _, a := range in.Enable {
++		switch {
++		case !strIn(sigAlgosKnown, a):
++			return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "sig-algos: %q is not an algorithm this binary can verify (%s)", a, strings.Join(sigAlgosKnown, ", "))
++		case strIn(cur.Retired, a) || strIn(in.Retire, a):
++			return errorsmod.Wrapf(ErrSigAlgo, "%q is retired and can never be enabled again", a)
++		}
++		en = append(en, a)
++	}
++	for _, a := range in.Retire {
++		switch {
++		case !strIn(sigAlgosKnown, a):
++			return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "sig-algos: unknown algorithm %q", a)
++		case sigAlgosPQ[a]:
++			return errorsmod.Wrapf(ErrSigAlgo, "%q is the chain's post-quantum algorithm (quantum locks and Q-day rely on it); it cannot be retired", a)
++		}
++		ret = append(ret, a)
++		for i := 0; i < len(en); i++ {
++			if en[i] == a {
++				en = append(en[:i], en[i+1:]...)
++				i--
++			}
++		}
++	}
++	next := sigAlgos{Version: in.Version, Enabled: sortedSet(en), Retired: sortedSet(ret)}
++	pq := false
++	for _, a := range next.Enabled {
++		pq = pq || sigAlgosPQ[a]
++	}
++	if !pq {
++		return errorsmod.Wrap(ErrSigAlgo, "at least one post-quantum algorithm must stay enabled")
++	}
++	bz, _ := json.Marshal(next)
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(sigAlgosKey, bz)
++	return nil
++}
++
++// sigAlgoOf: the algorithm of an account key (multisig: each sub-key).
++func sigAlgoOf(pk cryptotypes.PubKey) []string {
++	switch k := pk.(type) {
++	case *ethsecp256k1.PubKey:
++		return []string{sigAlgoEth}
++	case *secp256k1.PubKey:
++		return []string{sigAlgoSecp}
++	case *mldsa44.PubKey:
++		return []string{sigAlgoMLDSA44}
++	case *multisig.LegacyAminoPubKey:
++		var out []string
++		for _, sub := range k.GetPubKeys() {
++			out = append(out, sigAlgoOf(sub)...)
++		}
++		return out
++	}
++	return nil
++}
++
++// sigAlgoCheckTx is the algorithm rule in the ante handler (after the normal
++// checks, so every signer's public key is on its account).
++func (app *EVMD) sigAlgoCheckTx(ctx sdk.Context, tx sdk.Tx) error {
++	s := app.sigAlgos(ctx)
++	if len(s.Retired) == 0 {
++		return nil
++	}
++	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
++	for i := 0; i < len(msgs); i++ {
++		switch m := msgs[i].(type) {
++		case *evmtypes.MsgEthereumTx:
++			if strIn(s.Retired, sigAlgoEth) {
++				return errorsmod.Wrapf(ErrSigAlgo, "%s is retired (list version %d): Ethereum transactions are refused", sigAlgoEth, s.Version)
++			}
++		case *authz.MsgExec:
++			inner, err := m.GetMessages()
++			if err != nil {
++				return err
++			}
++			msgs = append(msgs, inner...)
++		}
++	}
++	st, ok := tx.(authsigning.SigVerifiableTx)
++	if !ok {
++		return nil
++	}
++	signers, err := st.GetSigners()
++	if err != nil {
++		return err
++	}
++	for _, a := range signers {
++		acc := app.AccountKeeper.GetAccount(ctx, a)
++		if acc == nil || acc.GetPubKey() == nil {
++			continue
++		}
++		for _, alg := range sigAlgoOf(acc.GetPubKey()) {
++			if strIn(s.Retired, alg) {
++				return errorsmod.Wrapf(ErrSigAlgo, "%s signs with %s, which is retired (list version %d); a migrated account acts through its ML-DSA-44 controller", sdk.AccAddress(a), alg, s.Version)
++			}
++		}
++	}
++	return nil
++}
++
++// qdayGuard: once Q-day has passed, MsgSetQDay could only bring ECDSA back
++// (unschedule it, or move it later), so it is refused.
++func (app *EVMD) qdayGuard(ctx sdk.Context) error {
++	if !app.guardActive(ctx) || !app.qdayActive(ctx) {
++		return nil
++	}
++	q, _ := app.qdayParams(ctx)
++	return errorsmod.Wrapf(ErrSigAlgo, "Q-day passed at block %d: it cannot be unscheduled or moved, ECDSA stays untrusted", q)
++}
++
++// ---- S: voting-power cap
++
++func (app *EVMD) powerCapBps(ctx sdk.Context) uint64 {
++	v := app.secRaw(ctx).Get(powerCapKey)
++	if len(v) != 8 {
++		return powerCapDefault
++	}
++	return readU64(v)
++}
++
++// setPowerCap: {"max_bps": 1..10000, or 0 to turn the cap off}.
++func (app *EVMD) setPowerCap(ctx sdk.Context, data []byte) error {
++	var in struct {
++		MaxBps uint64 `json:"max_bps"`
++	}
++	if err := futJSON(data, &in); err != nil {
++		return err
++	}
++	if in.MaxBps > 10000 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "power-cap: max_bps is 0 (off) to 10000")
++	}
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(powerCapKey, u64(in.MaxBps))
++	return nil
++}
++
++func powerStashKey(val []byte) []byte { return append([]byte{powerStashPfx}, val...) }
++
++// powerCapHooks: staking hooks that refuse a delegation change taking a
++// validator above the cap. The tokens before the change are kept in a
++// scratch key (gasless, deleted in the same message) so that only additions
++// are checked.
++type powerCapHooks struct{ app *EVMD }
++
++var _ stakingtypes.StakingHooks = powerCapHooks{}
++
++func (h powerCapHooks) on(ctx sdk.Context) bool {
++	return h.app.guardActive(ctx) && h.app.powerCapBps(ctx) > 0
++}
++
++func (h powerCapHooks) stash(c context.Context, val sdk.ValAddress) error {
++	ctx := sdk.UnwrapSDKContext(c)
++	if !h.on(ctx) {
++		return nil
++	}
++	v, err := h.app.StakingKeeper.GetValidator(ctx, val)
++	if err != nil {
++		return nil //nolint:nilerr // a validator the staking keeper is about to refuse
++	}
++	bz, err := v.Tokens.Marshal()
++	if err != nil {
++		return err
++	}
++	h.app.secRaw(ctx).Set(powerStashKey(val), bz)
++	return nil
++}
++
++func (h powerCapHooks) BeforeDelegationCreated(c context.Context, _ sdk.AccAddress, val sdk.ValAddress) error {
++	return h.stash(c, val)
++}
++
++func (h powerCapHooks) BeforeDelegationSharesModified(c context.Context, _ sdk.AccAddress, val sdk.ValAddress) error {
++	return h.stash(c, val)
++}
++
++func (h powerCapHooks) BeforeDelegationRemoved(c context.Context, _ sdk.AccAddress, val sdk.ValAddress) error {
++	if raw := h.app.secRaw(sdk.UnwrapSDKContext(c)); raw.Has(powerStashKey(val)) { // never touch the store otherwise
++		raw.Delete(powerStashKey(val))
++	}
++	return nil
++}
++
++func (h powerCapHooks) AfterDelegationModified(c context.Context, _ sdk.AccAddress, val sdk.ValAddress) error {
++	ctx := sdk.UnwrapSDKContext(c)
++	raw := h.app.secRaw(ctx)
++	before := raw.Get(powerStashKey(val))
++	if before == nil {
++		return nil
++	}
++	raw.Delete(powerStashKey(val))
++	if !h.on(ctx) {
++		return nil
++	}
++	var was sdkmath.Int
++	if err := was.Unmarshal(before); err != nil {
++		return err
++	}
++	return h.app.powerCapCheck(ctx, val, was)
++}
++
++// powerCapCheck: val's tokens grew from was; refuse if it is now above the cap
++// of an active set of at least 4 validators.
++func (app *EVMD) powerCapCheck(ctx sdk.Context, val sdk.ValAddress, was sdkmath.Int) error {
++	v, err := app.StakingKeeper.GetValidator(ctx, val)
++	if err != nil || !v.Tokens.GT(was) {
++		return nil //nolint:nilerr // no growth: nothing to check
++	}
++	set, err := app.StakingKeeper.GetLastValidators(ctx)
++	if err != nil {
++		return err
++	}
++	if len(set) < 4 {
++		return nil
++	}
++	total, in := sdkmath.ZeroInt(), false
++	for _, s := range set {
++		if s.GetOperator() == v.GetOperator() {
++			in = true
++			total = total.Add(v.Tokens)
++			continue
++		}
++		total = total.Add(s.Tokens)
++	}
++	if !in {
++		total = total.Add(v.Tokens)
++	}
++	capBps := app.powerCapBps(ctx)
++	if total.IsPositive() && v.Tokens.MulRaw(10000).GT(total.Mul(sdkmath.NewIntFromUint64(capBps))) {
++		share := v.Tokens.MulRaw(10000).Quo(total)
++		return errorsmod.Wrapf(ErrPowerCap, "validator %s would hold %s bps of the active set's power (cap %d bps, %d validators): delegate to another validator", v.GetOperator(), share, capBps, len(set))
++	}
++	return nil
++}
++
++func (powerCapHooks) AfterValidatorCreated(context.Context, sdk.ValAddress) error   { return nil }
++func (powerCapHooks) BeforeValidatorModified(context.Context, sdk.ValAddress) error { return nil }
++func (powerCapHooks) AfterValidatorRemoved(context.Context, sdk.ConsAddress, sdk.ValAddress) error {
++	return nil
++}
++func (powerCapHooks) AfterValidatorBonded(context.Context, sdk.ConsAddress, sdk.ValAddress) error {
++	return nil
++}
++func (powerCapHooks) AfterValidatorBeginUnbonding(context.Context, sdk.ConsAddress, sdk.ValAddress) error {
++	return nil
++}
++func (powerCapHooks) BeforeValidatorSlashed(context.Context, sdk.ValAddress, sdkmath.LegacyDec) error {
++	return nil
++}
++func (powerCapHooks) AfterUnbondingInitiated(context.Context, uint64) error { return nil }
++
++// ---- S: circuit breaker
++
++func circuitTripKey(typeURL string) []byte { return append([]byte{circuitTripPfx}, typeURL...) }
++
++// setCircuitAuthority: {"address":"zetaphy1…"} ("" removes it).
++func (app *EVMD) setCircuitAuthority(ctx sdk.Context, data []byte) error {
++	var in struct {
++		Address string `json:"address"`
++	}
++	if err := futJSON(data, &in); err != nil {
++		return err
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if in.Address == "" {
++		st.Delete(circuitAuthKey)
++		return nil
++	}
++	a, err := pqAddr(in.Address)
++	if err != nil || len(a) != 20 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "circuit-authority: address: a zetaphy1… or 0x… account, or \"\"")
++	}
++	if isGovAddr(in.Address) {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "circuit-authority: governance can always trip and reset; name a multisig")
++	}
++	st.Set(circuitAuthKey, a)
++	return nil
++}
++
++// checkCircuitAuthority: signer is the circuit authority, and it is a
++// multisig (threshold >= 2 of >= 2 distinct keys), never a single key.
++func (app *EVMD) checkCircuitAuthority(ctx sdk.Context, signer string) error {
++	a, err := pqAddr(signer)
++	auth := app.secRaw(ctx).Get(circuitAuthKey)
++	if err != nil || auth == nil || !bytes.Equal(a, auth) {
++		return errorsmod.Wrap(errortypes.ErrUnauthorized, "only governance or the circuit authority can trip or reset the circuit breaker")
++	}
++	if app.shieldActive(ctx) && !shieldSignedBy(ctx, a) { // zetaphy_shield.go
++		return errorsmod.Wrap(ErrCircuit, "the circuit authority must sign the transaction itself (not through authz or a contract)")
++	}
++	acc := app.AccountKeeper.GetAccount(ctx, a)
++	var pk cryptotypes.PubKey
++	if acc != nil {
++		pk = acc.GetPubKey()
++	}
++	ms, ok := pk.(*multisig.LegacyAminoPubKey)
++	if !ok || ms.Threshold < 2 || len(ms.GetPubKeys()) < 2 {
++		return errorsmod.Wrap(ErrCircuit, "the circuit authority must be a multisig with a threshold of at least 2 (a single key cannot trip the breaker)")
++	}
++	seen := map[string]bool{}
++	for _, k := range ms.GetPubKeys() {
++		if seen[string(k.Bytes())] {
++			return errorsmod.Wrap(ErrCircuit, "the circuit authority's multisig repeats a key")
++		}
++		seen[string(k.Bytes())] = true
++	}
++	return nil
++}
++
++func circuitIsProtected(typeURL string) bool {
++	for _, p := range circuitProtected {
++		if typeURL == p || (strings.HasSuffix(p, ".") && strings.HasPrefix(typeURL, p)) {
++			return true
++		}
++	}
++	return false
++}
++
++// setCircuit: {"msgs":["/cosmos.bank.v1beta1.MsgSend", ...]}.
++func (app *EVMD) setCircuit(ctx sdk.Context, trip bool, data []byte) error {
++	var in struct {
++		Msgs []string `json:"msgs"`
++	}
++	if err := futJSON(data, &in); err != nil {
++		return err
++	}
++	if len(in.Msgs) == 0 || len(in.Msgs) > circuitTripMax {
++		return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "circuit: 1 to %d message type URLs", circuitTripMax)
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	for _, u := range in.Msgs {
++		if !trip {
++			st.Delete(circuitTripKey(u))
++			continue
++		}
++		if app.MsgServiceRouter().HandlerByTypeURL(u) == nil {
++			return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "circuit: %q is not a message this chain routes", u)
++		}
++		if circuitIsProtected(u) {
++			return errorsmod.Wrapf(ErrCircuit, "%s cannot be tripped (governance, upgrades and the chain's consensus messages stay available)", u)
++		}
++		st.Set(circuitTripKey(u), u64(uint64(ctx.BlockHeight()))) // #nosec G115 -- block heights
++	}
++	return nil
++}
++
++// zetaphyCircuit is the message router's circuit breaker (baseapp.CircuitBreaker).
++type zetaphyCircuit struct{ app *EVMD }
++
++func (c zetaphyCircuit) IsAllowed(goCtx context.Context, typeURL string) (bool, error) {
++	ctx := sdk.UnwrapSDKContext(goCtx)
++	if !c.app.guardActive(ctx) || !c.app.secRaw(ctx).Has(circuitTripKey(typeURL)) {
++		return true, nil
++	}
++	if c.app.shieldActive(ctx) && !c.app.circuitTripInForce(ctx, typeURL) { // zetaphy_shield.go
++		return true, nil
++	}
++	return false, errorsmod.Wrapf(ErrCircuit, "%s is tripped by the circuit breaker", typeURL)
++}
++
++// circuitCheckTx refuses tripped messages at CheckTx (they would fail in the
++// block anyway; this keeps them out of it).
++func (app *EVMD) circuitCheckTx(ctx sdk.Context, tx sdk.Tx) error {
++	c := zetaphyCircuit{app}
++	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
++	for i := 0; i < len(msgs); i++ {
++		if ok, err := c.IsAllowed(ctx, sdk.MsgTypeURL(msgs[i])); !ok {
++			return err
++		}
++		if ex, ok := msgs[i].(*authz.MsgExec); ok {
++			inner, err := ex.GetMessages()
++			if err != nil {
++				return err
++			}
++			msgs = append(msgs, inner...)
++		}
++	}
++	return nil
++}
++
++// ---- P: constitution
++
++type constitution struct {
++	Enabled               bool          `json:"enabled"`
++	Since                 int64         `json:"since"`
++	UnbondingTime         time.Duration `json:"unbonding_time"`
++	BondDenom             string        `json:"bond_denom"`
++	VotingPeriod          time.Duration `json:"voting_period"`
++	ExpeditedVotingPeriod time.Duration `json:"expedited_voting_period"`
++	Quorum                string        `json:"quorum"`
++	Threshold             string        `json:"threshold"`
++	VetoThreshold         string        `json:"veto_threshold"`
++	ExpeditedThreshold    string        `json:"expedited_threshold"`
++	MintDenom             string        `json:"mint_denom"`
++	InflationMax          string        `json:"inflation_max"`
++	InflationMin          string        `json:"inflation_min"`
++	InflationRateChange   string        `json:"inflation_rate_change"`
++	BlocksPerYear         uint64        `json:"blocks_per_year"`
++	MaxSupply             string        `json:"max_supply"`
++	SlashDoubleSign       string        `json:"slash_fraction_double_sign"`
++	EvmDenom              string        `json:"evm_denom"`
++	PowerCapBps           uint64        `json:"power_cap_bps"`
++	QDayRevealDelay       int64         `json:"qday_reveal_delay"`
++	HoldDelaySeconds      uint64        `json:"ibc_hold_delay_seconds"`
++}
++
++func (app *EVMD) constitution(ctx sdk.Context) (constitution, bool) {
++	var c constitution
++	bz := app.secRaw(ctx).Get(constitutionKey)
++	if len(bz) == 0 || json.Unmarshal(bz, &c) != nil {
++		return constitution{}, false
++	}
++	return c, c.Enabled
++}
++
++func durOf(d *time.Duration) time.Duration {
++	if d == nil {
++		return 0
++	}
++	return *d
++}
++
++// setConstitution: {"enabled":true}. The values in force become the floors.
++// Once on, it cannot be changed or turned off by governance.
++func (app *EVMD) setConstitution(ctx sdk.Context, data []byte) error {
++	var in struct {
++		Enabled bool `json:"enabled"`
++	}
++	if err := futJSON(data, &in); err != nil {
++		return err
++	}
++	if _, on := app.constitution(ctx); on {
++		return errorsmod.Wrap(ErrConstitution, "the constitution is in force: governance cannot change or turn it off")
++	}
++	if !in.Enabled {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "constitution: it is off already")
++	}
++	sp, err := app.StakingKeeper.GetParams(ctx)
++	if err != nil {
++		return err
++	}
++	gp, err := app.GovKeeper.Params.Get(ctx)
++	if err != nil {
++		return err
++	}
++	mp, err := app.MintKeeper.Params.Get(ctx)
++	if err != nil {
++		return err
++	}
++	slp, err := app.SlashingKeeper.GetParams(ctx)
++	if err != nil {
++		return err
++	}
++	_, qdelay := app.qdayParams(ctx)
++	c := constitution{
++		Enabled: true, Since: ctx.BlockHeight(),
++		UnbondingTime: sp.UnbondingTime, BondDenom: sp.BondDenom,
++		VotingPeriod: durOf(gp.VotingPeriod), ExpeditedVotingPeriod: durOf(gp.ExpeditedVotingPeriod),
++		Quorum: gp.Quorum, Threshold: gp.Threshold, VetoThreshold: gp.VetoThreshold, ExpeditedThreshold: gp.ExpeditedThreshold,
++		MintDenom: mp.MintDenom, InflationMax: mp.InflationMax.String(), InflationMin: mp.InflationMin.String(),
++		InflationRateChange: mp.InflationRateChange.String(), BlocksPerYear: mp.BlocksPerYear, MaxSupply: mp.MaxSupply.String(),
++		SlashDoubleSign: slp.SlashFractionDoubleSign.String(),
++		EvmDenom:        app.EVMKeeper.GetParams(ctx).EvmDenom,
++		PowerCapBps:     app.powerCapBps(ctx), QDayRevealDelay: qdelay,
++		HoldDelaySeconds: readU64(app.secRaw(ctx).Get(holdParamsKey)),
++	}
++	bz, _ := json.Marshal(c)
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(constitutionKey, bz)
++	return nil
++}
++
++func decLess(a, floor string) bool { // a < floor (unparsable counts as crossing)
++	x, err1 := sdkmath.LegacyNewDecFromStr(a)
++	f, err2 := sdkmath.LegacyNewDecFromStr(floor)
++	return err1 != nil || (err2 == nil && x.LT(f))
++}
++
++func decMore(a, ceil string) bool { // a > ceil
++	x, err1 := sdkmath.LegacyNewDecFromStr(a)
++	c, err2 := sdkmath.LegacyNewDecFromStr(ceil)
++	return err1 != nil || (err2 == nil && x.GT(c))
++}
++
++func violates(what string) error {
++	return errorsmod.Wrapf(ErrConstitution, "%s (the constitution is in force; docs/ANTI-ROLLBACK-CHAIN.md)", what)
++}
++
++// constitutionCheck: nil unless the constitution is on and msg (a governance
++// proposal's message) crosses one of its limits.
++func (app *EVMD) constitutionCheck(ctx sdk.Context, msg sdk.Msg) error {
++	if !app.guardActive(ctx) {
++		return nil
++	}
++	c, on := app.constitution(ctx)
++	if !on {
++		return nil
++	}
++	switch m := msg.(type) {
++	case *wasmtypes.MsgSudoContract:
++		return violates("governance may not run a contract's sudo entry point (it can rewrite any contract state and balance)")
++	case *stakingtypes.MsgUpdateParams:
++		if m.Params.UnbondingTime < c.UnbondingTime {
++			return violates(fmt.Sprintf("unbonding_time %s is below its floor %s", m.Params.UnbondingTime, c.UnbondingTime))
++		}
++		if m.Params.BondDenom != c.BondDenom {
++			return violates("the bond denom cannot change")
++		}
++	case *govv1.MsgUpdateParams:
++		p := m.Params
++		switch {
++		case durOf(p.VotingPeriod) < c.VotingPeriod:
++			return violates(fmt.Sprintf("voting_period %s is below its floor %s", durOf(p.VotingPeriod), c.VotingPeriod))
++		case durOf(p.ExpeditedVotingPeriod) < c.ExpeditedVotingPeriod:
++			return violates(fmt.Sprintf("expedited_voting_period %s is below its floor %s", durOf(p.ExpeditedVotingPeriod), c.ExpeditedVotingPeriod))
++		case decLess(p.Quorum, c.Quorum), decLess(p.Threshold, c.Threshold), decLess(p.VetoThreshold, c.VetoThreshold),
++			decLess(p.ExpeditedThreshold, c.ExpeditedThreshold):
++			return violates("quorum and thresholds cannot go below their floors")
++		}
++	case *minttypes.MsgUpdateParams:
++		p := m.Params
++		maxSupplyUp := false
++		if ms, ok := sdkmath.NewIntFromString(c.MaxSupply); ok && !ms.IsZero() {
++			maxSupplyUp = p.MaxSupply.IsZero() || p.MaxSupply.GT(ms)
++		}
++		switch {
++		case p.MintDenom != c.MintDenom:
++			return violates("the mint denom cannot change")
++		case decMore(p.InflationMax.String(), c.InflationMax), decMore(p.InflationMin.String(), c.InflationMin),
++			decMore(p.InflationRateChange.String(), c.InflationRateChange), p.BlocksPerYear < c.BlocksPerYear, maxSupplyUp:
++			return violates("no new mint: inflation, its rate of change and max supply cannot rise, blocks_per_year cannot fall")
++		}
++	case *slashingtypes.MsgUpdateParams:
++		if decLess(m.Params.SlashFractionDoubleSign.String(), c.SlashDoubleSign) {
++			return violates("slash_fraction_double_sign cannot go below its floor")
++		}
++	case *evmtypes.MsgUpdateParams:
++		if m.Params.EvmDenom != c.EvmDenom {
++			return violates("the EVM denom cannot change")
++		}
++	case *MsgSetQDay:
++		d := int64(m.RevealDelay) // #nosec G115 -- bounded by QDayMaxRevealDelay in setQDay
++		if d == 0 {
++			d = QDayDefaultRevealDelay
++		}
++		if d < c.QDayRevealDelay {
++			return violates(fmt.Sprintf("the Q-day reveal delay %d is below its floor %d", d, c.QDayRevealDelay))
++		}
++	case *MsgSetIBCHold:
++		if m.DelaySeconds < c.HoldDelaySeconds {
++			return violates(fmt.Sprintf("the IBC hold delay %d s is below its floor %d s", m.DelaySeconds, c.HoldDelaySeconds))
++		}
++	case *MsgSetFuture:
++		switch m.Kind {
++		case "constitution":
++			return violates("the constitution cannot be changed or turned off")
++		case "power-cap":
++			var in struct {
++				MaxBps uint64 `json:"max_bps"`
++			}
++			if err := json.Unmarshal(m.Data, &in); err == nil && c.PowerCapBps > 0 && (in.MaxBps == 0 || in.MaxBps > c.PowerCapBps) {
++				return violates(fmt.Sprintf("the voting-power cap cannot be removed or raised above %d bps", c.PowerCapBps))
++			}
++		}
++	case *authz.MsgExec:
++		inner, err := m.GetMessages()
++		if err != nil {
++			return err
++		}
++		for _, x := range inner {
++			if err := app.constitutionCheck(ctx, x); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++// constitutionCheckTx: proposals that break the constitution are refused at
++// submission (Cosmos txs; any other path is caught at execution).
++func (app *EVMD) constitutionCheckTx(ctx sdk.Context, tx sdk.Tx) error {
++	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
++	for i := 0; i < len(msgs); i++ {
++		switch m := msgs[i].(type) {
++		case *govv1.MsgSubmitProposal:
++			inner, err := m.GetMsgs()
++			if err != nil {
++				return err
++			}
++			for _, x := range inner {
++				if err := app.constitutionCheck(ctx, x); err != nil {
++					return err
++				}
++			}
++		case *authz.MsgExec:
++			inner, err := m.GetMessages()
++			if err != nil {
++				return err
++			}
++			msgs = append(msgs, inner...)
++		}
++	}
++	return nil
++}
++
++// guardCheckTx: the chain-guard rules of the ante handler (pqLockAnte).
++func (app *EVMD) guardCheckTx(ctx sdk.Context, tx sdk.Tx) error {
++	if !app.guardActive(ctx) {
++		return nil
++	}
++	if err := app.circuitCheckTx(ctx, tx); err != nil {
++		return err
++	}
++	if err := app.sigAlgoCheckTx(ctx, tx); err != nil {
++		return err
++	}
++	return app.constitutionCheckTx(ctx, tx)
++}
++
++// govGuardRouter is the router governance executes proposals through: the
++// constitution is checked on each message right before it runs.
++type govGuardRouter struct {
++	app  *EVMD
++	next baseapp.MessageRouter
++}
++
++func (r govGuardRouter) wrap(h baseapp.MsgServiceHandler) baseapp.MsgServiceHandler {
++	if h == nil {
++		return nil
++	}
++	return func(ctx sdk.Context, msg sdk.Msg) (*sdk.Result, error) {
++		if err := r.app.constitutionCheck(ctx, msg); err != nil {
++			return nil, err
++		}
++		return h(ctx, msg)
++	}
++}
++
++func (r govGuardRouter) Handler(msg sdk.Msg) baseapp.MsgServiceHandler {
++	return r.wrap(r.next.Handler(msg))
++}
++
++func (r govGuardRouter) HandlerByTypeURL(u string) baseapp.MsgServiceHandler {
++	return r.wrap(r.next.HandlerByTypeURL(u))
++}
 diff --git a/evmd/zetaphy_cosmwasm.go b/evmd/zetaphy_cosmwasm.go
 new file mode 100644
 index 0000000..a786a35
@@ -2231,6 +4829,192 @@ index 0000000..a786a35
 +		panic(fmt.Sprintf("failed to initialize pinned wasm codes: %s", err))
 +	}
 +}
+diff --git a/evmd/zetaphy_faucetpow.go b/evmd/zetaphy_faucetpow.go
+new file mode 100644
+index 0000000..796f884
+--- /dev/null
++++ b/evmd/zetaphy_faucetpow.go
+@@ -0,0 +1,180 @@
++package evmd
++
++// ZETAPHY testnet faucet behind a proof of work: zetaphy_faucetPow, for the
++// hub's "Mine testnet ZETAPHY" page. This is not mining: no block, coin or
++// reward comes from the work, and ZETAPHY stays proof of stake. The work is a
++// captcha a browser solves so one person cannot drain the faucet with many
++// addresses or internet addresses: every grant costs minutes of a computer.
++// The grant itself is zetaphy_faucet's (faucetGrant in zetaphy_rpc.go): the
++// same key and amount, the same daily cap and per-address cooldown, nothing
++// for an address that already has funds, and only through this machine's
++// https address (rpc-guard counts calls per IP).
++//
++// A proof for address A at block height h is an 8-byte nonce such that
++//
++//	sha256(chainId (8 bytes, big-endian) || hash of block h (32) || A (20) || nonce (8))
++//
++// starts with at least the difficulty's number of zero bits. h must be one of
++// the last FaucetPowMaxAge blocks (no work done in advance), the proof binds A
++// (it cannot be handed to another address), and an (address, height) pair
++// gets one grant. Nothing is stored on chain: the used pairs are kept in
++// memory and dropped once their height is too old to be used anyway.
++//
++// The difficulty is FaucetPowBits, or the number in <home>/config/faucet-pow-bits
++// (FaucetPowMinBits to FaucetPowMaxBits; read on every call, no restart).
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/binary"
++	"fmt"
++	"math/bits"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/common/hexutil"
++
++	rpctypes "github.com/cosmos/evm/rpc/types"
++)
++
++const (
++	// FaucetPowBits: 2^30 tries on average, about 2–5 minutes for a laptop
++	// browser with two threads (measured numbers in zetaphy-hub/README.md).
++	FaucetPowBits     = 30
++	FaucetPowMinBits  = 12
++	FaucetPowMaxBits  = 48
++	FaucetPowMaxAge   = 100 // blocks (about 8 minutes at 5 s a block)
++	faucetPowBitsFile = "faucet-pow-bits"
++	faucetPowProof    = "sha256(chainId as 8 bytes big-endian || hash of block `height` (eth_getBlockByNumber) || address (20 bytes) || nonce (8 bytes)) starts with `bits` zero bits"
++)
++
++type powUse struct {
++	to     common.Address
++	height uint64
++}
++
++// FaucetPowDigest is the hash a proof must start with zero bits.
++func FaucetPowDigest(chainID uint64, blockHash []byte, to common.Address, nonce []byte) [32]byte {
++	b := make([]byte, 0, 68)
++	b = binary.BigEndian.AppendUint64(b, chainID)
++	b = append(b, blockHash...)
++	b = append(b, to.Bytes()...)
++	b = append(b, nonce...)
++	return sha256.Sum256(b)
++}
++
++// powZeroBits: the leading zero bits of a hash.
++func powZeroBits(h [32]byte) int {
++	for i, x := range h {
++		if x != 0 {
++			return i*8 + bits.LeadingZeros8(x)
++		}
++	}
++	return 256
++}
++
++// faucetPowBits: the operator's difficulty file, else FaucetPowBits.
++func (a *ZetaphyAPI) faucetPowBits() int {
++	raw, err := os.ReadFile(filepath.Join(a.clientCtx.HomeDir, "config", faucetPowBitsFile))
++	if err != nil {
++		return FaucetPowBits
++	}
++	n, err := strconv.Atoi(strings.TrimSpace(string(raw)))
++	if err != nil || n < FaucetPowMinBits || n > FaucetPowMaxBits {
++		return FaucetPowBits
++	}
++	return n
++}
++
++// FaucetPowInfo: what a miner needs before it starts.
++type FaucetPowInfo struct {
++	Enabled         bool         `json:"enabled"` // the faucet has its key on this node
++	Bits            int          `json:"bits"`
++	Reward          *hexutil.Big `json:"reward"`
++	ChainID         uint64       `json:"chainId"`
++	LatestHeight    uint64       `json:"latestHeight"`
++	MaxAgeBlocks    uint64       `json:"maxAgeBlocks"`
++	RemainingToday  int          `json:"remainingToday"` // grants left today (UTC), all addresses together
++	PerDay          int          `json:"perDay"`
++	CooldownSeconds int64        `json:"cooldownSeconds"` // per address, shared with zetaphy_faucet
++	Proof           string       `json:"proof"`
++}
++
++// FaucetPowInfo (zetaphy_faucetPowInfo): the difficulty, the reward, how old
++// a proof's block may be, and today's remaining grants.
++func (a *ZetaphyAPI) FaucetPowInfo(ctx context.Context) (*FaucetPowInfo, error) {
++	latest, err := a.backend.BlockNumber(ctx)
++	if err != nil {
++		return nil, err
++	}
++	out := &FaucetPowInfo{
++		Bits: a.faucetPowBits(), Reward: (*hexutil.Big)(FaucetAmount), ChainID: a.backend.ChainConfig().ChainID.Uint64(),
++		LatestHeight: uint64(latest), MaxAgeBlocks: FaucetPowMaxAge, PerDay: FaucetPerDay,
++		CooldownSeconds: int64(faucetCooldown.Seconds()), Proof: faucetPowProof,
++	}
++	faucet.Lock()
++	defer faucet.Unlock()
++	_, err = a.faucetKey()
++	out.Enabled = err == nil
++	faucetDay(faucetNow().UTC())
++	out.RemainingToday = max(0, FaucetPerDay-faucet.count)
++	return out, nil
++}
++
++// FaucetPow (zetaphy_faucetPow) sends FaucetAmount to address for a proof of
++// work at a recent block (see the top of this file).
++func (a *ZetaphyAPI) FaucetPow(ctx context.Context, address string, height hexutil.Uint64, nonce hexutil.Bytes) (*FaucetResult, error) {
++	addr, err := parseAccount(address)
++	if err != nil {
++		return nil, fmt.Errorf("invalid address: %w", err)
++	}
++	to := common.BytesToAddress(addr)
++	if err := faucetPeerOK(ctx); err != nil {
++		return nil, err
++	}
++	if len(nonce) != 8 {
++		return nil, fmt.Errorf("nonce: 8 bytes (0x and 16 hex digits)")
++	}
++	n, err := a.backend.BlockNumber(ctx)
++	if err != nil {
++		return nil, err
++	}
++	latest, h := uint64(n), uint64(height)
++	if h == 0 || h > latest {
++		return nil, fmt.Errorf("block %d is not there yet (latest %d)", h, latest)
++	}
++	if latest-h >= FaucetPowMaxAge {
++		return nil, fmt.Errorf("the proof's block %d is too old: use one of the last %d blocks (latest %d)", h, FaucetPowMaxAge, latest)
++	}
++	blk, err := a.backend.CometBlockByNumber(ctx, rpctypes.BlockNumber(h)) // #nosec G115 -- block heights
++	if err != nil || blk == nil || blk.Block == nil || len(blk.BlockID.Hash) != 32 {
++		return nil, fmt.Errorf("block %d not found", h)
++	}
++	need := a.faucetPowBits()
++	if got := powZeroBits(FaucetPowDigest(a.backend.ChainConfig().ChainID.Uint64(), blk.BlockID.Hash, to, nonce)); got < need {
++		return nil, fmt.Errorf("the proof has %d leading zero bits; %d are needed", got, need)
++	}
++	faucet.Lock()
++	defer faucet.Unlock()
++	if faucet.powUsed == nil {
++		faucet.powUsed = map[powUse]uint64{}
++	}
++	for k, kh := range faucet.powUsed {
++		if kh+FaucetPowMaxAge <= latest {
++			delete(faucet.powUsed, k)
++		}
++	}
++	use := powUse{to, h}
++	if _, used := faucet.powUsed[use]; used {
++		return nil, fmt.Errorf("this proof was used already; mine a new one")
++	}
++	res, err := a.faucetGrant(ctx, to)
++	if err != nil {
++		return nil, err
++	}
++	faucet.powUsed[use] = h
++	return res, nil
++}
 diff --git a/evmd/zetaphy_feeburn.go b/evmd/zetaphy_feeburn.go
 new file mode 100644
 index 0000000..a68e4a1
@@ -2320,12 +5104,2013 @@ index 0000000..a68e4a1
 +	write()
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_dead_burn", sdk.NewAttribute("amount", coins.String())))
 +}
+diff --git a/evmd/zetaphy_firewall.go b/evmd/zetaphy_firewall.go
+new file mode 100644
+index 0000000..35ef973
+--- /dev/null
++++ b/evmd/zetaphy_firewall.go
+@@ -0,0 +1,325 @@
++package evmd
++
++// ZETAPHY invariant firewall, node layer (docs/CHAIN-FIREWALL.md).
++//
++// After every successful EVM transaction (pqHooks.PostTxProcessing, whose
++// error reverts the whole transaction in x/vm's ApplyTransaction) and every
++// successful MsgEVMCall, the node checks the invariants of every protocol on
++// the chain-layer list of the InvariantFirewall contract governance named,
++// on the state the transaction left. If one that held at the last check point
++// does not hold now, the transaction fails with ErrInvariantFirewall and its
++// state is discarded, whichever contract the attacker went through.
++//
++// Off by default, in two steps, never by a binary swap alone:
++//
++//  1. the "zetaphy-firewall" software upgrade (or key 0x33 in a new chain's
++//     genesis) sets the height from which the code path exists at all; below
++//     it this binary runs blocks exactly as the previous one;
++//  2. governance points the chain at an InvariantFirewall contract:
++//     MsgSetFuture kind "invariant-firewall" {"address":"0x…"}
++//     (zetaphyd tx security-proposal invariant-firewall <0x…>), or key 0x31 in
++//     genesis. {"address":""} (or "-") turns it off again.
++//
++// How a check runs (deterministic, the same on every validator):
++//
++//   - The registry is read with two kinds of STATICCALL, each with
++//     firewallReadGas: chainProtocols() (at most 8 protocols) and, per
++//     protocol in list order, invariantsOf(p) (at most 8 invariants, caps in
++//     5,000..500,000). The answers are decoded strictly
++//     (zetaphy_firewall_core.go).
++//   - Each checker is called the way the contract layer calls it: STATICCALL
++//     holds(p) from the "zetaphy-firewall" module address with exactly its gas
++//     cap. Fail-closed: false, a revert, out of gas, or any answer that is
++//     not exactly 32 bytes encoding true is a violation. The first violation
++//     of a protocol ends its checks.
++//   - All checker caps of one check together are bounded by
++//     firewallTxGasBudget (2,000,000, CHAIN_GAS_BUDGET); a protocol whose
++//     checks do not fit in what is left counts as broken. So one transaction
++//     costs the node at most 9 reads + 2,000,000 gas of EVM work.
++//   - The calls run on a cache of the transaction's state that is never
++//     written back, with an infinite gas meter and no KV gas (the gas is the
++//     EVM gas above; PostTxProcessing hooks charge the tx nothing in
++//     cosmos/evm). No wall clock, no map iteration: block time and height
++//     come from the header, and every loop is over a slice in registry order.
++//
++// Check points: what is broken at the start of each block (BeginBlocker) and
++// after each transaction that passes is stored under 0x32. A transaction is
++// reverted only for a protocol that is broken now and was not broken at the
++// last check point: this transaction broke it. A protocol that broke some
++// other way (time passed, a non-EVM message, a checker that changed its
++// answer) does not revert every transaction of the chain; it is reported in
++// the zetaphy_firewall_broken event of each check point instead.
++//
++// A registry that cannot be read at all (chainProtocols reverts, runs out of
++// its gas, or answers garbage; the contract is gone) fails OPEN, with a
++// zetaphy_firewall_error event: a broken registry must not halt the chain.
++// Everything per protocol and per checker fails closed.
++
++import (
++	"context"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"math/big"
++	"strings"
++
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core"
++	"github.com/ethereum/go-ethereum/core/tracing"
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++	"github.com/ethereum/go-ethereum/crypto"
++
++	errorsmod "cosmossdk.io/errors"
++
++	"github.com/cosmos/evm/x/vm/statedb"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	"github.com/cosmos/cosmos-sdk/types/module"
++	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
++	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
++)
++
++// Keys of the zetaphypq store (after v5's 0x20..0x30).
++var (
++	firewallKey       = []byte{0x31} // the InvariantFirewall contract, EVM address (20)
++	firewallBaseKey   = []byte{0x32} // protocols broken at the last check point (20 bytes each)
++	firewallHeightKey = []byte{0x33} // height (8) from which the node layer exists ("zetaphy-firewall")
++)
++
++// ZetaphyFirewallUpgradeName adds the node-level invariant firewall to a
++// running chain (from the next block). It only sets 0x33: the firewall stays
++// off until governance names an InvariantFirewall contract.
++const ZetaphyFirewallUpgradeName = "zetaphy-firewall"
++
++// FirewallCaller is the "from" of every firewall call: a module address (no key).
++var FirewallCaller = common.BytesToAddress(authtypes.NewModuleAddress("zetaphy-firewall"))
++
++// ErrInvariantFirewall: a transaction broke a chain-layer protocol's invariant (codespace "zetaphy", code 40).
++var ErrInvariantFirewall = errorsmod.Register("zetaphy", 40, "invariant firewall")
++
++var (
++	firewallSelChainProtocols = crypto.Keccak256([]byte("chainProtocols()"))[:4]
++	firewallSelInvariantsOf   = crypto.Keccak256([]byte("invariantsOf(address)"))[:4]
++	firewallSelHolds          = crypto.Keccak256([]byte("holds(address)"))[:4]
++)
++
++func (app *EVMD) firewallHeight(ctx sdk.Context) int64 {
++	return int64(readU64(app.secRaw(ctx).Get(firewallHeightKey))) // #nosec G115 -- block heights
++}
++
++func (app *EVMD) setFirewallHeight(ctx sdk.Context, h int64) {
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(firewallHeightKey, binary.BigEndian.AppendUint64(nil, uint64(h))) // #nosec G115 -- block heights
++}
++
++// firewallActive: block h runs with the node-level firewall code (it may still be off).
++func (app *EVMD) firewallActive(ctx sdk.Context, h int64) bool {
++	a := app.firewallHeight(ctx)
++	return a > 0 && h >= a && app.futV5(ctx, h)
++}
++
++func (app *EVMD) firewallAddr(ctx sdk.Context) (common.Address, bool) {
++	v := app.secRaw(ctx).Get(firewallKey)
++	if len(v) != 20 {
++		return common.Address{}, false
++	}
++	return common.BytesToAddress(v), true
++}
++
++// firewallOn: the upgrade ran and governance named a contract.
++func (app *EVMD) firewallOn(ctx sdk.Context) bool {
++	if !app.firewallActive(ctx, ctx.BlockHeight()) {
++		return false
++	}
++	_, ok := app.firewallAddr(ctx)
++	return ok
++}
++
++// setFirewall: governance's "invariant-firewall" kind of MsgSetFuture.
++func (app *EVMD) setFirewall(ctx sdk.Context, data []byte) error {
++	if !app.firewallActive(ctx, ctx.BlockHeight()) {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "invariant-firewall: not active on this chain yet (zetaphy-firewall upgrade)")
++	}
++	var c struct {
++		Address string `json:"address"`
++	}
++	if err := futJSON(data, &c); err != nil {
++		return err
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if c.Address == "" {
++		st.Delete(firewallKey)
++		st.Delete(firewallBaseKey)
++		return nil
++	}
++	if !common.IsHexAddress(c.Address) || common.HexToAddress(c.Address) == (common.Address{}) {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "invariant-firewall: address: a 0x address, or \"\" to turn it off")
++	}
++	a := common.HexToAddress(c.Address)
++	if len(app.EVMKeeper.GetCode(ctx, app.EVMKeeper.GetCodeHash(ctx, a))) == 0 {
++		return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "invariant-firewall: no contract at %s", a.Hex())
++	}
++	st.Set(firewallKey, a.Bytes())
++	app.firewallCheckpoint(ctx) // the first check point: what is broken already does not block anyone
++	return nil
++}
++
++// firewallStatic makes one STATICCALL with exactly `gas`, on c's state, from
++// FirewallCaller. ok is false on any EVM error (revert, out of gas, …) or panic.
++func (app *EVMD) firewallStatic(c sdk.Context, to common.Address, data []byte, gas uint64) (ret []byte, ok bool) {
++	defer func() {
++		if r := recover(); r != nil {
++			ret, ok = nil, false
++		}
++	}()
++	cfg, err := app.EVMKeeper.EVMConfig(c, c.BlockHeader().ProposerAddress)
++	if err != nil {
++		return nil, false
++	}
++	sdb := statedb.New(c, app.EVMKeeper, statedb.NewEmptyTxConfig())
++	msg := core.Message{
++		From: FirewallCaller, To: &to, Value: new(big.Int), GasLimit: gas, Data: data,
++		GasPrice: new(big.Int), GasFeeCap: new(big.Int), GasTipCap: new(big.Int), AccessList: ethtypes.AccessList{},
++		SkipNonceChecks: true,
++	}
++	evm := app.EVMKeeper.NewEVM(c, msg, cfg, &tracing.Hooks{}, sdb) // no tracer: never traced, never logged
++	rules := evm.ChainConfig().Rules(evm.Context.BlockNumber, true, evm.Context.Time)
++	sdb.Prepare(rules, FirewallCaller, common.Address{}, &to, evm.ActivePrecompiles(), nil)
++	out, _, err := evm.StaticCall(FirewallCaller, to, data, gas)
++	if err != nil {
++		return nil, false
++	}
++	return out, true
++}
++
++// firewallEvaluate runs every chain-layer check on ctx's state (nothing is
++// written back). broken[i] and why[i] are for list[i]. err: the registry
++// itself could not be read (the caller fails open).
++func (app *EVMD) firewallEvaluate(ctx sdk.Context) (list []fwAddr, broken []bool, why []string, err error) {
++	fw, ok := app.firewallAddr(ctx)
++	if !ok {
++		return nil, nil, nil, errors.New("no InvariantFirewall is set")
++	}
++	c, _ := ctx.CacheContext() // never written back
++	c = c.WithGasMeter(storetypes.NewInfiniteGasMeter()).WithKVGasConfig(storetypes.GasConfig{}).
++		WithTransientKVGasConfig(storetypes.GasConfig{}).WithEventManager(sdk.NewEventManager())
++	if len(app.EVMKeeper.GetCode(c, app.EVMKeeper.GetCodeHash(c, fw))) == 0 {
++		return nil, nil, nil, fmt.Errorf("no contract at the firewall %s", fw.Hex())
++	}
++	ret, ok := app.firewallStatic(c, fw, firewallSelChainProtocols, firewallReadGas)
++	if !ok {
++		return nil, nil, nil, errors.New("chainProtocols() reverted or ran out of gas")
++	}
++	if list, err = firewallDecodeProtocols(ret); err != nil {
++		return nil, nil, nil, err
++	}
++	broken = make([]bool, len(list))
++	why = make([]string, len(list))
++	var used uint64
++	for i, p := range list {
++		ret, ok := app.firewallStatic(c, fw, append(append([]byte{}, firewallSelInvariantsOf...), common.LeftPadBytes(p[:], 32)...), firewallReadGas)
++		if !ok {
++			broken[i], why[i] = true, "invariantsOf reverted or ran out of gas"
++			continue
++		}
++		invs, err := firewallDecodeInvariants(ret)
++		if err != nil {
++			broken[i], why[i] = true, err.Error()
++			continue
++		}
++		var fits bool
++		if used, fits = firewallBudget(used, invs); !fits {
++			broken[i], why[i] = true, "its checks do not fit in the per-transaction gas budget"
++			continue
++		}
++		for _, v := range invs {
++			out, ok := app.firewallStatic(c, common.Address(v.Checker), firewallCalldataHolds(firewallSelHolds, p), v.Gas)
++			if !firewallHoldsOK(ok, out) {
++				broken[i] = true
++				why[i] = fmt.Sprintf("checker %s (%s) does not hold", common.Address(v.Checker).Hex(), strings.TrimRight(string(v.Name[:]), "\x00"))
++				break
++			}
++		}
++	}
++	return list, broken, why, nil
++}
++
++func (app *EVMD) firewallError(ctx sdk.Context, err error) {
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_firewall_error", sdk.NewAttribute("error", err.Error())))
++}
++
++// firewallCheckpoint records what is broken now (the start of a block, or a
++// fresh setting), so that it does not revert the transactions that follow.
++func (app *EVMD) firewallCheckpoint(ctx sdk.Context) {
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	list, broken, why, err := app.firewallEvaluate(ctx)
++	if err != nil {
++		app.firewallError(ctx, err)
++		st.Delete(firewallBaseKey)
++		return
++	}
++	now, _ := firewallNewlyBroken(nil, list, broken)
++	for i, a := range list {
++		if broken[i] {
++			ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_firewall_broken",
++				sdk.NewAttribute("protocol", common.Address(a).Hex()), sdk.NewAttribute("reason", why[i])))
++		}
++	}
++	st.Set(firewallBaseKey, firewallEncodeSet(now))
++}
++
++// firewallBeginBlock: the first check point of each block (after the
++// breaker's pauses, which can change what holds).
++func (app *EVMD) firewallBeginBlock(ctx sdk.Context) {
++	if !app.firewallOn(ctx) {
++		return
++	}
++	app.firewallCheckpoint(ctx)
++}
++
++// firewallPostTx: after a successful EVM transaction or MsgEVMCall, on the
++// state it left. An error reverts it. ctx is the transaction's own (cached)
++// context, so the new check point is committed with the transaction, or
++// dropped with it.
++func (app *EVMD) firewallPostTx(ctx sdk.Context) error {
++	if !app.firewallOn(ctx) {
++		return nil
++	}
++	list, broken, why, err := app.firewallEvaluate(ctx)
++	if err != nil {
++		app.firewallError(ctx, err) // fail open (see the top of this file)
++		return nil
++	}
++	base, err := firewallDecodeSet(app.secRaw(ctx).Get(firewallBaseKey))
++	if err != nil {
++		base = nil
++	}
++	now, newly := firewallNewlyBroken(base, list, broken)
++	if len(newly) > 0 {
++		reason := ""
++		for i, a := range list {
++			if a == newly[0] {
++				reason = why[i]
++			}
++		}
++		return errorsmod.Wrapf(ErrInvariantFirewall, "the transaction breaks an invariant of %s: %s", common.Address(newly[0]).Hex(), reason)
++	}
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(firewallBaseKey, firewallEncodeSet(now))
++	return nil
++}
++
++// registerZetaphyFirewall (from registerZetaphyUpgrades): "zetaphy-firewall"
++// makes the node layer exist from the block after the upgrade. It needs v5
++// (setFuture is v5's message) and adds no store.
++func (app *EVMD) registerZetaphyFirewall() {
++	app.UpgradeKeeper.SetUpgradeHandler(ZetaphyFirewallUpgradeName,
++		func(c context.Context, _ upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
++			ctx := sdk.UnwrapSDKContext(c)
++			if a := app.firewallHeight(ctx); a == 0 || a > ctx.BlockHeight()+1 {
++				app.setFirewallHeight(ctx, ctx.BlockHeight()+1)
++			}
++			ctx.Logger().Info("ZETAPHY invariant firewall available (off until governance sets invariant-firewall)", "from_height", ctx.BlockHeight()+1)
++			return app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
++		})
++}
+diff --git a/evmd/zetaphy_firewall_core.go b/evmd/zetaphy_firewall_core.go
+new file mode 100644
+index 0000000..f22790b
+--- /dev/null
++++ b/evmd/zetaphy_firewall_core.go
+@@ -0,0 +1,221 @@
++package evmd
++
++// ZETAPHY invariant firewall, node layer: the consensus-relevant pure logic
++// (docs/CHAIN-FIREWALL.md). Standard library only; zetaphy_firewall.go wires
++// it into the node.
++//
++// What it decides, from the registry the node read and the checks it ran:
++//
++//   - strict decoding of InvariantFirewall.chainProtocols() (address[], at
++//     most firewallMaxProtocols, no zero address, no duplicate) and of
++//     invariantsOf(p) ((address checker, uint32 gasLimit, bytes32 name)[]);
++//   - the bounds the contract has, enforced again by the node: at most
++//     firewallMaxInvariants per protocol, each cap in
++//     [firewallMinCheckGas, firewallMaxCheckGas], and at most
++//     firewallTxGasBudget of checker gas per transaction in all. A protocol
++//     whose invariants break a bound is counted broken (fail-closed);
++//   - a checker passes only on exactly 32 bytes encoding true;
++//   - which protocols a transaction broke (broken now, not at the check point).
++//
++// Everything iterates slices in registry order (never a map): the same
++// registry gives the same plan, the same gas and the same answer on every
++// validator.
++
++import (
++	"bytes"
++	"errors"
++)
++
++const (
++	firewallMaxProtocols  = 8         // InvariantFirewall.MAX_CHAIN
++	firewallMaxInvariants = 8         // InvariantFirewall.MAX_INVARIANTS
++	firewallMinCheckGas   = 5_000     // InvariantFirewall.MIN_CHECK_GAS
++	firewallMaxCheckGas   = 500_000   // InvariantFirewall.MAX_CHECK_GAS
++	firewallTxGasBudget   = 2_000_000 // InvariantFirewall.CHAIN_GAS_BUDGET: all checker caps of one check
++	firewallReadGas       = 200_000   // each registry read (chainProtocols, invariantsOf)
++)
++
++type fwAddr = [20]byte
++
++// fwInvariant is one entry of invariantsOf(p).
++type fwInvariant struct {
++	Checker fwAddr
++	Gas     uint64
++	Name    [32]byte
++}
++
++// fwSmall decodes a 32-byte ABI word that must fit in a uint64.
++func fwSmall(w []byte) (uint64, bool) {
++	for _, b := range w[:24] {
++		if b != 0 {
++			return 0, false
++		}
++	}
++	var v uint64
++	for _, b := range w[24:32] {
++		v = v<<8 | uint64(b)
++	}
++	return v, true
++}
++
++// fwWordAddr decodes a 32-byte ABI word that must be an address.
++func fwWordAddr(w []byte) (fwAddr, bool) {
++	var a fwAddr
++	if !bytes.Equal(w[:12], make([]byte, 12)) {
++		return a, false
++	}
++	copy(a[:], w[12:32])
++	return a, true
++}
++
++// fwArrayHead checks the head of a single dynamic-array return value with
++// `words` words per element, at most `max` elements, and returns n.
++func fwArrayHead(ret []byte, words, max uint64) (uint64, error) {
++	if len(ret) < 64 || len(ret)%32 != 0 || uint64(len(ret)) > 64+32*words*max {
++		return 0, errors.New("answer of the wrong size")
++	}
++	off, ok1 := fwSmall(ret[0:32])
++	n, ok2 := fwSmall(ret[32:64])
++	if !ok1 || !ok2 || off != 32 || n > max || uint64(len(ret)) != 64+32*words*n {
++		return 0, errors.New("malformed answer")
++	}
++	return n, nil
++}
++
++// firewallDecodeProtocols strictly decodes chainProtocols()'s answer.
++func firewallDecodeProtocols(ret []byte) ([]fwAddr, error) {
++	n, err := fwArrayHead(ret, 1, firewallMaxProtocols)
++	if err != nil {
++		return nil, errors.New("chainProtocols: " + err.Error())
++	}
++	list := make([]fwAddr, 0, n)
++	for i := uint64(0); i < n; i++ {
++		a, ok := fwWordAddr(ret[64+32*i : 96+32*i])
++		if !ok || a == (fwAddr{}) {
++			return nil, errors.New("chainProtocols: malformed address")
++		}
++		for _, b := range list {
++			if b == a {
++				return nil, errors.New("chainProtocols: a protocol listed twice")
++			}
++		}
++		list = append(list, a)
++	}
++	return list, nil
++}
++
++// firewallDecodeInvariants strictly decodes invariantsOf(p)'s answer and
++// checks the bounds: at most firewallMaxInvariants, caps in range, no zero or
++// duplicate checker. An error makes the protocol count as broken.
++func firewallDecodeInvariants(ret []byte) ([]fwInvariant, error) {
++	// More entries than allowed is a bound violation, not only a size error.
++	if len(ret) >= 64 {
++		if n, ok := fwSmall(ret[32:64]); ok && n > firewallMaxInvariants {
++			return nil, errors.New("invariantsOf: more than 8 invariants")
++		}
++	}
++	n, err := fwArrayHead(ret, 3, firewallMaxInvariants)
++	if err != nil {
++		return nil, errors.New("invariantsOf: " + err.Error())
++	}
++	out := make([]fwInvariant, 0, n)
++	for i := uint64(0); i < n; i++ {
++		e := ret[64+96*i : 160+96*i]
++		c, ok1 := fwWordAddr(e[0:32])
++		g, ok2 := fwSmall(e[32:64])
++		if !ok1 || !ok2 || c == (fwAddr{}) || g > 0xffffffff {
++			return nil, errors.New("invariantsOf: malformed entry")
++		}
++		if g < firewallMinCheckGas || g > firewallMaxCheckGas {
++			return nil, errors.New("invariantsOf: a gas cap outside 5,000..500,000")
++		}
++		for _, v := range out {
++			if v.Checker == c {
++				return nil, errors.New("invariantsOf: a checker listed twice")
++			}
++		}
++		v := fwInvariant{Checker: c, Gas: g}
++		copy(v.Name[:], e[64:96])
++		out = append(out, v)
++	}
++	return out, nil
++}
++
++// firewallHoldsOK: a checker's answer counts as "holds" only when the call
++// succeeded and returned exactly 32 bytes encoding true (uint256 1). False,
++// a revert, running out of its cap, or any other answer is a violation.
++func firewallHoldsOK(callOK bool, ret []byte) bool {
++	if !callOK || len(ret) != 32 {
++		return false
++	}
++	for _, b := range ret[:31] {
++		if b != 0 {
++			return false
++		}
++	}
++	return ret[31] == 1
++}
++
++// firewallCalldataHolds: holds(protocol).
++func firewallCalldataHolds(sel []byte, p fwAddr) []byte {
++	out := make([]byte, 0, 36)
++	out = append(out, sel...)
++	out = append(out, make([]byte, 12)...)
++	return append(out, p[:]...)
++}
++
++// firewallBudget reports whether a protocol's checks fit in what is left of
++// the per-transaction budget, and the gas they take from it.
++func firewallBudget(used uint64, invs []fwInvariant) (uint64, bool) {
++	var g uint64
++	for _, v := range invs {
++		g += v.Gas // each <= firewallMaxCheckGas, at most 8: no overflow
++	}
++	if used+g > firewallTxGasBudget {
++		return used, false
++	}
++	return used + g, true
++}
++
++// firewallNewlyBroken: the protocols broken now (broken[i] for list[i]), and
++// those of them that were not broken at the check point (baseline): the ones
++// this transaction broke.
++func firewallNewlyBroken(baseline, list []fwAddr, broken []bool) (now, newly []fwAddr) {
++	for i, a := range list {
++		if i >= len(broken) || !broken[i] {
++			continue
++		}
++		now = append(now, a)
++		was := false
++		for _, b := range baseline {
++			if b == a {
++				was = true
++				break
++			}
++		}
++		if !was {
++			newly = append(newly, a)
++		}
++	}
++	return now, newly
++}
++
++// firewallEncodeSet / firewallDecodeSet: the check point in the store (20 bytes each).
++func firewallEncodeSet(set []fwAddr) []byte {
++	out := make([]byte, 0, 20*len(set))
++	for _, a := range set {
++		out = append(out, a[:]...)
++	}
++	return out
++}
++
++func firewallDecodeSet(b []byte) ([]fwAddr, error) {
++	if len(b)%20 != 0 || len(b) > 20*firewallMaxProtocols {
++		return nil, errors.New("firewall check point: corrupt")
++	}
++	set := make([]fwAddr, len(b)/20)
++	for i := range set {
++		copy(set[i][:], b[20*i:])
++	}
++	return set, nil
++}
+diff --git a/evmd/zetaphy_future.go b/evmd/zetaphy_future.go
+new file mode 100644
+index 0000000..861956f
+--- /dev/null
++++ b/evmd/zetaphy_future.go
+@@ -0,0 +1,313 @@
++package evmd
++
++// ZETAPHY v5: protocol-level protection research, all off until governance
++// (or, for accounts, the account itself) turns it on. docs/future/chain-protocol.md.
++//
++//   - AI precompile (zetaphy_aimodel.go, 0x…0902): an integer-only
++//     gradient-boosted tree model, set by governance, scores a feature vector.
++//   - Immune system (zetaphy_immune.go, 0x…0903): validators score the
++//     contracts deployed in a block from their bytecode and put the scores in
++//     their vote extension, after the ML-DSA vote signature; the median is
++//     recorded on chain and readable through a ThreatRegistry-compatible view.
++//   - Bridge circuit breaker (zetaphy_breaker.go): validators flag an
++//     anomalous outflow of a watched bridge in the same vote extension; on a
++//     2/3 supermajority the chain calls the bridge's pause(). Only
++//     governance unpauses (on the bridge) and re-arms (here).
++//   - Protected accounts and anomaly hold (zetaphy_guard.go, 0x…0904):
++//     opt-in, per account; the hold covers the native coin and ERC-20s.
++//   - Neuro model by height (zetaphy_modelat.go): governance points the
++//     chain at a ModelEpochs registry; ModelVersionAt reads it.
++//
++// Upgrade path, as the security core: a new chain has v5 from block 1 (key
++// 0x20 = 1 in app_state.zetaphypq); a running chain gets "zetaphy-v5", which
++// sets 0x20 to the upgrade height + 1. Below it nothing changes: the three
++// addresses are empty accounts and vote extensions carry the signature only.
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"strings"
++
++	gogoproto "github.com/cosmos/gogoproto/proto"
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core/vm"
++
++	errorsmod "cosmossdk.io/errors"
++
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	"github.com/cosmos/cosmos-sdk/types/module"
++	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
++)
++
++// Keys of the zetaphypq store used by v5.
++var (
++	futV5Key          = []byte{0x20} // height (8) from which v5 applies
++	aiModelKey        = []byte{0x21} // the GBDT model (binary, zetaphy_aimodel.go)
++	immuneParamsKey   = []byte{0x22} // immuneParams (JSON)
++	immunePendingPfx  = byte(0x23)   // || height (8) || contract (20) -> {}: deployed in that block, to be scored
++	immuneScorePfx    = byte(0x24)   // || contract (20) -> score (2) || height (8) || voters' power share bps (2)
++	breakerCfgPfx     = byte(0x25)   // || bridge (20) -> breakerCfg (JSON)
++	breakerStatsPfx   = byte(0x26)   // || bridge (20) -> breakerStats (binary)
++	breakerSeenPfx    = byte(0x27)   // || bridge (20) || recipient (20) -> {}
++	breakerTripPfx    = byte(0x28)   // || bridge (20) -> height (8) || pause call ok (1)
++	breakerPausePfx   = byte(0x29)   // || bridge (20) -> {}: pause due in this block's BeginBlock
++	guardProtectPfx   = byte(0x2A)   // || account (20) -> guardProtection (binary)
++	guardQueuePfx     = byte(0x2B)   // || account (20) || target (20) -> usable from, unix s (8)
++	holdCfgPfx        = byte(0x2C)   // || account (20) -> holdCfg (binary)
++	holdStatsPfx      = byte(0x2D)   // || account (20) -> holdStats (binary)
++	holdTokenPfx      = byte(0x2E)   // || account (20) || token (20) -> holdRule (binary)
++	holdTokenStatsPfx = byte(0x2F)   // || account (20) || token (20) -> holdStats (binary)
++	modelEpochsKey    = []byte{0x30} // the ModelEpochs registry, EVM address (20) (zetaphy_modelat.go)
++	// 0x31..0x33: the node-level invariant firewall (zetaphy_firewall.go)
++)
++
++// futKeyKnown: v5 prefixes a genesis may carry (and the firewall's 0x31..0x33).
++func futKeyKnown(p byte) bool { return p >= 0x20 && p <= 0x33 }
++
++// ZetaphyV5UpgradeName turns v5 on for a running chain (from the next block).
++const ZetaphyV5UpgradeName = "zetaphy-v5"
++
++// The v5 precompiles (on from the v5 height, whatever active_static_precompiles says).
++var (
++	AIPrecompileAddress     = common.HexToAddress("0x0000000000000000000000000000000000000902")
++	ImmunePrecompileAddress = common.HexToAddress("0x0000000000000000000000000000000000000903")
++	GuardPrecompileAddress  = common.HexToAddress("0x0000000000000000000000000000000000000904")
++)
++
++// ErrGuard is the refusal of the protected-account mode and the anomaly hold
++// (codespace "zetaphy", code 31).
++var ErrGuard = errorsmod.Register("zetaphy", 31, "account guard")
++
++func (app *EVMD) futV5Height(ctx sdk.Context) int64 {
++	return int64(readU64(app.secRaw(ctx).Get(futV5Key))) // #nosec G115 -- block heights
++}
++
++// futV5 reports whether block h runs with v5.
++func (app *EVMD) futV5(ctx sdk.Context, h int64) bool {
++	a := app.futV5Height(ctx)
++	return a > 0 && h >= a
++}
++
++func (app *EVMD) setFutV5Height(ctx sdk.Context, h int64) {
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(futV5Key, u64(uint64(h))) // #nosec G115 -- block heights
++}
++
++// MsgSetFuture sets one v5 parameter (governance only). Kind and data:
++//
++//	ai-model       the binary model (zetaphy_aimodel.go); empty removes it
++//	immune         immuneParams as JSON
++//	breaker        breakerCfg as JSON (enabled false removes the bridge)
++//	breaker-rearm  {"bridge":"0x…"}: forget a trip, so the breaker can fire again
++//	model-epochs   {"address":"0x…"}: the Neuro ModelEpochs registry ("" removes it; zetaphy_modelat.go)
++//	invariant-firewall  {"address":"0x…"}: the InvariantFirewall the node checks after every EVM tx
++//	               ("" turns it off; zetaphy_firewall.go; needs the zetaphy-firewall upgrade)
++type MsgSetFuture struct {
++	Authority string
++	Kind      string
++	Data      []byte
++}
++
++// MsgZXVotes is put by the proposer next to the vote certificate: the v5
++// part of each validator's vote extension for the previous block, with the
++// CometBFT signature over the whole extension (zetaphy_immune.go). It is
++// never signed or fee-paying.
++type MsgZXVotes struct {
++	Signer  string
++	Height  uint64
++	Round   uint64
++	Entries []byte
++}
++
++func (m *MsgSetFuture) Reset() { *m = MsgSetFuture{} }
++func (m *MsgSetFuture) String() string {
++	return fmt.Sprintf("MsgSetFuture{%s %d bytes}", m.Kind, len(m.Data))
++}
++func (*MsgSetFuture) ProtoMessage()               {}
++func (*MsgSetFuture) Descriptor() ([]byte, []int) { return pqCallDescriptor, []int{14} }
++func (m *MsgSetFuture) Marshal() ([]byte, error)  { return pqMarshal(14, m) }
++func (m *MsgSetFuture) Unmarshal(b []byte) error  { return pqUnmarshal(14, b, m) }
++func (m *MsgSetFuture) Size() int                 { return pqSize(m) }
++func (m *MsgZXVotes) Reset()                      { *m = MsgZXVotes{} }
++func (m *MsgZXVotes) String() string              { return fmt.Sprintf("MsgZXVotes{%d}", m.Height) }
++func (*MsgZXVotes) ProtoMessage()                 {}
++func (*MsgZXVotes) Descriptor() ([]byte, []int)   { return pqCallDescriptor, []int{15} }
++func (m *MsgZXVotes) Marshal() ([]byte, error)    { return pqMarshal(15, m) }
++func (m *MsgZXVotes) Unmarshal(b []byte) error    { return pqUnmarshal(15, b, m) }
++func (m *MsgZXVotes) Size() int                   { return pqSize(m) }
++
++// futJSON decodes governance JSON strictly (unknown fields refused).
++func futJSON(data []byte, v any) error {
++	d := json.NewDecoder(bytes.NewReader(data))
++	d.DisallowUnknownFields()
++	if err := d.Decode(v); err != nil {
++		return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "data: %v", err)
++	}
++	return nil
++}
++
++func (app *EVMD) setFuture(ctx sdk.Context, m *MsgSetFuture) (gogoproto.Message, error) {
++	if app.guardActive(ctx) { // ZETAPHY chain guard kinds (zetaphy_chainguard.go); before it, every kind runs as before
++		if done, res, err := app.setGuardKind(ctx, m); done {
++			return res, err
++		}
++	}
++	if m.Authority != govAuthority() {
++		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only governance can change v5 settings")
++	}
++	if !app.futV5(ctx, ctx.BlockHeight()) {
++		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "v5 is not active on this chain yet (zetaphy-v5 upgrade)")
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	switch m.Kind {
++	case "ai-model":
++		if len(m.Data) == 0 {
++			st.Delete(aiModelKey)
++			break
++		}
++		if _, err := parseGBDT(m.Data); err != nil {
++			return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest, "ai-model: %v", err)
++		}
++		st.Set(aiModelKey, m.Data)
++	case "immune":
++		var p immuneParams
++		if err := futJSON(m.Data, &p); err != nil {
++			return nil, err
++		}
++		if err := p.validate(); err != nil {
++			return nil, err
++		}
++		bz, _ := json.Marshal(p)
++		st.Set(immuneParamsKey, bz)
++	case "breaker":
++		var c breakerCfg
++		if err := futJSON(m.Data, &c); err != nil {
++			return nil, err
++		}
++		if err := app.setBreaker(ctx, c); err != nil {
++			return nil, err
++		}
++	case "breaker-rearm":
++		var c struct {
++			Bridge string `json:"bridge"`
++		}
++		if err := futJSON(m.Data, &c); err != nil {
++			return nil, err
++		}
++		if !common.IsHexAddress(c.Bridge) {
++			return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "bridge: a 0x address")
++		}
++		b := common.HexToAddress(c.Bridge)
++		st.Delete(append([]byte{breakerTripPfx}, b.Bytes()...))
++		st.Delete(append([]byte{breakerPausePfx}, b.Bytes()...))
++	case "model-epochs":
++		if err := app.setModelEpochs(ctx, m.Data); err != nil {
++			return nil, err
++		}
++	case "invariant-firewall":
++		if err := app.setFirewall(ctx, m.Data); err != nil {
++			return nil, err
++		}
++	default:
++		return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest, "kind %q: ai-model, immune, breaker, breaker-rearm, model-epochs or invariant-firewall", m.Kind)
++	}
++	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_v5_set", sdk.NewAttribute("kind", m.Kind), sdk.NewAttribute("bytes", fmt.Sprint(len(m.Data)))))
++	return &MsgPQResponse{}, nil
++}
++
++// futPrecompile: the v5 precompiles, from the v5 height.
++func (app *EVMD) futPrecompile(ctx sdk.Context, addr common.Address) (vm.PrecompiledContract, bool) {
++	if addr != AIPrecompileAddress && addr != ImmunePrecompileAddress && addr != GuardPrecompileAddress {
++		return nil, false
++	}
++	if !app.futV5(ctx, ctx.BlockHeight()) {
++		return nil, false
++	}
++	switch addr {
++	case AIPrecompileAddress:
++		return app.aiPrecompile, true
++	case ImmunePrecompileAddress:
++		return app.immunePrecompile, true
++	}
++	return app.guardPrecompile, true
++}
++
++// registerZetaphyV5 (from registerZetaphyUpgrades): "zetaphy-v5" turns v5 on
++// from the block after the upgrade. It needs a chain that already ran
++// zetaphy-v4 (it adds no store).
++func (app *EVMD) registerZetaphyV5() {
++	app.UpgradeKeeper.SetUpgradeHandler(ZetaphyV5UpgradeName,
++		func(c context.Context, _ upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
++			ctx := sdk.UnwrapSDKContext(c)
++			if a := app.futV5Height(ctx); a == 0 || a > ctx.BlockHeight()+1 {
++				app.setFutV5Height(ctx, ctx.BlockHeight()+1)
++			}
++			ctx.Logger().Info("ZETAPHY v5 scheduled", "from_height", ctx.BlockHeight()+1)
++			return app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
++		})
++}
++
++// futProposalMsg: the v5 kinds of `zetaphyd tx security-proposal`.
++//
++//	ai-model <model.hex file | ->        (- removes the model)
++//	immune '<json>'                      e.g. '{"enabled":true,"enforce_bps":9000,"hold_bps":8000,"protect_bps":7000}'
++//	breaker '<json>'                     see breakerCfg
++//	breaker-rearm <bridge 0x…>
++//	model-epochs <ModelEpochs 0x… | ->  (- removes it)
++//	invariant-firewall <InvariantFirewall 0x… | ->  (- turns the node-level firewall off)
++func futProposalMsg(args []string, readFile func(string) ([]byte, error)) (sdk.Msg, string, error) {
++	gov := govAuthority()
++	if len(args) != 2 {
++		return nil, "", fmt.Errorf("%s takes one argument", args[0])
++	}
++	switch args[0] {
++	case "ai-model":
++		if args[1] == "-" {
++			return &MsgSetFuture{Authority: gov, Kind: "ai-model"}, "Remove the AI precompile model", nil
++		}
++		raw, err := readFile(args[1])
++		if err != nil {
++			return nil, "", err
++		}
++		bz, err := secHex(strings.TrimSpace(string(raw)))
++		if err != nil {
++			return nil, "", fmt.Errorf("%s: hex expected: %w", args[1], err)
++		}
++		if _, err := parseGBDT(bz); err != nil {
++			return nil, "", err
++		}
++		return &MsgSetFuture{Authority: gov, Kind: "ai-model", Data: bz}, fmt.Sprintf("AI precompile model (%d bytes)", len(bz)), nil
++	case "immune", "breaker":
++		if !json.Valid([]byte(args[1])) {
++			return nil, "", fmt.Errorf("%s: JSON expected", args[0])
++		}
++		return &MsgSetFuture{Authority: gov, Kind: args[0], Data: []byte(args[1])}, fmt.Sprintf("v5 %s settings", args[0]), nil
++	case "breaker-rearm":
++		if !common.IsHexAddress(args[1]) {
++			return nil, "", fmt.Errorf("breaker-rearm <bridge 0x…>")
++		}
++		data, _ := json.Marshal(map[string]string{"bridge": args[1]})
++		return &MsgSetFuture{Authority: gov, Kind: "breaker-rearm", Data: data}, "Re-arm the bridge circuit breaker for " + args[1], nil
++	case "model-epochs":
++		if args[1] == "-" {
++			return &MsgSetFuture{Authority: gov, Kind: "model-epochs", Data: []byte(`{"address":""}`)}, "Remove the Neuro ModelEpochs registry", nil
++		}
++		if !common.IsHexAddress(args[1]) {
++			return nil, "", fmt.Errorf("model-epochs <ModelEpochs 0x… | ->")
++		}
++		data, _ := json.Marshal(map[string]string{"address": common.HexToAddress(args[1]).Hex()})
++		return &MsgSetFuture{Authority: gov, Kind: "model-epochs", Data: data}, "Neuro ModelEpochs registry " + args[1], nil
++	case "invariant-firewall":
++		if args[1] == "-" {
++			return &MsgSetFuture{Authority: gov, Kind: "invariant-firewall", Data: []byte(`{"address":""}`)}, "Turn the node-level invariant firewall off", nil
++		}
++		if !common.IsHexAddress(args[1]) {
++			return nil, "", fmt.Errorf("invariant-firewall <InvariantFirewall 0x… | ->")
++		}
++		data, _ := json.Marshal(map[string]string{"address": common.HexToAddress(args[1]).Hex()})
++		return &MsgSetFuture{Authority: gov, Kind: "invariant-firewall", Data: data}, "Node-level invariant firewall: check the chain-layer protocols of " + args[1], nil
++	}
++	return nil, "", fmt.Errorf("unknown proposal %q", args[0])
++}
+diff --git a/evmd/zetaphy_guard.go b/evmd/zetaphy_guard.go
+new file mode 100644
+index 0000000..ed38703
+--- /dev/null
++++ b/evmd/zetaphy_guard.go
+@@ -0,0 +1,1118 @@
++package evmd
++
++// ZETAPHY v5 account guard (precompile 0x…0904): two opt-in protections for
++// the account that signs a transaction. An account that never opts in is
++// never checked beyond two store reads.
++//
++// Protected-account mode (protect(mode, delaySeconds)):
++//
++//	mode 2 "reject": the account's txs that call, pay, approve or transfer
++//	       tokens to a high-risk contract are refused;
++//	mode 1 "delay queue": the same txs go through only after the account
++//	       queued that target (queue(target)) at least delaySeconds earlier
++//	       (then for one day).
++//	High-risk: an immune score >= protect_bps (default 7000,
++//	zetaphy_immune.go), or an enforced flag in the ThreatRegistry that the
++//	threat gate points at (asked even while the gate is off).
++//	Checked: tx.to, and the spender / recipient argument of approve,
++//	increaseAllowance, setApprovalForAll, transfer, transferFrom,
++//	safeTransferFrom and Permit2's approve; bank sends to such an address.
++//	Turning it on or stronger is immediate; weaker or off waits
++//	max(delay, 1 day), so a stolen key cannot switch it off first.
++//
++// Anomaly hold (holdOptIn(guardian, timeoutSeconds, minAmount, multBps)):
++//
++//	the chain keeps, per account, the number of native outflows and their
++//	moving average (alpha 1/8). An outflow above minAmount that is either
++//	among the first 5 or above average × multBps / 1e4 is held: refused
++//	until the account has a release that covers it. requestRelease(amount)
++//	by the account becomes usable after timeout, or at once when the
++//	guardian (a second key: an ML-DSA-44 account through MsgEVMCall, a
++//	passkey wallet contract, …) calls confirmRelease(account). A release is
++//	usable for one day. The guardian (or the account) can cancelRelease;
++//	opting out waits the timeout and the guardian can cancel it
++//	(cancelOptOut).
++//
++//	Native outflows: Ethereum tx value, MsgEVMCall value, bank sends, IBC
++//	MsgTransfer and the ICS-20 precompile, MsgConvertCoin to another
++//	address, and transfer / transferFrom(self, …) / approve /
++//	increaseAllowance on the native coin's ERC-20 interface (0xEeee…EEeE,
++//	or any token pair of the EVM denom).
++//
++//	ERC-20 rules (holdToken(token, minAmount, multBps), up to 16 per
++//	account, under the same guardian and timeout): the same profile and
++//	release model per token, with its own threshold in the token's units.
++//	Outflows of a token: transfer, transferFrom(self, …), bank / IBC sends
++//	and MsgConvertCoin of the token's coin (token pairs: erc20/0x… and IBC
++//	denoms with an ERC-20 interface), MsgConvertERC20 to another address.
++//	Approvals (approve, increaseAllowance, Permit2's approve) are checked
++//	against the profile like an outflow of the approved amount, but do not
++//	teach it; an unlimited approval is therefore always held until a
++//	release covers it. requestTokenRelease / confirmTokenRelease /
++//	cancelTokenRelease, holdTokenOptOut (waits the timeout) and
++//	cancelTokenOptOut (the guardian) work as the native ones.
++//
++// Limits (docs/future/chain-protocol.md): only what the signer's own
++// messages say is seen: a contract that moves tokens internally (a router
++// spending an earlier approval, a smart wallet, multicall, an off-chain
++// EIP-2612 permit or Permit2 signature used by someone else) is not; nor
++// are approvals given before opting in. A tx refused in a block (the state
++// changed after CheckTx) fails there without running.
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"math/big"
++
++	transfertypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
++	"github.com/ethereum/go-ethereum/accounts/abi"
++	"github.com/ethereum/go-ethereum/common"
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++	"github.com/ethereum/go-ethereum/core/vm"
++
++	errorsmod "cosmossdk.io/errors"
++
++	cmn "github.com/cosmos/evm/precompiles/common"
++	"github.com/cosmos/evm/precompiles/ics20"
++	erc20types "github.com/cosmos/evm/x/erc20/types"
++	evmtypes "github.com/cosmos/evm/x/vm/types"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
++)
++
++const (
++	guardDay        = 86400
++	guardMinDelay   = 3600
++	guardMaxDelay   = 30 * guardDay
++	holdWarmup      = 5
++	guardModeOff    = 0
++	guardModeQueue  = 1
++	guardModeReject = 2
++)
++
++// ---- protected-account mode
++
++type guardProtection struct {
++	mode, pendMode   uint8
++	delay, pendDelay uint64
++	pendAt           int64
++}
++
++func (app *EVMD) guardProtectionRaw(ctx sdk.Context, a common.Address) guardProtection {
++	v := app.secRaw(ctx).Get(append([]byte{guardProtectPfx}, a.Bytes()...))
++	if len(v) != 26 {
++		return guardProtection{}
++	}
++	return guardProtection{mode: v[0], delay: binary.BigEndian.Uint64(v[1:]), pendMode: v[9], pendDelay: binary.BigEndian.Uint64(v[10:]),
++		pendAt: int64(binary.BigEndian.Uint64(v[18:]))} // #nosec G115 -- unix seconds
++}
++
++// guardProtectionOf: the settings in force at the block time.
++func (app *EVMD) guardProtectionOf(ctx sdk.Context, a common.Address) guardProtection {
++	p := app.guardProtectionRaw(ctx, a)
++	if p.pendAt > 0 && ctx.BlockTime().Unix() >= p.pendAt {
++		return guardProtection{mode: p.pendMode, delay: p.pendDelay}
++	}
++	return p
++}
++
++func (app *EVMD) setGuardProtection(ctx sdk.Context, a common.Address, p guardProtection) {
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	k := append([]byte{guardProtectPfx}, a.Bytes()...)
++	if p.mode == guardModeOff && p.pendAt == 0 {
++		st.Delete(k)
++		return
++	}
++	v := append([]byte{p.mode}, u64(p.delay)...)
++	v = append(append(v, p.pendMode), u64(p.pendDelay)...)
++	st.Set(k, append(v, u64(uint64(p.pendAt))...)) // #nosec G115 -- unix seconds
++}
++
++func guardStronger(n, cur guardProtection) bool {
++	if n.mode != cur.mode {
++		return n.mode > cur.mode
++	}
++	return n.mode != guardModeQueue || n.delay >= cur.delay
++}
++
++// guardProtect sets the mode; returns when it applies.
++func (app *EVMD) guardProtect(ctx sdk.Context, a common.Address, mode uint8, delay uint64) (int64, error) {
++	if mode > guardModeReject {
++		return 0, errors.New("protect: mode 0 (off), 1 (delay queue) or 2 (reject)")
++	}
++	if mode == guardModeQueue && (delay < guardMinDelay || delay > guardMaxDelay) {
++		return 0, fmt.Errorf("protect: the delay queue needs %d..%d seconds", guardMinDelay, guardMaxDelay)
++	}
++	if mode != guardModeQueue {
++		delay = 0
++	}
++	now := ctx.BlockTime().Unix()
++	cur := app.guardProtectionOf(ctx, a)
++	n := guardProtection{mode: mode, delay: delay}
++	if guardStronger(n, cur) {
++		app.setGuardProtection(ctx, a, n)
++		return now, nil
++	}
++	wait := int64(max(cur.delay, guardDay)) // #nosec G115 -- at most 30 days
++	at := now + wait
++	app.setGuardProtection(ctx, a, guardProtection{mode: cur.mode, delay: cur.delay, pendMode: mode, pendDelay: delay, pendAt: at})
++	return at, nil
++}
++
++func guardQueueKey(a, target common.Address) []byte {
++	return append(append([]byte{guardQueuePfx}, a.Bytes()...), target.Bytes()...)
++}
++
++// guardHighRisk: the target is a contract the protected mode stops.
++func (app *EVMD) guardHighRisk(ctx sdk.Context, target common.Address) (bool, string) {
++	if threatSystemAddress(target) {
++		return false, ""
++	}
++	if s, _, _, ok := app.immuneScore(ctx, target); ok && s >= app.immuneParams(ctx).ProtectBps {
++		return true, fmt.Sprintf("immune score %d bps", s)
++	}
++	if v := app.secRaw(ctx).Get(gateKey); len(v) == 21 && app.secV3(ctx) {
++		reg := common.BytesToAddress(v[:20])
++		if reg != (common.Address{}) && reg != target {
++			if on, _ := app.threatEnforced(ctx, reg, target); on {
++				return true, "enforced flag in the ThreatRegistry " + reg.Hex()
++			}
++		}
++	}
++	return false, ""
++}
++
++// guardTargets: the addresses a call hands value or allowance to.
++func guardTargets(to *common.Address, data []byte) []common.Address {
++	var out []common.Address
++	if to != nil {
++		out = append(out, *to)
++	}
++	if len(data) < 4 {
++		return out
++	}
++	word := func(i int) (common.Address, bool) {
++		if i < 0 || len(data) < 4+32*(i+1) {
++			return common.Address{}, false
++		}
++		return common.BytesToAddress(data[4+32*i : 4+32*(i+1)]), true
++	}
++	arg := -1
++	switch binary.BigEndian.Uint32(data) {
++	case 0x095ea7b3, 0x39509351, 0xa22cb465, 0xa9059cbb: // approve, increaseAllowance, setApprovalForAll, transfer
++		arg = 0
++	case 0x23b872dd, 0x42842e0e, 0xb88d4fde, 0xf242432a, 0x2eb2c2d6, 0x87517c45: // transferFrom, safeTransferFrom ×2, ERC-1155 ×2, Permit2 approve
++		arg = 1
++	}
++	if a, ok := word(arg); ok {
++		out = append(out, a)
++	}
++	return out
++}
++
++func (app *EVMD) guardCheckProtected(ctx sdk.Context, from common.Address, targets []common.Address) error {
++	p := app.guardProtectionOf(ctx, from)
++	if p.mode == guardModeOff {
++		return nil
++	}
++	now := ctx.BlockTime().Unix()
++	for _, t := range targets {
++		risky, why := app.guardHighRisk(ctx, t)
++		if !risky {
++			continue
++		}
++		if p.mode == guardModeQueue {
++			if f := int64(readU64(app.secRaw(ctx).Get(guardQueueKey(from, t)))); f > 0 && now >= f && now < f+guardDay { // #nosec G115 -- unix seconds
++				continue
++			}
++			return errorsmod.Wrapf(ErrGuard, "%s is protected: %s is high-risk (%s). Queue it first with queue(%s) on %s; it can be used %d s later, for a day",
++				from.Hex(), t.Hex(), why, t.Hex(), GuardPrecompileAddress.Hex(), p.delay)
++		}
++		return errorsmod.Wrapf(ErrGuard, "%s is protected: %s is high-risk (%s); refused. Turning protection off takes at least a day",
++			from.Hex(), t.Hex(), why)
++	}
++	return nil
++}
++
++// ---- anomaly hold
++
++type holdCfg struct {
++	guardian      common.Address
++	timeout       uint64
++	minAmount     *big.Int
++	multBps       uint32
++	optOutAt      int64
++	releaseAmount *big.Int
++	releaseReady  int64
++}
++
++func (app *EVMD) holdCfgOf(ctx sdk.Context, a common.Address) *holdCfg {
++	v := app.secRaw(ctx).Get(append([]byte{holdCfgPfx}, a.Bytes()...))
++	if len(v) != 20+8+32+4+8+32+8 {
++		return nil
++	}
++	c := &holdCfg{guardian: common.BytesToAddress(v[:20]), timeout: binary.BigEndian.Uint64(v[20:]), minAmount: new(big.Int).SetBytes(v[28:60]),
++		multBps: binary.BigEndian.Uint32(v[60:]), optOutAt: int64(binary.BigEndian.Uint64(v[64:])), // #nosec G115 -- unix seconds
++		releaseAmount: new(big.Int).SetBytes(v[72:104]), releaseReady: int64(binary.BigEndian.Uint64(v[104:]))} // #nosec G115 -- unix seconds
++	if c.optOutAt > 0 && ctx.BlockTime().Unix() >= c.optOutAt {
++		return nil // opted out
++	}
++	return c
++}
++
++func (app *EVMD) setHoldCfg(ctx sdk.Context, a common.Address, c *holdCfg) {
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	k := append([]byte{holdCfgPfx}, a.Bytes()...)
++	if c == nil {
++		st.Delete(k)
++		st.Delete(append([]byte{holdStatsPfx}, a.Bytes()...))
++		return
++	}
++	v := append(c.guardian.Bytes(), u64(c.timeout)...)
++	v = append(v, common.LeftPadBytes(c.minAmount.Bytes(), 32)...)
++	v = binary.BigEndian.AppendUint32(v, c.multBps)
++	v = append(v, u64(uint64(c.optOutAt))...) // #nosec G115 -- unix seconds
++	v = append(v, common.LeftPadBytes(c.releaseAmount.Bytes(), 32)...)
++	st.Set(k, append(v, u64(uint64(c.releaseReady))...)) // #nosec G115 -- unix seconds
++}
++
++func (app *EVMD) holdStatsOf(ctx sdk.Context, a common.Address) (uint64, *big.Int) {
++	return app.holdStatsAt(ctx, append([]byte{holdStatsPfx}, a.Bytes()...))
++}
++
++func holdValidRule(minAmount *big.Int, multBps uint32) error {
++	if minAmount == nil || minAmount.Sign() <= 0 || minAmount.BitLen() > 255 || multBps < 10000 || multBps > 1_000_000 {
++		return errors.New("minAmount > 0, multBps 10000..1000000")
++	}
++	return nil
++}
++
++func (app *EVMD) holdOptIn(ctx sdk.Context, a, guardian common.Address, timeout uint64, minAmount *big.Int, multBps uint32) error {
++	if app.holdCfgOf(ctx, a) != nil {
++		return errors.New("holdOptIn: already opted in (opt out first; that waits the timeout)")
++	}
++	if guardian == (common.Address{}) || guardian == a {
++		return errors.New("holdOptIn: the guardian must be another account (a second key)")
++	}
++	if timeout < guardMinDelay || timeout > guardMaxDelay {
++		return fmt.Errorf("holdOptIn: timeout %d..%d seconds", guardMinDelay, guardMaxDelay)
++	}
++	if err := holdValidRule(minAmount, multBps); err != nil {
++		return fmt.Errorf("holdOptIn: %w", err)
++	}
++	// A fresh start: the profile and the token rules of an earlier opt-in go.
++	app.setHoldCfg(ctx, a, nil)
++	app.holdClearTokens(ctx, a)
++	app.setHoldCfg(ctx, a, &holdCfg{guardian: guardian, timeout: timeout, minAmount: minAmount, multBps: multBps, releaseAmount: new(big.Int)})
++	return nil
++}
++
++// holdRule is one profile rule of the hold: the native coin's (from
++// holdCfg) or a token's.
++type holdRule struct {
++	minAmount     *big.Int
++	multBps       uint32
++	optOutAt      int64 // token rules only; the native rule ends with the account's opt-out
++	releaseAmount *big.Int
++	releaseReady  int64
++}
++
++func (app *EVMD) holdStatsAt(ctx sdk.Context, key []byte) (uint64, *big.Int) {
++	v := app.secRaw(ctx).Get(key)
++	if len(v) != 40 {
++		return 0, new(big.Int)
++	}
++	return binary.BigEndian.Uint64(v), new(big.Int).SetBytes(v[8:])
++}
++
++// holdEval applies a rule to an outflow. check is what leaves the account
++// or is approved; learn is the part that teaches the profile (approvals do
++// not). In a block it also updates the profile and uses up the release
++// (save writes the rule back).
++func (app *EVMD) holdEval(ctx sdk.Context, statsKey []byte, r *holdRule, check, learn *big.Int, save func(), held func(count uint64, avg *big.Int) error) error {
++	if check.Sign() <= 0 {
++		return nil
++	}
++	count, avg := app.holdStatsAt(ctx, statsKey)
++	breaks := false
++	if check.Cmp(r.minAmount) > 0 {
++		lim := new(big.Int).Mul(avg, big.NewInt(int64(r.multBps)))
++		breaks = count < holdWarmup || new(big.Int).Mul(check, big.NewInt(10000)).Cmp(lim) > 0
++	}
++	now := ctx.BlockTime().Unix()
++	useRelease := false
++	if breaks {
++		if r.releaseReady > 0 && now >= r.releaseReady && now < r.releaseReady+guardDay && check.Cmp(r.releaseAmount) <= 0 {
++			useRelease = true
++		} else {
++			return held(count, avg)
++		}
++	}
++	if ctx.ExecMode() != sdk.ExecModeFinalize {
++		return nil
++	}
++	if useRelease {
++		r.releaseAmount.Sub(r.releaseAmount, check)
++		if r.releaseAmount.Sign() == 0 {
++			r.releaseReady = 0
++		}
++		save()
++	}
++	if learn == nil || learn.Sign() <= 0 {
++		return nil
++	}
++	if count == 0 {
++		avg.Set(learn)
++	} else { // avg += (learn - avg) / 8
++		d := new(big.Int).Sub(learn, avg)
++		avg.Add(avg, d.Quo(d, big.NewInt(8)))
++	}
++	for avg.BitLen() > 255 {
++		avg.Rsh(avg, 1)
++	}
++	v := append(u64(count+1), common.LeftPadBytes(avg.Bytes(), 32)...)
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(statsKey, v)
++	return nil
++}
++
++func holdBps(m uint32) string { return fmt.Sprintf("×%d.%02d", m/10000, m%10000/100) }
++
++// holdCheck applies the native rule to an outflow of the native coin.
++func (app *EVMD) holdCheck(ctx sdk.Context, a common.Address, check, learn *big.Int) error {
++	c := app.holdCfgOf(ctx, a)
++	if c == nil {
++		return nil
++	}
++	r := &holdRule{minAmount: c.minAmount, multBps: c.multBps, releaseAmount: c.releaseAmount, releaseReady: c.releaseReady}
++	return app.holdEval(ctx, append([]byte{holdStatsPfx}, a.Bytes()...), r, check, learn,
++		func() { c.releaseAmount, c.releaseReady = r.releaseAmount, r.releaseReady; app.setHoldCfg(ctx, a, c) },
++		func(count uint64, avg *big.Int) error {
++			return errorsmod.Wrapf(ErrGuard, "outflow of %s from %s is held: it breaks the account's profile (average %s over %d outflows, threshold %s, minimum %s). "+
++				"Call requestRelease(%s) on %s; it can go %d s later, or at once when the guardian %s calls confirmRelease",
++				check, a.Hex(), avg, count, holdBps(c.multBps), c.minAmount, check, GuardPrecompileAddress.Hex(), c.timeout, c.guardian.Hex())
++		})
++}
++
++// ---- ERC-20 rules of the anomaly hold
++
++const holdMaxTokens = 16
++
++var (
++	// Permit2's canonical address (a preinstall, setup-node.sh).
++	permit2Address = common.HexToAddress("0x000000000022D473030F116dDEE9F6B43aC78BA3")
++	ics20Address   = common.HexToAddress(evmtypes.ICS20PrecompileAddress)
++)
++
++func holdTokenKey(a, token common.Address) []byte {
++	return append(append([]byte{holdTokenPfx}, a.Bytes()...), token.Bytes()...)
++}
++
++func holdTokenStatsKey(a, token common.Address) []byte {
++	return append(append([]byte{holdTokenStatsPfx}, a.Bytes()...), token.Bytes()...)
++}
++
++// holdTokenRaw: the stored rule, opted out or not.
++func (app *EVMD) holdTokenRaw(ctx sdk.Context, a, token common.Address) *holdRule {
++	v := app.secRaw(ctx).Get(holdTokenKey(a, token))
++	if len(v) != 32+4+8+32+8 {
++		return nil
++	}
++	return &holdRule{minAmount: new(big.Int).SetBytes(v[:32]), multBps: binary.BigEndian.Uint32(v[32:]),
++		optOutAt: int64(binary.BigEndian.Uint64(v[36:])), releaseAmount: new(big.Int).SetBytes(v[44:76]), // #nosec G115 -- unix seconds
++		releaseReady: int64(binary.BigEndian.Uint64(v[76:]))} // #nosec G115 -- unix seconds
++}
++
++// holdTokenRuleOf: the token rule in force (the account opted in, the
++// token not opted out).
++func (app *EVMD) holdTokenRuleOf(ctx sdk.Context, a, token common.Address) *holdRule {
++	if app.holdCfgOf(ctx, a) == nil {
++		return nil
++	}
++	r := app.holdTokenRaw(ctx, a, token)
++	if r == nil || (r.optOutAt > 0 && ctx.BlockTime().Unix() >= r.optOutAt) {
++		return nil
++	}
++	return r
++}
++
++func (app *EVMD) setHoldTokenRule(ctx sdk.Context, a, token common.Address, r *holdRule) {
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if r == nil {
++		st.Delete(holdTokenKey(a, token))
++		st.Delete(holdTokenStatsKey(a, token))
++		return
++	}
++	v := append(common.LeftPadBytes(r.minAmount.Bytes(), 32), binary.BigEndian.AppendUint32(nil, r.multBps)...)
++	v = append(v, u64(uint64(r.optOutAt))...) // #nosec G115 -- unix seconds
++	v = append(v, common.LeftPadBytes(r.releaseAmount.Bytes(), 32)...)
++	st.Set(holdTokenKey(a, token), append(v, u64(uint64(r.releaseReady))...)) // #nosec G115 -- unix seconds
++}
++
++// holdTokenList: the tokens with a stored rule (at most holdMaxTokens), in
++// store order.
++func (app *EVMD) holdTokenList(ctx sdk.Context, a common.Address) []common.Address {
++	pfx := append([]byte{holdTokenPfx}, a.Bytes()...)
++	it := storetypes.KVStorePrefixIterator(app.secRaw(ctx), pfx)
++	defer it.Close()
++	var out []common.Address
++	for ; it.Valid() && len(out) < holdMaxTokens; it.Next() {
++		if k := it.Key(); len(k) == len(pfx)+20 {
++			out = append(out, common.BytesToAddress(k[len(pfx):]))
++		}
++	}
++	return out
++}
++
++func (app *EVMD) holdClearTokens(ctx sdk.Context, a common.Address) {
++	for _, t := range app.holdTokenList(ctx, a) {
++		app.setHoldTokenRule(ctx, a, t, nil)
++	}
++}
++
++// holdNativeToken: the token is an ERC-20 interface of the EVM coin itself
++// (0xEeee…EEeE on ZETAPHY): its outflows count under the native rule.
++func (app *EVMD) holdNativeToken(ctx sdk.Context, token common.Address) bool {
++	p, ok := app.Erc20Keeper.GetTokenPair(ctx, app.Erc20Keeper.GetTokenPairID(ctx, token.Hex()))
++	return ok && p.Denom == evmtypes.GetEVMCoinDenom()
++}
++
++func (app *EVMD) holdTokenOptIn(ctx sdk.Context, a, token common.Address, minAmount *big.Int, multBps uint32) error {
++	if app.holdCfgOf(ctx, a) == nil {
++		return errors.New("holdToken: opt in first (holdOptIn); a token rule uses the account's guardian and timeout")
++	}
++	if token == (common.Address{}) || app.holdNativeToken(ctx, token) {
++		return errors.New("holdToken: that is the native coin, which the account's main rule already covers")
++	}
++	if app.holdTokenRuleOf(ctx, a, token) != nil {
++		return errors.New("holdToken: that token is held already (opt it out first; that waits the timeout)")
++	}
++	if err := holdValidRule(minAmount, multBps); err != nil {
++		return fmt.Errorf("holdToken: %w", err)
++	}
++	if app.holdTokenRaw(ctx, a, token) == nil && len(app.holdTokenList(ctx, a)) >= holdMaxTokens {
++		return fmt.Errorf("holdToken: at most %d tokens per account", holdMaxTokens)
++	}
++	app.setHoldTokenRule(ctx, a, token, nil) // an opted-out rule and its profile go
++	app.setHoldTokenRule(ctx, a, token, &holdRule{minAmount: minAmount, multBps: multBps, releaseAmount: new(big.Int)})
++	return nil
++}
++
++// holdTokenCheck applies a token rule to an outflow of that token.
++func (app *EVMD) holdTokenCheck(ctx sdk.Context, a, token common.Address, check, learn *big.Int) error {
++	r := app.holdTokenRuleOf(ctx, a, token)
++	if r == nil {
++		return nil
++	}
++	c := app.holdCfgOf(ctx, a)
++	return app.holdEval(ctx, holdTokenStatsKey(a, token), r, check, learn,
++		func() { app.setHoldTokenRule(ctx, a, token, r) },
++		func(count uint64, avg *big.Int) error {
++			return errorsmod.Wrapf(ErrGuard, "outflow (or approval) of %s of token %s from %s is held: it breaks the account's profile for that token (average %s over %d outflows, threshold %s, minimum %s). "+
++				"Call requestTokenRelease(%s, %s) on %s; it can go %d s later, or at once when the guardian %s calls confirmTokenRelease",
++				check, token.Hex(), a.Hex(), avg, count, holdBps(r.multBps), r.minAmount, token.Hex(), check, GuardPrecompileAddress.Hex(), c.timeout, c.guardian.Hex())
++		})
++}
++
++// holdFlow is one outflow of an asset: the zero address is the native coin.
++type holdFlow struct {
++	asset  common.Address
++	amount *big.Int
++	learn  bool // a transfer (true) or an approval (false)
++}
++
++// holdTokenAsset: where an outflow of token counts for account a.
++func (app *EVMD) holdTokenAsset(ctx sdk.Context, a, token common.Address) (common.Address, bool) {
++	if app.secRaw(ctx).Has(holdTokenKey(a, token)) {
++		return token, true
++	}
++	if app.holdNativeToken(ctx, token) {
++		return common.Address{}, true
++	}
++	return common.Address{}, false
++}
++
++// holdDenomAsset: where an outflow of a bank coin counts (the coin of a
++// token pair counts as its ERC-20).
++func (app *EVMD) holdDenomAsset(ctx sdk.Context, a common.Address, denom string) (common.Address, bool) {
++	if denom == evmtypes.GetEVMCoinDenom() {
++		return common.Address{}, true
++	}
++	if common.IsHexAddress(denom) {
++		return common.Address{}, false
++	}
++	p, ok := app.Erc20Keeper.GetTokenPair(ctx, app.Erc20Keeper.GetTokenPairID(ctx, denom))
++	if !ok || !common.IsHexAddress(p.Erc20Address) {
++		return common.Address{}, false
++	}
++	return app.holdTokenAsset(ctx, a, common.HexToAddress(p.Erc20Address))
++}
++
++// holdCallFlows: the token outflows a call's calldata states for the
++// signer (ERC-20 transfer / transferFrom(self, …) / approve /
++// increaseAllowance, Permit2's approve, the ICS-20 precompile's transfer).
++func (app *EVMD) holdCallFlows(ctx sdk.Context, from, to common.Address, data []byte) []holdFlow {
++	if len(data) < 4 {
++		return nil
++	}
++	word := func(i int) []byte {
++		if len(data) < 4+32*(i+1) {
++			return nil
++		}
++		return data[4+32*i : 4+32*(i+1)]
++	}
++	num := func(i int) *big.Int {
++		if w := word(i); w != nil {
++			return new(big.Int).SetBytes(w)
++		}
++		return nil
++	}
++	var out []holdFlow
++	token := func(t common.Address, amt *big.Int, learn bool) {
++		if amt == nil || amt.Sign() <= 0 {
++			return
++		}
++		if asset, ok := app.holdTokenAsset(ctx, from, t); ok {
++			out = append(out, holdFlow{asset, amt, learn})
++		}
++	}
++	switch binary.BigEndian.Uint32(data) {
++	case 0xa9059cbb: // transfer(to, amount)
++		token(to, num(1), true)
++	case 0x23b872dd: // transferFrom(from, to, amount): the signer's own tokens
++		if w := word(0); w != nil && common.BytesToAddress(w) == from {
++			token(to, num(2), true)
++		}
++	case 0x095ea7b3, 0x39509351: // approve, increaseAllowance(spender, amount)
++		token(to, num(1), false)
++	case 0x87517c45: // Permit2 approve(token, spender, amount uint160, expiration)
++		if to == permit2Address {
++			if w := word(0); w != nil {
++				token(common.BytesToAddress(w), num(2), false)
++			}
++		}
++	}
++	if m, ok := ics20.ABI.Methods[ics20.TransferMethod]; ok && to == ics20Address && bytes.Equal(data[:4], m.ID) {
++		if args, err := m.Inputs.Unpack(data[4:]); err == nil && len(args) >= 5 {
++			denom, _ := args[2].(string)
++			amt, _ := args[3].(*big.Int)
++			sender, _ := args[4].(common.Address)
++			if amt != nil && amt.Sign() > 0 && sender == from {
++				if asset, ok := app.holdDenomAsset(ctx, from, denom); ok {
++					out = append(out, holdFlow{asset, amt, true})
++				}
++			}
++		}
++	}
++	return out
++}
++
++// holdFlows: every outflow of an action, the native value included.
++func (app *EVMD) holdFlows(ctx sdk.Context, act guardAction) []holdFlow {
++	var out []holdFlow
++	if act.value != nil && act.value.Sign() > 0 {
++		out = append(out, holdFlow{common.Address{}, act.value, true})
++	}
++	// The hold's lookups are free (only opted-in accounts get here).
++	ctx = ctx.WithGasMeter(storetypes.NewInfiniteGasMeter()).WithKVGasConfig(storetypes.GasConfig{})
++	if act.to != nil {
++		out = append(out, app.holdCallFlows(ctx, act.from, *act.to, act.data)...)
++	}
++	for _, c := range act.coins {
++		if c.Amount.IsPositive() {
++			if asset, ok := app.holdDenomAsset(ctx, act.from, c.Denom); ok {
++				out = append(out, holdFlow{asset, c.Amount.BigInt(), true})
++			}
++		}
++	}
++	for _, t := range act.tokens {
++		if t.amount != nil && t.amount.Sign() > 0 {
++			if asset, ok := app.holdTokenAsset(ctx, act.from, t.token); ok {
++				out = append(out, holdFlow{asset, t.amount, true})
++			}
++		}
++	}
++	return out
++}
++
++// ---- the ante rule
++
++type guardTokenOut struct {
++	token  common.Address
++	amount *big.Int
++}
++
++type guardAction struct {
++	from      common.Address
++	to        *common.Address
++	value     *big.Int  // the native coin
++	data      []byte    // calldata
++	coins     sdk.Coins // the other bank coins sent
++	tokens    []guardTokenOut
++	delegated []common.Address // EIP-7702: the authorities of the tx's code delegations (shield height on)
++}
++
++// guardSplitCoins: the native amount, and the other coins.
++func guardSplitCoins(cs sdk.Coins) (*big.Int, sdk.Coins) {
++	denom := evmtypes.GetEVMCoinDenom()
++	var other sdk.Coins
++	for _, c := range cs {
++		if c.Denom != denom {
++			other = append(other, c)
++		}
++	}
++	return cs.AmountOf(denom).BigInt(), other
++}
++
++// guardDelegations: the authorities of an Ethereum tx's EIP-7702 code
++// delegations (those whose signature recovers).
++func guardDelegations(t *ethtypes.Transaction) []common.Address {
++	var out []common.Address
++	for _, auth := range t.SetCodeAuthorizations() {
++		if a, err := auth.Authority(); err == nil {
++			out = append(out, a)
++		}
++	}
++	return out
++}
++
++// guardActionsOf: the actions of a tx's messages (zetaphyTxMsgs). strict (the
++// shield height on): every message or the tx is refused, and the code
++// delegations of Ethereum txs are listed.
++func guardActionsOf(tx sdk.Tx, strict bool) ([]guardAction, error) {
++	var out []guardAction
++	msgs, err := zetaphyTxMsgs(tx, strict)
++	if err != nil {
++		return nil, err
++	}
++	for i := 0; i < len(msgs); i++ {
++		switch m := msgs[i].(type) {
++		case *evmtypes.MsgEthereumTx:
++			if t := m.AsTransaction(); t != nil {
++				act := guardAction{from: common.BytesToAddress(m.From), to: t.To(), value: t.Value(), data: t.Data()}
++				if strict {
++					act.delegated = guardDelegations(t)
++				}
++				out = append(out, act)
++			}
++		case *MsgEVMCall:
++			if isGovAddr(m.Sender) {
++				continue
++			}
++			from := m.Sender
++			if m.AsOwner != "" {
++				from = m.AsOwner
++			}
++			f, err := pqAddr(from)
++			if err != nil {
++				continue
++			}
++			var to *common.Address
++			if common.IsHexAddress(m.To) {
++				t := common.HexToAddress(m.To)
++				to = &t
++			}
++			v, _ := new(big.Int).SetString(m.Value, 10)
++			if v == nil || v.Sign() < 0 {
++				v = new(big.Int)
++			}
++			out = append(out, guardAction{from: common.BytesToAddress(f), to: to, value: v, data: m.Data})
++		case *banktypes.MsgSend:
++			f, err1 := pqAddr(m.FromAddress)
++			t, err2 := pqAddr(m.ToAddress)
++			if err1 != nil || err2 != nil {
++				continue
++			}
++			to := common.BytesToAddress(t)
++			v, other := guardSplitCoins(m.Amount)
++			out = append(out, guardAction{from: common.BytesToAddress(f), to: &to, value: v, coins: other})
++		case *banktypes.MsgMultiSend:
++			for _, in := range m.Inputs {
++				if f, err := pqAddr(in.Address); err == nil {
++					v, other := guardSplitCoins(in.Coins)
++					out = append(out, guardAction{from: common.BytesToAddress(f), value: v, coins: other})
++				}
++			}
++			for _, o := range m.Outputs {
++				if t, err := pqAddr(o.Address); err == nil && len(m.Inputs) > 0 {
++					if f, err := pqAddr(m.Inputs[0].Address); err == nil {
++						to := common.BytesToAddress(t)
++						out = append(out, guardAction{from: common.BytesToAddress(f), to: &to, value: new(big.Int)})
++					}
++				}
++			}
++		case *transfertypes.MsgTransfer: // to another chain
++			if f, err := pqAddr(m.Sender); err == nil && !m.Token.Amount.IsNil() {
++				v, other := guardSplitCoins(sdk.Coins{m.Token})
++				out = append(out, guardAction{from: common.BytesToAddress(f), value: v, coins: other})
++			}
++		case *erc20types.MsgConvertERC20: // token -> coin, for receiver
++			r, err := pqAddr(m.Receiver)
++			if err != nil || !common.IsHexAddress(m.Sender) || !common.IsHexAddress(m.ContractAddress) || m.Amount.IsNil() {
++				continue
++			}
++			from, to := common.HexToAddress(m.Sender), common.BytesToAddress(r)
++			if to == from {
++				continue
++			}
++			out = append(out, guardAction{from: from, to: &to, value: new(big.Int),
++				tokens: []guardTokenOut{{common.HexToAddress(m.ContractAddress), m.Amount.BigInt()}}})
++		case *erc20types.MsgConvertCoin: // coin -> token, for receiver
++			f, err := pqAddr(m.Sender)
++			if err != nil || !common.IsHexAddress(m.Receiver) || m.Coin.Amount.IsNil() {
++				continue
++			}
++			from, to := common.BytesToAddress(f), common.HexToAddress(m.Receiver)
++			if to == from {
++				continue
++			}
++			v, other := guardSplitCoins(sdk.Coins{m.Coin})
++			out = append(out, guardAction{from: from, to: &to, value: v, coins: other})
++		}
++	}
++	return out, nil
++}
++
++func (app *EVMD) guardEnrolled(ctx sdk.Context, a common.Address) bool {
++	st := app.secRaw(ctx)
++	return st.Has(append([]byte{guardProtectPfx}, a.Bytes()...)) || st.Has(append([]byte{holdCfgPfx}, a.Bytes()...))
++}
++
++// guardActions runs both rules over a tx's actions.
++func (app *EVMD) guardActions(ctx sdk.Context, acts []guardAction) error {
++	if len(acts) == 0 || !app.futV5(ctx, ctx.BlockHeight()) {
++		return nil
++	}
++	type key struct{ from, asset common.Address }
++	type sum struct{ check, learn *big.Int }
++	sums := map[key]*sum{}
++	var order []key // in order of first appearance: deterministic
++	for _, act := range acts {
++		// The shield (zetaphy_shield.go): a protected account's code is never
++		// delegated (EIP-7702), whoever sends the tx; turning protection off
++		// first waits its delay.
++		for _, a := range act.delegated {
++			if app.guardInForce(ctx, a) {
++				return errorsmod.Wrapf(ErrGuard, "%s is protected by the account guard: an EIP-7702 code delegation for it is refused. "+
++					"Turn protection off (and opt out of the hold) first; that waits its delay", a.Hex())
++			}
++		}
++		if !app.guardEnrolled(ctx, act.from) {
++			continue
++		}
++		if err := app.guardCheckProtected(ctx, act.from, guardTargets(act.to, act.data)); err != nil {
++			return err
++		}
++		if app.holdCfgOf(ctx, act.from) == nil {
++			continue
++		}
++		for _, f := range app.holdFlows(ctx, act) {
++			k := key{act.from, f.asset}
++			if sums[k] == nil {
++				sums[k] = &sum{new(big.Int), new(big.Int)}
++				order = append(order, k)
++			}
++			sums[k].check.Add(sums[k].check, f.amount)
++			if f.learn {
++				sums[k].learn.Add(sums[k].learn, f.amount)
++			}
++		}
++	}
++	for _, k := range order {
++		var err error
++		if k.asset == (common.Address{}) {
++			err = app.holdCheck(ctx, k.from, sums[k].check, sums[k].learn)
++		} else {
++			err = app.holdTokenCheck(ctx, k.from, k.asset, sums[k].check, sums[k].learn)
++		}
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (app *EVMD) guardTx(ctx sdk.Context, tx sdk.Tx) error {
++	if !app.futV5(ctx, ctx.BlockHeight()) {
++		return nil
++	}
++	acts, err := guardActionsOf(tx, app.shieldActive(ctx))
++	if err != nil {
++		return err
++	}
++	return app.guardActions(ctx, acts)
++}
++
++// guardMempoolCheck: the same rules when an EVM tx is submitted.
++func (app *EVMD) guardMempoolCheck(from common.Address, tx *ethtypes.Transaction) error {
++	ctx, err := app.CreateQueryContext(0, false)
++	if err != nil {
++		return nil
++	}
++	ctx = ctx.WithBlockHeight(ctx.BlockHeight() + 1).WithExecMode(sdk.ExecModeCheck)
++	act := guardAction{from: from, to: tx.To(), value: tx.Value(), data: tx.Data()}
++	if app.shieldActive(ctx) {
++		act.delegated = guardDelegations(tx)
++	}
++	return app.guardActions(ctx, []guardAction{act})
++}
++
++// zetaphyMempoolCheck: the checks the EVM mempool runs at submission.
++func (app *EVMD) zetaphyMempoolCheck(from common.Address, tx *ethtypes.Transaction) error {
++	if err := app.threatMempoolCheck(from, tx); err != nil {
++		return err
++	}
++	return app.guardMempoolCheck(from, tx)
++}
++
++// ---- precompile 0x…0904
++
++const guardABIJSON = `[
++ {"type":"function","name":"protect","stateMutability":"nonpayable","inputs":[{"name":"mode","type":"uint8"},{"name":"delaySeconds","type":"uint64"}],"outputs":[{"name":"effectiveAt","type":"uint64"}]},
++ {"type":"function","name":"protection","stateMutability":"view","inputs":[{"name":"account","type":"address"}],"outputs":[{"name":"mode","type":"uint8"},{"name":"delaySeconds","type":"uint64"},{"name":"pendingMode","type":"uint8"},{"name":"pendingAt","type":"uint64"}]},
++ {"type":"function","name":"queue","stateMutability":"nonpayable","inputs":[{"name":"target","type":"address"}],"outputs":[{"name":"usableFrom","type":"uint64"}]},
++ {"type":"function","name":"queuedFrom","stateMutability":"view","inputs":[{"name":"account","type":"address"},{"name":"target","type":"address"}],"outputs":[{"name":"usableFrom","type":"uint64"}]},
++ {"type":"function","name":"highRisk","stateMutability":"view","inputs":[{"name":"target","type":"address"}],"outputs":[{"name":"risky","type":"bool"},{"name":"why","type":"string"}]},
++ {"type":"function","name":"holdOptIn","stateMutability":"nonpayable","inputs":[{"name":"guardian","type":"address"},{"name":"timeoutSeconds","type":"uint64"},{"name":"minAmount","type":"uint256"},{"name":"multBps","type":"uint32"}],"outputs":[]},
++ {"type":"function","name":"holdOptOut","stateMutability":"nonpayable","inputs":[],"outputs":[{"name":"at","type":"uint64"}]},
++ {"type":"function","name":"cancelOptOut","stateMutability":"nonpayable","inputs":[{"name":"account","type":"address"}],"outputs":[]},
++ {"type":"function","name":"requestRelease","stateMutability":"nonpayable","inputs":[{"name":"amount","type":"uint256"}],"outputs":[{"name":"readyAt","type":"uint64"}]},
++ {"type":"function","name":"confirmRelease","stateMutability":"nonpayable","inputs":[{"name":"account","type":"address"}],"outputs":[]},
++ {"type":"function","name":"cancelRelease","stateMutability":"nonpayable","inputs":[{"name":"account","type":"address"}],"outputs":[]},
++ {"type":"function","name":"holdToken","stateMutability":"nonpayable","inputs":[{"name":"token","type":"address"},{"name":"minAmount","type":"uint256"},{"name":"multBps","type":"uint32"}],"outputs":[]},
++ {"type":"function","name":"holdTokenOptOut","stateMutability":"nonpayable","inputs":[{"name":"token","type":"address"}],"outputs":[{"name":"at","type":"uint64"}]},
++ {"type":"function","name":"cancelTokenOptOut","stateMutability":"nonpayable","inputs":[{"name":"account","type":"address"},{"name":"token","type":"address"}],"outputs":[]},
++ {"type":"function","name":"requestTokenRelease","stateMutability":"nonpayable","inputs":[{"name":"token","type":"address"},{"name":"amount","type":"uint256"}],"outputs":[{"name":"readyAt","type":"uint64"}]},
++ {"type":"function","name":"confirmTokenRelease","stateMutability":"nonpayable","inputs":[{"name":"account","type":"address"},{"name":"token","type":"address"}],"outputs":[]},
++ {"type":"function","name":"cancelTokenRelease","stateMutability":"nonpayable","inputs":[{"name":"account","type":"address"},{"name":"token","type":"address"}],"outputs":[]},
++ {"type":"function","name":"holdTokenState","stateMutability":"view","inputs":[{"name":"account","type":"address"},{"name":"token","type":"address"}],"outputs":[{"name":"minAmount","type":"uint256"},{"name":"multBps","type":"uint32"},{"name":"count","type":"uint64"},{"name":"average","type":"uint256"},{"name":"releaseAmount","type":"uint256"},{"name":"releaseReadyAt","type":"uint64"},{"name":"optOutAt","type":"uint64"}]},
++ {"type":"function","name":"holdTokens","stateMutability":"view","inputs":[{"name":"account","type":"address"}],"outputs":[{"name":"tokens","type":"address[]"}]},
++ {"type":"function","name":"holdState","stateMutability":"view","inputs":[{"name":"account","type":"address"}],"outputs":[{"name":"guardian","type":"address"},{"name":"timeoutSeconds","type":"uint64"},{"name":"minAmount","type":"uint256"},{"name":"multBps","type":"uint32"},{"name":"count","type":"uint64"},{"name":"average","type":"uint256"},{"name":"releaseAmount","type":"uint256"},{"name":"releaseReadyAt","type":"uint64"},{"name":"optOutAt","type":"uint64"}]}
++]`
++
++// GuardABI is the account guard precompile's ABI.
++var GuardABI = func() abi.ABI {
++	a, err := abi.JSON(bytes.NewReader([]byte(guardABIJSON)))
++	if err != nil {
++		panic(err)
++	}
++	return a
++}()
++
++type guardPrecompile struct {
++	cmn.Precompile
++	app *EVMD
++}
++
++func newGuardPrecompile(app *EVMD) *guardPrecompile {
++	return &guardPrecompile{Precompile: cmn.Precompile{
++		KvGasConfig: storetypes.KVGasConfig(), TransientKVGasConfig: storetypes.TransientGasConfig(),
++		ContractAddress: GuardPrecompileAddress,
++	}, app: app}
++}
++
++func (*guardPrecompile) Name() string { return "zetaphy-guard" }
++
++func guardIsTx(m *abi.Method) bool { return !m.IsConstant() }
++
++func (p *guardPrecompile) RequiredGas(input []byte) uint64 {
++	if len(input) < 4 {
++		return 0
++	}
++	m, err := GuardABI.MethodById(input[:4])
++	if err != nil {
++		return 0
++	}
++	return p.Precompile.RequiredGas(input, guardIsTx(m))
++}
++
++func (p *guardPrecompile) Run(evm *vm.EVM, contract *vm.Contract, readonly bool) ([]byte, error) {
++	return p.RunNativeAction(evm, contract, func(ctx sdk.Context) ([]byte, error) {
++		method, args, err := cmn.SetupABI(GuardABI, contract, readonly, guardIsTx)
++		if err != nil {
++			return nil, err
++		}
++		if v := contract.Value(); v != nil && !v.IsZero() {
++			return nil, errors.New("the guard precompile takes no value")
++		}
++		return p.execute(ctx, method, args, contract.Caller())
++	})
++}
++
++func (p *guardPrecompile) execute(ctx sdk.Context, method *abi.Method, args []any, caller common.Address) ([]byte, error) {
++	app, now := p.app, ctx.BlockTime().Unix()
++	event := func(name string, attrs ...string) {
++		e := sdk.NewEvent("zetaphy_guard_"+name, sdk.NewAttribute("account", caller.Hex()))
++		for i := 0; i+1 < len(attrs); i += 2 {
++			e = e.AppendAttributes(sdk.NewAttribute(attrs[i], attrs[i+1]))
++		}
++		ctx.EventManager().EmitEvent(e)
++	}
++	switch method.Name {
++	case "protect":
++		at, err := app.guardProtect(ctx, caller, args[0].(uint8), args[1].(uint64))
++		if err != nil {
++			return nil, err
++		}
++		event("protect", "mode", fmt.Sprint(args[0]), "effective_at", fmt.Sprint(at))
++		return method.Outputs.Pack(uint64(at)) // #nosec G115 -- unix seconds
++	case "protection":
++		cur := app.guardProtectionOf(ctx, args[0].(common.Address))
++		raw := app.guardProtectionRaw(ctx, args[0].(common.Address))
++		if raw.pendAt <= now {
++			raw.pendMode, raw.pendAt = 0, 0
++		}
++		return method.Outputs.Pack(cur.mode, cur.delay, raw.pendMode, uint64(raw.pendAt)) // #nosec G115 -- unix seconds
++	case "queue":
++		pr := app.guardProtectionOf(ctx, caller)
++		if pr.mode != guardModeQueue {
++			return nil, errors.New("queue: only in protection mode 1 (delay queue)")
++		}
++		target := args[0].(common.Address)
++		from := now + int64(pr.delay)                                                             // #nosec G115 -- at most 30 days
++		ctx.KVStore(app.GetKey(pqStoreKey)).Set(guardQueueKey(caller, target), u64(uint64(from))) // #nosec G115 -- unix seconds
++		event("queue", "target", target.Hex(), "usable_from", fmt.Sprint(from))
++		return method.Outputs.Pack(uint64(from)) // #nosec G115 -- unix seconds
++	case "queuedFrom":
++		return method.Outputs.Pack(readU64(app.secRaw(ctx).Get(guardQueueKey(args[0].(common.Address), args[1].(common.Address)))))
++	case "highRisk":
++		ctx.GasMeter().ConsumeGas(threatGateGas, "zetaphy guard risk check")
++		r, why := app.guardHighRisk(ctx, args[0].(common.Address))
++		return method.Outputs.Pack(r, why)
++	case "holdOptIn":
++		if err := app.holdOptIn(ctx, caller, args[0].(common.Address), args[1].(uint64), args[2].(*big.Int), args[3].(uint32)); err != nil {
++			return nil, err
++		}
++		event("hold_opt_in", "guardian", args[0].(common.Address).Hex())
++		return method.Outputs.Pack()
++	case "holdOptOut":
++		c := app.holdCfgOf(ctx, caller)
++		if c == nil {
++			return nil, errors.New("holdOptOut: not opted in")
++		}
++		if c.optOutAt == 0 {
++			c.optOutAt = now + int64(c.timeout) // #nosec G115 -- at most 30 days
++			app.setHoldCfg(ctx, caller, c)
++		}
++		event("hold_opt_out", "at", fmt.Sprint(c.optOutAt))
++		return method.Outputs.Pack(uint64(c.optOutAt)) // #nosec G115 -- unix seconds
++	case "cancelOptOut", "confirmRelease", "cancelRelease":
++		acct := args[0].(common.Address)
++		c := app.holdCfgOf(ctx, acct)
++		if c == nil {
++			return nil, errors.New("that account is not opted in")
++		}
++		if caller != c.guardian && (method.Name != "cancelRelease" || caller != acct) {
++			return nil, errors.New("only the account's guardian (or, to cancel a release, the account)")
++		}
++		switch method.Name {
++		case "cancelOptOut":
++			c.optOutAt = 0
++		case "confirmRelease":
++			if c.releaseAmount.Sign() == 0 {
++				return nil, errors.New("confirmRelease: nothing was requested")
++			}
++			c.releaseReady = now
++		case "cancelRelease":
++			c.releaseAmount, c.releaseReady = new(big.Int), 0
++		}
++		app.setHoldCfg(ctx, acct, c)
++		event(method.Name, "for", acct.Hex())
++		return method.Outputs.Pack()
++	case "requestRelease":
++		c := app.holdCfgOf(ctx, caller)
++		amt := args[0].(*big.Int)
++		if c == nil || amt.Sign() <= 0 || amt.BitLen() > 255 {
++			return nil, errors.New("requestRelease: opt in first, and ask for a positive amount")
++		}
++		c.releaseAmount, c.releaseReady = new(big.Int).Set(amt), now+int64(c.timeout) // #nosec G115 -- at most 30 days
++		app.setHoldCfg(ctx, caller, c)
++		event("request_release", "amount", amt.String(), "ready_at", fmt.Sprint(c.releaseReady))
++		return method.Outputs.Pack(uint64(c.releaseReady)) // #nosec G115 -- unix seconds
++	case "holdToken":
++		token := args[0].(common.Address)
++		if err := app.holdTokenOptIn(ctx, caller, token, args[1].(*big.Int), args[2].(uint32)); err != nil {
++			return nil, err
++		}
++		event("hold_token", "token", token.Hex())
++		return method.Outputs.Pack()
++	case "holdTokenOptOut":
++		token := args[0].(common.Address)
++		c, r := app.holdCfgOf(ctx, caller), app.holdTokenRuleOf(ctx, caller, token)
++		if c == nil || r == nil {
++			return nil, errors.New("holdTokenOptOut: that token is not held")
++		}
++		if r.optOutAt == 0 {
++			r.optOutAt = now + int64(c.timeout) // #nosec G115 -- at most 30 days
++			app.setHoldTokenRule(ctx, caller, token, r)
++		}
++		event("hold_token_opt_out", "token", token.Hex(), "at", fmt.Sprint(r.optOutAt))
++		return method.Outputs.Pack(uint64(r.optOutAt)) // #nosec G115 -- unix seconds
++	case "cancelTokenOptOut", "confirmTokenRelease", "cancelTokenRelease":
++		acct, token := args[0].(common.Address), args[1].(common.Address)
++		c, r := app.holdCfgOf(ctx, acct), app.holdTokenRuleOf(ctx, acct, token)
++		if c == nil || r == nil {
++			return nil, errors.New("that account does not hold that token")
++		}
++		if caller != c.guardian && (method.Name != "cancelTokenRelease" || caller != acct) {
++			return nil, errors.New("only the account's guardian (or, to cancel a release, the account)")
++		}
++		switch method.Name {
++		case "cancelTokenOptOut":
++			r.optOutAt = 0
++		case "confirmTokenRelease":
++			if r.releaseAmount.Sign() == 0 {
++				return nil, errors.New("confirmTokenRelease: nothing was requested")
++			}
++			r.releaseReady = now
++		case "cancelTokenRelease":
++			r.releaseAmount, r.releaseReady = new(big.Int), 0
++		}
++		app.setHoldTokenRule(ctx, acct, token, r)
++		event(method.Name, "for", acct.Hex(), "token", token.Hex())
++		return method.Outputs.Pack()
++	case "requestTokenRelease":
++		token, amt := args[0].(common.Address), args[1].(*big.Int)
++		c, r := app.holdCfgOf(ctx, caller), app.holdTokenRuleOf(ctx, caller, token)
++		if c == nil || r == nil || amt.Sign() <= 0 {
++			return nil, errors.New("requestTokenRelease: hold the token first (holdToken), and ask for a positive amount")
++		}
++		// up to 2^256-1: an unlimited approval can be released too
++		r.releaseAmount, r.releaseReady = new(big.Int).Set(amt), now+int64(c.timeout) // #nosec G115 -- at most 30 days
++		app.setHoldTokenRule(ctx, caller, token, r)
++		event("request_token_release", "token", token.Hex(), "amount", amt.String(), "ready_at", fmt.Sprint(r.releaseReady))
++		return method.Outputs.Pack(uint64(r.releaseReady)) // #nosec G115 -- unix seconds
++	case "holdTokenState":
++		a, token := args[0].(common.Address), args[1].(common.Address)
++		r := app.holdTokenRuleOf(ctx, a, token)
++		if r == nil {
++			return method.Outputs.Pack(new(big.Int), uint32(0), uint64(0), new(big.Int), new(big.Int), uint64(0), uint64(0))
++		}
++		n, avg := app.holdStatsAt(ctx, holdTokenStatsKey(a, token))
++		return method.Outputs.Pack(r.minAmount, r.multBps, n, avg, r.releaseAmount, uint64(r.releaseReady), uint64(r.optOutAt)) // #nosec G115 -- unix seconds
++	case "holdTokens":
++		a := args[0].(common.Address)
++		var out []common.Address
++		for _, t := range app.holdTokenList(ctx, a) {
++			if app.holdTokenRuleOf(ctx, a, t) != nil {
++				out = append(out, t)
++			}
++		}
++		if out == nil {
++			out = []common.Address{}
++		}
++		return method.Outputs.Pack(out)
++	case "holdState":
++		a := args[0].(common.Address)
++		c := app.holdCfgOf(ctx, a)
++		if c == nil {
++			return method.Outputs.Pack(common.Address{}, uint64(0), new(big.Int), uint32(0), uint64(0), new(big.Int), new(big.Int), uint64(0), uint64(0))
++		}
++		n, avg := app.holdStatsOf(ctx, a)
++		return method.Outputs.Pack(c.guardian, c.timeout, c.minAmount, c.multBps, n, avg, c.releaseAmount, uint64(c.releaseReady), uint64(c.optOutAt)) // #nosec G115 -- unix seconds
++	}
++	return nil, fmt.Errorf("unknown method %s", method.Name)
++}
 diff --git a/evmd/zetaphy_ibchold.go b/evmd/zetaphy_ibchold.go
 new file mode 100644
-index 0000000..20a1db1
+index 0000000..d2c4757
 --- /dev/null
 +++ b/evmd/zetaphy_ibchold.go
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,549 @@
 +package evmd
 +
 +// ZETAPHY IBC large-transfer hold.
@@ -2570,12 +7355,33 @@ index 0000000..20a1db1
 +	return m.app.OnChanCloseConfirm(ctx, port, ch)
 +}
 +
++// The shield (zetaphy_shield.go): the invariant firewall checks the state a
++// packet left, as after an EVM tx (ERC-20 conversions and IBC callbacks run
++// EVM code). An acknowledgement or timeout that breaks an invariant fails.
 +func (m *ibcHoldMiddleware) OnAcknowledgementPacket(ctx sdk.Context, v string, p channeltypes.Packet, ack []byte, r sdk.AccAddress) error {
-+	return m.app.OnAcknowledgementPacket(ctx, v, p, ack, r)
++	if err := m.app.OnAcknowledgementPacket(ctx, v, p, ack, r); err != nil {
++		return err
++	}
++	return m.z.shieldFirewall(ctx)
 +}
 +
 +func (m *ibcHoldMiddleware) OnTimeoutPacket(ctx sdk.Context, v string, p channeltypes.Packet, r sdk.AccAddress) error {
-+	return m.app.OnTimeoutPacket(ctx, v, p, r)
++	if err := m.app.OnTimeoutPacket(ctx, v, p, r); err != nil {
++		return err
++	}
++	return m.z.shieldFirewall(ctx)
++}
++
++// shieldRecvAck: a received packet that broke an invariant gets an error
++// acknowledgement instead (IBC core then discards what it did).
++func (app *EVMD) shieldRecvAck(ctx sdk.Context, ack ibcexported.Acknowledgement) ibcexported.Acknowledgement {
++	if ack == nil || !ack.Success() {
++		return ack
++	}
++	if err := app.shieldFirewall(ctx); err != nil {
++		return channeltypes.NewErrorAcknowledgement(err)
++	}
++	return ack
 +}
 +
 +func (m *ibcHoldMiddleware) SetICS4Wrapper(w porttypes.ICS4Wrapper) { m.app.SetICS4Wrapper(w) }
@@ -2603,7 +7409,7 @@ index 0000000..20a1db1
 +			}
 +		}
 +	}
-+	return m.app.OnRecvPacket(ctx, version, packet, relayer)
++	return m.z.shieldRecvAck(ctx, m.app.OnRecvPacket(ctx, version, packet, relayer))
 +}
 +
 +func (app *EVMD) ibcHoldStore(ctx sdk.Context, version string, packet channeltypes.Packet, relayer sdk.AccAddress, denom string, data transfertypes.InternalTransferRepresentation) error {
@@ -2696,7 +7502,7 @@ index 0000000..20a1db1
 +				perr = fmt.Errorf("delivery failed: %v", r)
 +			}
 +		}()
-+		ack = app.ibcHoldStack.app.OnRecvPacket(appCtx, h.Version, packet, h.Relayer)
++		ack = app.shieldRecvAck(appCtx, app.ibcHoldStack.app.OnRecvPacket(appCtx, h.Version, packet, h.Relayer))
 +		return nil
 +	}(); perr != nil {
 +		// Out of gas or a panic: nothing of the delivery is kept, the source
@@ -2814,11 +7620,17 @@ index 0000000..20a1db1
 +}
 +
 +func (m *ibcHoldV2) OnTimeoutPacket(ctx sdk.Context, src, dst string, seq uint64, p channeltypesv2.Payload, r sdk.AccAddress) error {
-+	return m.app.OnTimeoutPacket(ctx, src, dst, seq, p, r)
++	if err := m.app.OnTimeoutPacket(ctx, src, dst, seq, p, r); err != nil {
++		return err
++	}
++	return m.z.shieldFirewall(ctx) // the shield, as on v1
 +}
 +
 +func (m *ibcHoldV2) OnAcknowledgementPacket(ctx sdk.Context, src, dst string, seq uint64, ack []byte, p channeltypesv2.Payload, r sdk.AccAddress) error {
-+	return m.app.OnAcknowledgementPacket(ctx, src, dst, seq, ack, p, r)
++	if err := m.app.OnAcknowledgementPacket(ctx, src, dst, seq, ack, p, r); err != nil {
++		return err
++	}
++	return m.z.shieldFirewall(ctx)
 +}
 +
 +func (m *ibcHoldV2) UnmarshalPacketData(p channeltypesv2.Payload) (any, error) {
@@ -2840,14 +7652,1173 @@ index 0000000..20a1db1
 +			}
 +		}
 +	}
-+	return m.app.OnRecvPacket(ctx, src, dst, seq, p, r)
++	res := m.app.OnRecvPacket(ctx, src, dst, seq, p, r)
++	if res.Status == channeltypesv2.PacketStatus_Success {
++		if err := m.z.shieldFirewall(ctx); err != nil { // the shield, as on v1
++			return channeltypesv2.RecvPacketResult{Status: channeltypesv2.PacketStatus_Failure, Acknowledgement: channeltypes.NewErrorAcknowledgement(err).Acknowledgement()}
++		}
++	}
++	return res
++}
+diff --git a/evmd/zetaphy_immune.go b/evmd/zetaphy_immune.go
+new file mode 100644
+index 0000000..7191070
+--- /dev/null
++++ b/evmd/zetaphy_immune.go
+@@ -0,0 +1,822 @@
++package evmd
++
++// ZETAPHY v5 chain immune system: validators score new contracts in their
++// vote extensions; the chain records the median.
++//
++// Timeline (ABCI++ makes a vote before the block it votes on runs, so the
++// vote at height H sees the state after H-1):
++//
++//	block N        a contract is deployed (a top-level creation: an
++//	               Ethereum tx or a MsgEVMCall without "to"); it is put in
++//	               the pending list of N (at most immuneMaxPerBlock, more
++//	               are left unscored with an event)
++//	vote on N+1    each validator scores the pending contracts of N from
++//	               their runtime bytecode (immuneCodeScore, a deterministic
++//	               subset of Neuro's rules) and adds the scores to its vote
++//	               extension, after the ML-DSA-44 vote signature
++//	block N+2      the proposer carries those extensions (MsgZXVotes, next to
++//	               the vote certificate); every node checks each one against
++//	               the validator's CometBFT signature and records, per
++//	               contract, the power-weighted median score, if validators
++//	               with more than 2/3 of the power sent one
++//
++// Vote extension layout: [ML-DSA-44 signature, 2420 bytes, when the
++// validator signs] || [v5 payload, when it has something to say]:
++//
++//	"ZX1" | n u8 | n × (contract 20 | score u16) | m u8 | m × bridge 20
++//
++// (contracts and bridges strictly increasing; the bridges are those the
++// validator flags, zetaphy_breaker.go). The PQ certificate keeps using the
++// signature part only, so its format and rule are unchanged. Before the v5
++// height a payload is refused, as any extra byte was before.
++//
++// Readable on chain through 0x…0903: scoreOf, and the ThreatRegistry views
++// isContractEnforced / isContractHeld (score at or above governance's
++// enforce_bps / hold_bps), so the threat gate (gov.sh threat-gate
++// 0x…0903 on) and BridgeGuard.setThreats can use it directly.
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"math/big"
++	"sort"
++
++	circl "github.com/cloudflare/circl/sign/mldsa/mldsa44"
++	abci "github.com/cometbft/cometbft/abci/types"
++	cryptoenc "github.com/cometbft/cometbft/crypto/encoding"
++	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
++	protoio "github.com/cosmos/gogoproto/io"
++	gogoproto "github.com/cosmos/gogoproto/proto"
++	"github.com/ethereum/go-ethereum/accounts/abi"
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/core/vm"
++
++	errorsmod "cosmossdk.io/errors"
++
++	cmn "github.com/cosmos/evm/precompiles/common"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
++)
++
++const (
++	immuneMaxPerBlock = 16  // contracts scored per block
++	breakerMax        = 4   // watched bridges
++	zxMaxEntries      = 200 // validators in one MsgZXVotes
++	zxMaxPayload      = 3 + 1 + immuneMaxPerBlock*22 + 1 + breakerMax*20
++	zxMaxEntriesBytes = 1 << 20
++)
++
++// immuneParams (governance, MsgSetFuture kind "immune").
++type immuneParams struct {
++	Enabled    bool   `json:"enabled"`
++	EnforceBps uint16 `json:"enforce_bps"` // isContractEnforced from this score (0: never)
++	HoldBps    uint16 `json:"hold_bps"`    // isContractHeld from this score (0: never)
++	ProtectBps uint16 `json:"protect_bps"` // protected accounts treat a contract as high-risk from this score (0: 7000)
++}
++
++func (p immuneParams) validate() error {
++	if p.EnforceBps > 10000 || p.HoldBps > 10000 || p.ProtectBps > 10000 {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "scores are basis points: 0..10000")
++	}
++	return nil
++}
++
++func (app *EVMD) immuneParams(ctx sdk.Context) immuneParams {
++	var p immuneParams
++	if raw := app.secRaw(ctx).Get(immuneParamsKey); raw != nil {
++		_ = json.Unmarshal(raw, &p)
++	}
++	if p.ProtectBps == 0 {
++		p.ProtectBps = 7000
++	}
++	return p
++}
++
++// ---- bytecode score (a deterministic subset of zetaphy-neuro/src rules)
++
++const (
++	selMint = iota + 1
++	selBlacklist
++	selFee
++	selTrading
++	selTaxWallet
++)
++
++// immuneSelectors: Neuro's selectors (src/selectors.generated.js) of the
++// categories that make a token dangerous to hold.
++var immuneSelectors = map[uint32]int{
++	0x40c10f19: selMint, 0xa0712d68: selMint, 0x449a52f8: selMint, 0xcc872b66: selMint,
++	0xf9f92be4: selBlacklist, 0x404e5129: selBlacklist, 0x153b0d1e: selBlacklist, 0x44337ea1: selBlacklist,
++	0x537df3b6: selBlacklist, 0xfe575a87: selBlacklist, 0xb515566a: selBlacklist, 0x00b8cf2a: selBlacklist,
++	0xd34628cc: selBlacklist, 0x0ecb93c0: selBlacklist, 0xe4997dc5: selBlacklist, 0xf3bdc228: selBlacklist,
++	0x69fe0e2d: selFee, 0x0b78f9c0: selFee, 0xc4081a4c: selFee, 0x2e5bb6ff: selFee, 0x0cc835a3: selFee, 0x8b4cee08: selFee,
++	0x6db79437: selFee, 0xcec10c11: selFee, 0xc647b20e: selFee, 0x5cb23e12: selFee, 0x55e2e974: selFee, 0xe5dc6b21: selFee,
++	0x8095d564: selFee, 0xc17b5b8c: selFee, 0xec1f3f63: selFee, 0x2ff5fe1e: selFee, 0x57d0a982: selFee, 0x233e8700: selFee,
++	0xdc1052e2: selFee, 0x8cd09d50: selFee,
++	0xea414b28: selTaxWallet, 0x5d098b38: selTaxWallet,
++	0x8a8c523c: selTrading, 0xc9567bf9: selTrading, 0xc2e5ec04: selTrading, 0x8f70ccf7: selTrading, 0x293230b8: selTrading, 0xca72a4e7: selTrading,
++}
++
++// CodeFeatures is what immuneCodeScore reads from runtime bytecode.
++type CodeFeatures struct {
++	Size                                                  int
++	MinimalProxy                                          bool
++	SelfDestruct, DelegateCall, CallCode, Create2, Origin bool
++	ERC20                                                 bool
++	Mint, Blacklist, Fee, Trading, TaxWallet              int
++}
++
++var minimalProxyPrefix = common.FromHex("363d3d373d3d3d363d73")
++var minimalProxySuffix = common.FromHex("5af43d82803e903d91602b57fd5bf3")
++
++// ImmuneCodeFeatures walks the opcodes (skipping PUSH data, as Neuro's
++// src/bytecode.js) of the code without its Solidity metadata.
++func ImmuneCodeFeatures(code []byte) CodeFeatures {
++	f := CodeFeatures{Size: len(code)}
++	if len(code) == 45 && bytes.HasPrefix(code, minimalProxyPrefix) && bytes.HasSuffix(code, minimalProxySuffix) {
++		f.MinimalProxy = true
++		return f
++	}
++	end := len(code)
++	if end >= 4 { // CBOR metadata: its length is in the last 2 bytes
++		ml := int(code[end-2])<<8 | int(code[end-1])
++		if s := end - 2 - ml; ml > 0 && s > 0 && code[s] >= 0xa1 && code[s] <= 0xa5 {
++			end = s
++		}
++	}
++	var transfer, balanceOf, approve bool
++	for pc := 0; pc < end; pc++ {
++		op := code[pc]
++		switch op {
++		case 0xff:
++			f.SelfDestruct = true
++		case 0xf4:
++			f.DelegateCall = true
++		case 0xf2:
++			f.CallCode = true
++		case 0xf5:
++			f.Create2 = true
++		case 0x32:
++			f.Origin = true
++		}
++		if op >= 0x60 && op <= 0x7f {
++			n := int(op) - 0x5f
++			if n <= 4 && pc+n < len(code) {
++				var sel uint32
++				for _, b := range code[pc+1 : pc+1+n] {
++					sel = sel<<8 | uint32(b)
++				}
++				switch sel {
++				case 0xa9059cbb:
++					transfer = true
++				case 0x70a08231:
++					balanceOf = true
++				case 0x095ea7b3:
++					approve = true
++				}
++				switch immuneSelectors[sel] {
++				case selMint:
++					f.Mint++
++				case selBlacklist:
++					f.Blacklist++
++				case selFee:
++					f.Fee++
++				case selTrading:
++					f.Trading++
++				case selTaxWallet:
++					f.TaxWallet++
++				}
++			}
++			pc += n
++		}
++	}
++	f.ERC20 = transfer && balanceOf && approve
++	return f
++}
++
++// Score in basis points: 0 (nothing found) .. 10000.
++func (f CodeFeatures) Score() uint16 {
++	if f.Size == 0 {
++		return 0
++	}
++	if f.MinimalProxy {
++		return 1000 // behaviour is the target's: not judged here
++	}
++	s := 0
++	add := func(on bool, w int) {
++		if on {
++			s += w
++		}
++	}
++	add(f.SelfDestruct, 2000)
++	add(f.CallCode, 2000)
++	add(f.DelegateCall, 1500)
++	add(f.Origin, 1000) // tx.origin checks: a honeypot pattern
++	add(f.Create2, 500)
++	if f.ERC20 {
++		add(f.Blacklist > 0, 2500)
++		add(f.Fee > 0, 1500)
++		add(f.Trading > 0, 1000)
++		add(f.Mint > 0, 1000)
++		add(f.TaxWallet > 0, 500)
++	}
++	return uint16(min(s, 10000)) // #nosec G115 -- capped
++}
++
++func (app *EVMD) immuneCodeScore(ctx sdk.Context, a common.Address) uint16 {
++	return ImmuneCodeFeatures(app.EVMKeeper.GetCode(ctx, app.EVMKeeper.GetCodeHash(ctx, a))).Score()
++}
++
++// ---- pending list
++
++func immunePendingKey(h int64, a common.Address) []byte {
++	return append(append([]byte{immunePendingPfx}, u64(uint64(h))...), a.Bytes()...) // #nosec G115 -- block heights
++}
++
++func immunePendingPrefix(h int64) []byte {
++	return append([]byte{immunePendingPfx}, u64(uint64(h))...) // #nosec G115 -- block heights
++}
++
++// immunePending: the contracts deployed in block h, by address.
++func (app *EVMD) immunePending(ctx sdk.Context, h int64) []common.Address {
++	var out []common.Address
++	p := immunePendingPrefix(h)
++	it := app.secRaw(ctx).Iterator(p, storetypes.PrefixEndBytes(p))
++	defer it.Close()
++	for ; it.Valid() && len(out) < immuneMaxPerBlock; it.Next() {
++		out = append(out, common.BytesToAddress(it.Key()[len(p):]))
++	}
++	return out
++}
++
++// immuneNoteDeploy puts a contract created in this block in the pending list.
++func (app *EVMD) immuneNoteDeploy(ctx sdk.Context, a common.Address) {
++	if !app.futV5(ctx, ctx.BlockHeight()) || ctx.ExecMode() != sdk.ExecModeFinalize || !app.immuneParams(ctx).Enabled {
++		return
++	}
++	if len(app.immunePending(ctx, ctx.BlockHeight())) >= immuneMaxPerBlock {
++		ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_immune_unscored", sdk.NewAttribute("contract", a.Hex())))
++		return
++	}
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(immunePendingKey(ctx.BlockHeight(), a), []byte{})
++}
++
++// immuneScore: the recorded median for a contract.
++func (app *EVMD) immuneScore(ctx sdk.Context, a common.Address) (score uint16, height int64, share uint16, ok bool) {
++	v := app.secRaw(ctx).Get(append([]byte{immuneScorePfx}, a.Bytes()...))
++	if len(v) != 12 {
++		return 0, 0, 0, false
++	}
++	return binary.BigEndian.Uint16(v), int64(binary.BigEndian.Uint64(v[2:])), binary.BigEndian.Uint16(v[10:]), true // #nosec G115 -- block heights
++}
++
++// ---- vote extension payload
++
++type zxScore struct {
++	contract common.Address
++	score    uint16
++}
++
++type zxPayload struct {
++	scores  []zxScore
++	flagged []common.Address
++}
++
++// zxSplit: the ML-DSA-44 signature part and the v5 payload of an extension.
++func zxSplit(ext []byte) (sig, payload []byte) {
++	if len(ext) >= circl.SignatureSize {
++		return ext[:circl.SignatureSize], ext[circl.SignatureSize:]
++	}
++	return nil, ext
++}
++
++func (p *zxPayload) encode() []byte {
++	if p == nil || (len(p.scores) == 0 && len(p.flagged) == 0) {
++		return nil
++	}
++	out := append([]byte("ZX1"), byte(len(p.scores)))
++	for _, s := range p.scores {
++		out = binary.BigEndian.AppendUint16(append(out, s.contract.Bytes()...), s.score)
++	}
++	out = append(out, byte(len(p.flagged)))
++	for _, b := range p.flagged {
++		out = append(out, b.Bytes()...)
++	}
++	return out
++}
++
++// zxDecode parses a payload's structure (no state).
++func zxDecode(b []byte) (*zxPayload, error) {
++	if len(b) == 0 {
++		return &zxPayload{}, nil
++	}
++	if len(b) > zxMaxPayload || len(b) < 5 || string(b[:3]) != "ZX1" {
++		return nil, errors.New("v5 payload: bad header or size")
++	}
++	p := &zxPayload{}
++	n, q := int(b[3]), 4
++	if n > immuneMaxPerBlock || len(b) < q+n*22+1 {
++		return nil, errors.New("v5 payload: scores")
++	}
++	for i := 0; i < n; i++ {
++		s := zxScore{common.BytesToAddress(b[q : q+20]), binary.BigEndian.Uint16(b[q+20:])}
++		if s.score > 10000 || (i > 0 && bytes.Compare(s.contract.Bytes(), p.scores[i-1].contract.Bytes()) <= 0) {
++			return nil, errors.New("v5 payload: score out of range or contracts not increasing")
++		}
++		p.scores = append(p.scores, s)
++		q += 22
++	}
++	m := int(b[q])
++	q++
++	if m > breakerMax || len(b) != q+m*20 {
++		return nil, errors.New("v5 payload: bridges")
++	}
++	for i := 0; i < m; i++ {
++		a := common.BytesToAddress(b[q : q+20])
++		if i > 0 && bytes.Compare(a.Bytes(), p.flagged[i-1].Bytes()) <= 0 {
++			return nil, errors.New("v5 payload: bridges not increasing")
++		}
++		p.flagged = append(p.flagged, a)
++		q += 20
++	}
++	return p, nil
++}
++
++// zxCheck validates a payload for the vote on height h against the state
++// after h-1 (the state the vote was made in).
++func (app *EVMD) zxCheck(ctx sdk.Context, h int64, b []byte) (*zxPayload, error) {
++	if len(b) == 0 {
++		return &zxPayload{}, nil
++	}
++	if !app.futV5(ctx, h) {
++		return nil, errors.New("v5 payload before the v5 height")
++	}
++	p, err := zxDecode(b)
++	if err != nil {
++		return nil, err
++	}
++	if len(p.scores) > 0 {
++		if !app.immuneParams(ctx).Enabled {
++			return nil, errors.New("v5 payload: the immune system is off")
++		}
++		st := app.secRaw(ctx)
++		for _, s := range p.scores {
++			if !st.Has(immunePendingKey(h-1, s.contract)) {
++				return nil, fmt.Errorf("v5 payload: %s was not deployed in block %d", s.contract.Hex(), h-1)
++			}
++		}
++	}
++	for _, br := range p.flagged {
++		if app.breakerConfig(ctx, br) == nil {
++			return nil, fmt.Errorf("v5 payload: %s is not a watched bridge", br.Hex())
++		}
++	}
++	return p, nil
++}
++
++// zxBuild: this validator's payload for its vote on h (state after h-1).
++func (app *EVMD) zxBuild(ctx sdk.Context, h int64) (out []byte) {
++	defer func() {
++		if r := recover(); r != nil { // never lose the vote over this
++			app.Logger().Error("ZETAPHY v5: vote payload", "panic", r)
++			out = nil
++		}
++	}()
++	if !app.futV5(ctx, h) {
++		return nil
++	}
++	p := &zxPayload{}
++	if app.immuneParams(ctx).Enabled {
++		for _, a := range app.immunePending(ctx, h-1) {
++			p.scores = append(p.scores, zxScore{a, app.immuneCodeScore(ctx, a)})
++		}
++	}
++	p.flagged = app.breakerFlags(ctx, h-1)
++	return p.encode()
++}
++
++// ---- carrying the extensions in the next block
++
++type zxEntry struct {
++	cons    []byte
++	mode    byte // 0: no signature part, 1: the one in the block's certificate, 2: inline
++	sig     []byte
++	payload []byte
++	extSig  []byte
++}
++
++func (e zxEntry) encode() []byte {
++	out := append(append([]byte{}, e.cons...), e.mode)
++	if e.mode == 2 {
++		out = append(out, e.sig...)
++	}
++	out = binary.BigEndian.AppendUint16(out, uint16(len(e.payload))) // #nosec G115 -- capped
++	out = append(append(out, e.payload...), byte(len(e.extSig)))
++	return append(out, e.extSig...)
++}
++
++func zxDecodeEntries(b []byte) ([]zxEntry, error) {
++	var out []zxEntry
++	for q := 0; q < len(b); {
++		if len(out) >= zxMaxEntries || q+21 > len(b) {
++			return nil, errors.New("ZX votes: malformed")
++		}
++		e := zxEntry{cons: b[q : q+20], mode: b[q+20]}
++		q += 21
++		switch e.mode {
++		case 0, 1:
++		case 2:
++			if q+circl.SignatureSize > len(b) {
++				return nil, errors.New("ZX votes: malformed")
++			}
++			e.sig = b[q : q+circl.SignatureSize]
++			q += circl.SignatureSize
++		default:
++			return nil, errors.New("ZX votes: mode")
++		}
++		if q+2 > len(b) {
++			return nil, errors.New("ZX votes: malformed")
++		}
++		n := int(binary.BigEndian.Uint16(b[q:]))
++		q += 2
++		if n == 0 || n > zxMaxPayload || q+n+1 > len(b) {
++			return nil, errors.New("ZX votes: payload")
++		}
++		e.payload = b[q : q+n]
++		q += n
++		k := int(b[q])
++		q++
++		if k == 0 || q+k > len(b) {
++			return nil, errors.New("ZX votes: signature")
++		}
++		e.extSig = b[q : q+k]
++		q += k
++		if len(out) > 0 && bytes.Compare(e.cons, out[len(out)-1].cons) <= 0 {
++			return nil, errors.New("ZX votes: validators not increasing")
++		}
++		out = append(out, e)
++	}
++	return out, nil
++}
++
++func zxHas(tx sdk.Tx) bool {
++	for _, m := range tx.GetMsgs() {
++		if _, ok := m.(*MsgZXVotes); ok {
++			return true
++		}
++	}
++	return false
++}
++
++func (app *EVMD) zxVotesMsg(sdk.Context, *MsgZXVotes) (gogoproto.Message, error) {
++	return &MsgPQResponse{}, nil // applied in PreBlocker (zxPreBlock)
++}
++
++// zxOf: the MsgZXVotes of a block, right after the certificate (or first).
++func (app *EVMD) zxOf(txs [][]byte) (*MsgZXVotes, int) {
++	i := 0
++	if app.pqCertOf(txs) != nil {
++		i = 1
++	}
++	if len(txs) <= i {
++		return nil, -1
++	}
++	tx, err := app.TxDecode(txs[i])
++	if err != nil || len(tx.GetMsgs()) != 1 {
++		return nil, -1
++	}
++	z, _ := tx.GetMsgs()[0].(*MsgZXVotes)
++	if z == nil {
++		return nil, -1
++	}
++	return z, i
++}
++
++func certSigs(c *MsgPQCertificate) map[string][]byte {
++	out := map[string][]byte{}
++	if c == nil {
++		return out
++	}
++	for i := 0; i+pqAttestationSize <= len(c.Attestations); i += pqAttestationSize {
++		out[string(c.Attestations[i:i+20])] = c.Attestations[i+20 : i+pqAttestationSize]
++	}
++	return out
++}
++
++// zxBuildTx: the proposer's MsgZXVotes for block height, from the extended
++// votes on height-1; cert is the certificate tx it puts first (or nil).
++func (app *EVMD) zxBuildTx(ctx sdk.Context, height int64, commit abci.ExtendedCommitInfo, cert []byte) []byte {
++	if !app.futV5(ctx, height-1) {
++		return nil
++	}
++	var c *MsgPQCertificate
++	if cert != nil {
++		c = app.pqCertOf([][]byte{cert})
++	}
++	inCert := certSigs(c)
++	var entries []zxEntry
++	for _, v := range commit.Votes {
++		if v.BlockIdFlag != cmtproto.BlockIDFlagCommit || len(v.Validator.Address) != 20 || len(v.ExtensionSignature) == 0 || len(v.ExtensionSignature) > 255 {
++			continue
++		}
++		sig, payload := zxSplit(v.VoteExtension)
++		if len(payload) == 0 {
++			continue
++		}
++		if _, err := zxDecode(payload); err != nil {
++			continue
++		}
++		e := zxEntry{cons: v.Validator.Address, payload: payload, extSig: v.ExtensionSignature}
++		switch {
++		case sig == nil:
++		case bytes.Equal(inCert[string(v.Validator.Address)], sig):
++			e.mode = 1
++		default:
++			e.mode, e.sig = 2, sig
++		}
++		entries = append(entries, e)
++	}
++	if len(entries) == 0 {
++		return nil
++	}
++	sort.Slice(entries, func(i, j int) bool { return bytes.Compare(entries[i].cons, entries[j].cons) < 0 })
++	var raw []byte
++	for i, e := range entries {
++		if i >= zxMaxEntries || (i > 0 && bytes.Equal(e.cons, entries[i-1].cons)) {
++			continue
++		}
++		raw = append(raw, e.encode()...)
++	}
++	b := app.txConfig.NewTxBuilder()
++	if err := b.SetMsgs(&MsgZXVotes{Signer: authtypes.NewModuleAddress(pqStoreKey).String(), Height: uint64(height - 1), // #nosec G115 -- block heights
++		Round: uint64(commit.Round), Entries: raw}); err != nil { // #nosec G115 -- rounds are small
++		return nil
++	}
++	bz, err := app.txConfig.TxEncoder()(b.GetTx())
++	if err != nil {
++		return nil
++	}
++	return bz
++}
++
++// zxCheckProposal: a structurally sound MsgZXVotes, for the block before.
++func (app *EVMD) zxCheckProposal(height int64, txs [][]byte) error {
++	z, _ := app.zxOf(txs)
++	if z == nil {
++		return nil
++	}
++	if z.Height != uint64(height-1) || len(z.Entries) > zxMaxEntriesBytes { // #nosec G115 -- block heights
++		return errors.New("malformed v5 votes")
++	}
++	_, err := zxDecodeEntries(z.Entries)
++	return err
++}
++
++// zxExtSignBytes: what CometBFT signs for a vote extension.
++func zxExtSignBytes(chainID string, height int64, round int64, ext []byte) ([]byte, error) {
++	var buf bytes.Buffer
++	err := protoio.NewDelimitedWriter(&buf).WriteMsg(&cmtproto.CanonicalVoteExtension{Extension: ext, Height: height, Round: round, ChainId: chainID})
++	return buf.Bytes(), err
++}
++
++// zxPreBlock applies the extensions a block carries: immune medians and
++// breaker trips. A bad entry is skipped, never the block.
++func (app *EVMD) zxPreBlock(ctx sdk.Context, req *abci.RequestFinalizeBlock) {
++	if !app.futV5(ctx, req.Height) {
++		return
++	}
++	defer app.immunePrune(ctx, req.Height-2)
++	z, _ := app.zxOf(req.Txs)
++	if z == nil || z.Height != uint64(req.Height-1) || len(z.Entries) > zxMaxEntriesBytes { // #nosec G115 -- block heights
++		return
++	}
++	entries, err := zxDecodeEntries(z.Entries)
++	if err != nil {
++		return
++	}
++	power := map[string]int64{}
++	var total int64
++	for _, v := range req.DecidedLastCommit.Votes {
++		power[string(v.Validator.Address)] = v.Validator.Power
++		total += v.Validator.Power
++	}
++	if total <= 0 {
++		return
++	}
++	inCert := certSigs(app.pqCertOf(req.Txs))
++	type vote struct {
++		score uint16
++		power int64
++	}
++	scores := map[common.Address][]vote{}
++	flagged := map[common.Address]int64{}
++	params := app.immuneParams(ctx)
++	st := app.secRaw(ctx)
++	for _, e := range entries {
++		pw, ok := power[string(e.cons)]
++		if !ok || pw <= 0 {
++			continue
++		}
++		var ext []byte
++		switch e.mode {
++		case 1:
++			if inCert[string(e.cons)] == nil {
++				continue
++			}
++			ext = append(append([]byte{}, inCert[string(e.cons)]...), e.payload...)
++		case 2:
++			ext = append(append([]byte{}, e.sig...), e.payload...)
++		default:
++			ext = e.payload
++		}
++		if !app.zxVerifyExt(ctx, e.cons, int64(z.Height), int64(z.Round), ext, e.extSig) { // #nosec G115 -- heights and rounds
++			continue
++		}
++		p, err := zxDecode(e.payload)
++		if err != nil {
++			continue
++		}
++		if params.Enabled {
++			for _, s := range p.scores {
++				if st.Has(immunePendingKey(req.Height-2, s.contract)) {
++					scores[s.contract] = append(scores[s.contract], vote{s.score, pw})
++				}
++			}
++		}
++		for _, b := range p.flagged {
++			flagged[b] += pw
++		}
++	}
++	kv := ctx.KVStore(app.GetKey(pqStoreKey))
++	contracts := make([]common.Address, 0, len(scores))
++	for a := range scores {
++		contracts = append(contracts, a)
++	}
++	sort.Slice(contracts, func(i, j int) bool { return bytes.Compare(contracts[i].Bytes(), contracts[j].Bytes()) < 0 })
++	for _, a := range contracts {
++		vs := scores[a]
++		var sum int64
++		for _, v := range vs {
++			sum += v.power
++		}
++		if 3*sum <= 2*total {
++			ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_immune_no_quorum", sdk.NewAttribute("contract", a.Hex()),
++				sdk.NewAttribute("power_bps", fmt.Sprint(sum*10000/total))))
++			continue
++		}
++		sort.SliceStable(vs, func(i, j int) bool { return vs[i].score < vs[j].score })
++		var cum int64
++		med := vs[len(vs)-1].score
++		for _, v := range vs {
++			cum += v.power
++			if 2*cum >= sum {
++				med = v.score
++				break
++			}
++		}
++		share := uint16(sum * 10000 / total) // #nosec G115 -- at most 10000
++		val := binary.BigEndian.AppendUint16(nil, med)
++		val = append(val, u64(uint64(req.Height))...) // #nosec G115 -- block heights
++		kv.Set(append([]byte{immuneScorePfx}, a.Bytes()...), binary.BigEndian.AppendUint16(val, share))
++		ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_immune_score", sdk.NewAttribute("contract", a.Hex()),
++			sdk.NewAttribute("score_bps", fmt.Sprint(med)), sdk.NewAttribute("power_bps", fmt.Sprint(share))))
++	}
++	for _, b := range sortedAddrs(flagged) {
++		if 3*flagged[b] > 2*total {
++			app.breakerSchedulePause(ctx, b, flagged[b]*10000/total)
++		}
++	}
++}
++
++func sortedAddrs[V any](m map[common.Address]V) []common.Address {
++	out := make([]common.Address, 0, len(m))
++	for a := range m {
++		out = append(out, a)
++	}
++	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i].Bytes(), out[j].Bytes()) < 0 })
++	return out
++}
++
++// zxVerifyExt checks a vote extension against the validator's consensus key.
++func (app *EVMD) zxVerifyExt(ctx sdk.Context, cons []byte, height, round int64, ext, sig []byte) bool {
++	pk, err := app.StakingKeeper.GetPubKeyByConsAddr(ctx, sdk.ConsAddress(cons))
++	if err != nil {
++		return false
++	}
++	cpk, err := cryptoenc.PubKeyFromProto(pk)
++	if err != nil {
++		return false
++	}
++	sb, err := zxExtSignBytes(ctx.ChainID(), height, round, ext)
++	return err == nil && cpk.VerifySignature(sb, sig)
++}
++
++// immunePrune drops pending lists up to height h.
++func (app *EVMD) immunePrune(ctx sdk.Context, h int64) {
++	if h < 0 {
++		return
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	it := st.Iterator([]byte{immunePendingPfx}, immunePendingPrefix(h+1))
++	var del [][]byte
++	for ; it.Valid() && len(del) < 1024; it.Next() {
++		del = append(del, append([]byte{}, it.Key()...))
++	}
++	_ = it.Close()
++	for _, k := range del {
++		st.Delete(k)
++	}
++}
++
++// ---- precompile 0x…0903
++
++const immuneABIJSON = `[
++ {"type":"function","name":"scoreOf","stateMutability":"view","inputs":[{"name":"who","type":"address"}],"outputs":[{"name":"score","type":"uint16"},{"name":"height","type":"uint64"},{"name":"powerBps","type":"uint16"},{"name":"known","type":"bool"}]},
++ {"type":"function","name":"isContractEnforced","stateMutability":"view","inputs":[{"name":"who","type":"address"}],"outputs":[{"name":"","type":"bool"},{"name":"","type":"uint8"}]},
++ {"type":"function","name":"isContractHeld","stateMutability":"view","inputs":[{"name":"who","type":"address"}],"outputs":[{"name":"","type":"bool"},{"name":"","type":"uint8"}]},
++ {"type":"function","name":"codeScore","stateMutability":"view","inputs":[{"name":"who","type":"address"}],"outputs":[{"name":"score","type":"uint16"}]},
++ {"type":"function","name":"immuneParams","stateMutability":"view","inputs":[],"outputs":[{"name":"enabled","type":"bool"},{"name":"enforceBps","type":"uint16"},{"name":"holdBps","type":"uint16"},{"name":"protectBps","type":"uint16"}]},
++ {"type":"function","name":"breaker","stateMutability":"view","inputs":[{"name":"bridge","type":"address"}],"outputs":[{"name":"watched","type":"bool"},{"name":"tripped","type":"bool"},{"name":"trippedAt","type":"uint64"},{"name":"lastHeight","type":"uint64"},{"name":"lastVolume","type":"uint256"},{"name":"baseline","type":"uint256"}]}
++]`
++
++// ImmuneABI is the immune precompile's ABI.
++var ImmuneABI = func() abi.ABI {
++	a, err := abi.JSON(bytes.NewReader([]byte(immuneABIJSON)))
++	if err != nil {
++		panic(err)
++	}
++	return a
++}()
++
++// ThreatReasonImmune: the ThreatRegistry reason the immune views answer ("Other").
++const ThreatReasonImmune = 7
++
++type immunePrecompile struct {
++	cmn.Precompile
++	app *EVMD
++}
++
++func newImmunePrecompile(app *EVMD) *immunePrecompile {
++	return &immunePrecompile{Precompile: cmn.Precompile{
++		KvGasConfig: storetypes.KVGasConfig(), TransientKVGasConfig: storetypes.TransientGasConfig(),
++		ContractAddress: ImmunePrecompileAddress,
++	}, app: app}
++}
++
++func (*immunePrecompile) Name() string { return "zetaphy-immune" }
++
++func (p *immunePrecompile) RequiredGas(input []byte) uint64 {
++	return p.Precompile.RequiredGas(input, false)
++}
++
++func (p *immunePrecompile) Run(evm *vm.EVM, contract *vm.Contract, readonly bool) ([]byte, error) {
++	return p.RunNativeAction(evm, contract, func(ctx sdk.Context) ([]byte, error) {
++		method, args, err := cmn.SetupABI(ImmuneABI, contract, readonly, func(*abi.Method) bool { return false })
++		if err != nil {
++			return nil, err
++		}
++		if v := contract.Value(); v != nil && !v.IsZero() {
++			return nil, errors.New("the immune precompile takes no value")
++		}
++		app := p.app
++		ctx.GasMeter().ConsumeGas(2000, "zetaphy immune read")
++		params := app.immuneParams(ctx)
++		switch method.Name {
++		case "scoreOf":
++			s, h, share, ok := app.immuneScore(ctx, args[0].(common.Address))
++			return method.Outputs.Pack(s, uint64(h), share, ok) // #nosec G115 -- block heights
++		case "isContractEnforced", "isContractHeld":
++			th := params.EnforceBps
++			if method.Name == "isContractHeld" {
++				th = params.HoldBps
++			}
++			s, _, _, ok := app.immuneScore(ctx, args[0].(common.Address))
++			on := ok && th > 0 && s >= th
++			reason := uint8(0)
++			if on {
++				reason = ThreatReasonImmune
++			}
++			return method.Outputs.Pack(on, reason)
++		case "codeScore":
++			a := args[0].(common.Address)
++			code := app.EVMKeeper.GetCode(ctx, app.EVMKeeper.GetCodeHash(ctx, a))
++			ctx.GasMeter().ConsumeGas(uint64(len(code))/4, "zetaphy immune code walk") // #nosec G115 -- code size
++			return method.Outputs.Pack(ImmuneCodeFeatures(code).Score())
++		case "immuneParams":
++			return method.Outputs.Pack(params.Enabled, params.EnforceBps, params.HoldBps, params.ProtectBps)
++		case "breaker":
++			b := args[0].(common.Address)
++			st := app.breakerStatsOf(ctx, b)
++			trip := app.secRaw(ctx).Get(append([]byte{breakerTripPfx}, b.Bytes()...))
++			return method.Outputs.Pack(app.breakerConfig(ctx, b) != nil, trip != nil, readU64(trip), uint64(st.height), // #nosec G115 -- block heights
++				new(big.Int).Set(st.volume), new(big.Int).Set(st.baseline))
++		}
++		return nil, fmt.Errorf("unknown method %s", method.Name)
++	})
++}
+diff --git a/evmd/zetaphy_modelat.go b/evmd/zetaphy_modelat.go
+new file mode 100644
+index 0000000..6789501
+--- /dev/null
++++ b/evmd/zetaphy_modelat.go
+@@ -0,0 +1,319 @@
++package evmd
++
++// ZETAPHY v5: the Neuro model version bound to chain height (item 35,
++// docs/future/federated.md "Node side").
++//
++// The registry is the ModelEpochs contract (zetaphy-network/contracts/
++// ModelEpochs.sol); the chain only stores where it is:
++//
++//	model-epochs   MsgSetFuture kind: {"address":"0x…"} (a contract), or
++//	               {"address":""} to remove it (no model in consensus)
++//
++// ModelVersionAt(ctx, h) reads ModelEpochs.versionAt(h) with a read-only
++// EVM call (no commit, 200,000 gas, from the "neuro" module address). Any
++// error, an unset registry or no code at it is found = false. Called while
++// processing block h, ctx holds the committed state after h-1, whose answer
++// for h is final (no tx in h or later can add, cancel or change a version
++// with activation <= h). Consensus code may only compare the hash it
++// returns; it never fetches the manifest.
++//
++// Queries, on the state after h-1 (an archive node for old heights):
++//
++//	zetaphyd q neuro model-at <h>      (the same lookup, through EthCall)
++//	zetaphy_modelAt(h)                 JSON-RPC, on the public EVM endpoint
++//	modelEpochs() on 0x…0902           the registry address, for contracts
++//
++// Browsers and runners get the same answer from eth_call versionAt(h) with
++// blockTag h-1 (zetaphy-network/src/modelepochs.js).
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"math/big"
++	"strconv"
++
++	"github.com/ethereum/go-ethereum/accounts/abi"
++	"github.com/ethereum/go-ethereum/common"
++	"github.com/ethereum/go-ethereum/common/hexutil"
++	"github.com/ethereum/go-ethereum/core"
++	ethtypes "github.com/ethereum/go-ethereum/core/types"
++	"github.com/spf13/cobra"
++	"google.golang.org/grpc/metadata"
++
++	errorsmod "cosmossdk.io/errors"
++
++	"github.com/cosmos/evm/x/vm/statedb"
++	evmtypes "github.com/cosmos/evm/x/vm/types"
++
++	"github.com/cosmos/cosmos-sdk/client"
++	"github.com/cosmos/cosmos-sdk/client/flags"
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	grpctypes "github.com/cosmos/cosmos-sdk/types/grpc"
++	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
++)
++
++const (
++	modelAtGas    = 200_000
++	modelAtMaxRet = 4096 // versionAt's answer: 5 words + a uri of at most 256 bytes
++	modelAtMaxURI = 256
++)
++
++// ModelEpochsCaller is the "from" of the lookup: the neuro module address.
++var ModelEpochsCaller = common.BytesToAddress(authtypes.NewModuleAddress("neuro"))
++
++var modelEpochsABI = func() abi.ABI {
++	a, err := abi.JSON(bytes.NewReader([]byte(`[{"type":"function","name":"versionAt","stateMutability":"view",
++	 "inputs":[{"name":"height","type":"uint256"}],
++	 "outputs":[{"name":"found","type":"bool"},{"name":"index","type":"uint256"},{"name":"hash","type":"bytes32"},{"name":"activation","type":"uint64"},{"name":"uri","type":"string"}]}]`)))
++	if err != nil {
++		panic(err)
++	}
++	return a
++}()
++
++// ModelVersion is the Neuro model version in force at a height.
++type ModelVersion struct {
++	Found      bool
++	Index      uint64
++	Hash       [32]byte
++	Activation int64
++	URI        string
++}
++
++// modelEpochsAddr: the registry governance set (ok false: none).
++func (app *EVMD) modelEpochsAddr(ctx sdk.Context) (common.Address, bool) {
++	v := app.secRaw(ctx).Get(modelEpochsKey)
++	if len(v) != 20 {
++		return common.Address{}, false
++	}
++	return common.BytesToAddress(v), true
++}
++
++// setModelEpochs: governance's "model-epochs" kind of MsgSetFuture.
++func (app *EVMD) setModelEpochs(ctx sdk.Context, data []byte) error {
++	var c struct {
++		Address string `json:"address"`
++	}
++	if err := futJSON(data, &c); err != nil {
++		return err
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	if c.Address == "" || (common.IsHexAddress(c.Address) && common.HexToAddress(c.Address) == (common.Address{})) {
++		st.Delete(modelEpochsKey)
++		return nil
++	}
++	if !common.IsHexAddress(c.Address) {
++		return errorsmod.Wrap(errortypes.ErrInvalidRequest, "model-epochs: address: a 0x address, or \"\" to remove it")
++	}
++	a := common.HexToAddress(c.Address)
++	if len(app.EVMKeeper.GetCode(ctx, app.EVMKeeper.GetCodeHash(ctx, a))) == 0 {
++		return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "model-epochs: no contract at %s", a.Hex())
++	}
++	st.Set(modelEpochsKey, a.Bytes())
++	return nil
++}
++
++// modelAtDecode checks and decodes versionAt(h)'s answer. A registry that
++// answers anything else (too long, a zero hash, a version from after h, an
++// over-long uri) counts as no version.
++func modelAtDecode(ret []byte, h int64) (ModelVersion, error) {
++	if len(ret) > modelAtMaxRet {
++		return ModelVersion{}, errors.New("versionAt: answer too long")
++	}
++	out, err := modelEpochsABI.Unpack("versionAt", ret)
++	if err != nil || len(out) != 5 {
++		return ModelVersion{}, fmt.Errorf("versionAt: bad answer: %v", err)
++	}
++	found, _ := out[0].(bool)
++	idx, _ := out[1].(*big.Int)
++	hash, _ := out[2].([32]byte)
++	act, _ := out[3].(uint64)
++	uri, _ := out[4].(string)
++	if !found {
++		return ModelVersion{}, nil
++	}
++	if idx == nil || !idx.IsUint64() || hash == ([32]byte{}) || act > uint64(h) || len(uri) == 0 || len(uri) > modelAtMaxURI { // #nosec G115 -- h > 0
++		return ModelVersion{}, errors.New("versionAt: the registry's answer breaks its rules")
++	}
++	return ModelVersion{Found: true, Index: idx.Uint64(), Hash: hash, Activation: int64(act), URI: uri}, nil // #nosec G115 -- act <= h
++}
++
++func modelAtCalldata(h int64) ([]byte, error) {
++	if h < 1 {
++		return nil, errors.New("height must be at least 1")
++	}
++	return modelEpochsABI.Pack("versionAt", big.NewInt(h))
++}
++
++// ModelVersionAt returns the Neuro model version in force at height h, from
++// the registry on ctx's state (see the top of this file). err says why
++// found is false; consensus code treats any error as "no model".
++func (app *EVMD) ModelVersionAt(ctx sdk.Context, h int64) (ModelVersion, error) {
++	reg, ok := app.modelEpochsAddr(ctx)
++	if !ok {
++		return ModelVersion{}, errors.New("no ModelEpochs registry is set (governance: security-proposal model-epochs)")
++	}
++	data, err := modelAtCalldata(h)
++	if err != nil {
++		return ModelVersion{}, err
++	}
++	c, _ := ctx.CacheContext() // never written back
++	c = c.WithGasMeter(storetypes.NewInfiniteGasMeter()).WithKVGasConfig(storetypes.GasConfig{}).
++		WithTransientKVGasConfig(storetypes.GasConfig{}).WithEventManager(sdk.NewEventManager())
++	if len(app.EVMKeeper.GetCode(c, app.EVMKeeper.GetCodeHash(c, reg))) == 0 {
++		return ModelVersion{}, fmt.Errorf("no contract at the registry %s", reg.Hex())
++	}
++	var res *evmtypes.MsgEthereumTxResponse
++	func() {
++		defer func() {
++			if r := recover(); r != nil {
++				err = fmt.Errorf("versionAt: %v", r)
++			}
++		}()
++		sdb := statedb.New(c, app.EVMKeeper, statedb.NewEmptyTxConfig())
++		res, err = app.EVMKeeper.ApplyMessage(c, sdb, core.Message{
++			From: ModelEpochsCaller, To: &reg, Value: new(big.Int), GasLimit: modelAtGas, Data: data,
++			GasPrice: new(big.Int), GasFeeCap: new(big.Int), GasTipCap: new(big.Int), AccessList: ethtypes.AccessList{},
++			SkipNonceChecks: true,
++		}, nil, false, false, true)
++	}()
++	if err != nil {
++		return ModelVersion{}, err
++	}
++	if res == nil || res.Failed() {
++		return ModelVersion{}, errors.New("versionAt reverted or ran out of gas")
++	}
++	return modelAtDecode(res.Ret, h)
++}
++
++// ---- queries (outside consensus)
++
++// ModelAtResult is the answer of zetaphy_modelAt and `q neuro model-at`.
++type ModelAtResult struct {
++	Height      int64   `json:"height"`
++	StateHeight int64   `json:"stateHeight"` // the state read: height - 1
++	Registry    *string `json:"registry"`
++	Found       bool    `json:"found"`
++	Index       *uint64 `json:"index,omitempty"`
++	Hash        *string `json:"hash,omitempty"`
++	Activation  *int64  `json:"activation,omitempty"`
++	URI         *string `json:"uri,omitempty"`
++	Error       string  `json:"error,omitempty"` // why found is false
++}
++
++func (v ModelVersion) result(h int64, reg *common.Address, err error) *ModelAtResult {
++	r := &ModelAtResult{Height: h, StateHeight: h - 1, Found: v.Found}
++	if reg != nil {
++		s := reg.Hex()
++		r.Registry = &s
++	}
++	if err != nil {
++		r.Error = err.Error()
++	}
++	if v.Found {
++		hs := hexutil.Encode(v.Hash[:])
++		r.Index, r.Hash, r.Activation, r.URI = &v.Index, &hs, &v.Activation, &v.URI
++	}
++	return r
++}
++
++// modelEthCaller is the part of the EVM query service the lookup needs
++// (evmtypes.QueryClient; the keeper itself in tests).
++type modelEthCaller interface {
++	EthCall(ctx context.Context, req *evmtypes.EthCallRequest) (*evmtypes.MsgEthereumTxResponse, error)
++}
++
++// modelAtVia: the lookup for h through an EthCall service whose state is
++// the one after h-1, given the registry stored there.
++func modelAtVia(ctx context.Context, q modelEthCaller, reg []byte, h int64) *ModelAtResult {
++	if len(reg) != 20 {
++		return ModelVersion{}.result(h, nil, errors.New("no ModelEpochs registry is set"))
++	}
++	a := common.BytesToAddress(reg)
++	data, err := modelAtCalldata(h)
++	if err != nil {
++		return ModelVersion{}.result(h, &a, err)
++	}
++	gas := hexutil.Uint64(modelAtGas)
++	from, in := ModelEpochsCaller, hexutil.Bytes(data)
++	args, _ := json.Marshal(evmtypes.TransactionArgs{From: &from, To: &a, Gas: &gas, Input: &in})
++	res, err := q.EthCall(ctx, &evmtypes.EthCallRequest{Args: args, GasCap: modelAtGas})
++	if err == nil && (res == nil || res.Failed()) {
++		err = errors.New("versionAt reverted or ran out of gas (or no contract there)")
++	}
++	if err != nil {
++		return ModelVersion{}.result(h, &a, err)
++	}
++	if len(res.Ret) == 0 {
++		return ModelVersion{}.result(h, &a, fmt.Errorf("no contract at the registry %s", a.Hex()))
++	}
++	v, err := modelAtDecode(res.Ret, h)
++	return v.result(h, &a, err)
++}
++
++type ethCallClient struct{ q evmtypes.QueryClient }
++
++func (c ethCallClient) EthCall(ctx context.Context, req *evmtypes.EthCallRequest) (*evmtypes.MsgEthereumTxResponse, error) {
++	return c.q.EthCall(ctx, req)
++}
++
++// ModelAtQuery answers ModelAt{height} from a node, on the state after
++// height-1.
++func ModelAtQuery(ctx context.Context, cctx client.Context, h int64) (*ModelAtResult, error) {
++	if h < 2 {
++		return nil, errors.New("height must be at least 2 (the state after height-1 is read)")
++	}
++	cctx = cctx.WithHeight(h - 1)
++	ctx = metadata.AppendToOutgoingContext(ctx, grpctypes.GRPCBlockHeightHeader, strconv.FormatInt(h-1, 10))
++	reg, _, err := cctx.QueryStore(modelEpochsKey, pqStoreKey)
++	if err != nil {
++		return nil, fmt.Errorf("reading the registry at height %d: %w", h-1, err)
++	}
++	return modelAtVia(ctx, ethCallClient{evmtypes.NewQueryClient(cctx)}, reg, h), nil
++}
++
++// ModelAt (zetaphy_modelAt): the Neuro model version in force at height.
++func (a *ZetaphyAPI) ModelAt(ctx context.Context, height hexutil.Uint64) (*ModelAtResult, error) {
++	if uint64(height) > 1<<62 {
++		return nil, errors.New("height out of range")
++	}
++	return ModelAtQuery(ctx, a.clientCtx, int64(height)) // #nosec G115 -- checked above
++}
++
++// NeuroQueryCmd: zetaphyd q neuro model-at <height>.
++func NeuroQueryCmd() *cobra.Command {
++	cmd := &cobra.Command{Use: "neuro", Short: "Neuro on the chain (ZETAPHY v5)", RunE: client.ValidateCmd}
++	at := &cobra.Command{
++		Use:   "model-at <height>",
++		Short: "The Neuro model version in force at a height (ModelEpochs.versionAt on the state after height-1)",
++		Args:  cobra.ExactArgs(1),
++		RunE: func(cmd *cobra.Command, args []string) error {
++			h, err := strconv.ParseInt(args[0], 10, 64)
++			if err != nil {
++				return fmt.Errorf("height: %w", err)
++			}
++			cctx, err := client.GetClientQueryContext(cmd)
++			if err != nil {
++				return err
++			}
++			r, err := ModelAtQuery(cmd.Context(), cctx, h)
++			if err != nil {
++				return err
++			}
++			bz, err := json.MarshalIndent(r, "", "  ")
++			if err != nil {
++				return err
++			}
++			_, err = fmt.Fprintln(cmd.OutOrStdout(), string(bz))
++			return err
++		},
++	}
++	flags.AddQueryFlagsToCmd(at)
++	cmd.AddCommand(at)
++	return cmd
 +}
 diff --git a/evmd/zetaphy_pqcall.go b/evmd/zetaphy_pqcall.go
 new file mode 100644
-index 0000000..71f9d28
+index 0000000..2d448d3
 --- /dev/null
 +++ b/evmd/zetaphy_pqcall.go
-@@ -0,0 +1,487 @@
+@@ -0,0 +1,499 @@
 +package evmd
 +
 +// ZETAPHY post-quantum messages (zetaphy/pq/v1/tx.proto, built in code below):
@@ -2891,6 +8862,7 @@ index 0000000..71f9d28
 +	"github.com/cosmos/cosmos-sdk/types/msgservice"
 +
 +	"github.com/cosmos/evm/x/vm/statedb"
++	evmtypes "github.com/cosmos/evm/x/vm/types"
 +)
 +
 +const (
@@ -3144,6 +9116,8 @@ index 0000000..71f9d28
 +	{"MsgSetIBCHold", "authority", "authority:S delay_seconds:U guardian:S"},
 +	{"MsgSetIBCHoldRule", "authority", "authority:S denom:S min_amount:S supply_bps:U"},
 +	{"MsgIBCHoldCancel", "signer", "signer:S id:U"},
++	{"MsgSetFuture", "authority", "authority:S kind:S data:B"},
++	{"MsgZXVotes", "signer", "signer:S height:U round:U entries:B"},
 +}
 +
 +var pqMethods = [][3]string{{"EVMCall", "MsgEVMCall", "MsgEVMCallResponse"},
@@ -3152,7 +9126,8 @@ index 0000000..71f9d28
 +	{"SetQDay", "MsgSetQDay", "MsgPQResponse"}, {"QDayCommit", "MsgQDayCommit", "MsgPQResponse"},
 +	{"QDayReveal", "MsgQDayReveal", "MsgPQResponse"}, {"SetThreatGate", "MsgSetThreatGate", "MsgPQResponse"},
 +	{"SetIBCHold", "MsgSetIBCHold", "MsgPQResponse"}, {"SetIBCHoldRule", "MsgSetIBCHoldRule", "MsgPQResponse"},
-+	{"IBCHoldCancel", "MsgIBCHoldCancel", "MsgPQResponse"}}
++	{"IBCHoldCancel", "MsgIBCHoldCancel", "MsgPQResponse"},
++	{"SetFuture", "MsgSetFuture", "MsgPQResponse"}, {"ZXVotes", "MsgZXVotes", "MsgPQResponse"}}
 +
 +var pqCallProto = func() *descriptorpb.FileDescriptorProto {
 +	types := map[byte]descriptorpb.FieldDescriptorProto_Type{'S': descriptorpb.FieldDescriptorProto_TYPE_STRING,
@@ -3205,7 +9180,8 @@ index 0000000..71f9d28
 +
 +func init() {
 +	for _, m := range []gogoproto.Message{&MsgEVMCall{}, &MsgEVMCallResponse{}, &MsgQuantumLock{}, &MsgPQVoteKey{}, &MsgPQResponse{}, &MsgPQCertificate{}, &MsgSetPQEvidence{},
-+		&MsgSetQDay{}, &MsgQDayCommit{}, &MsgQDayReveal{}, &MsgSetThreatGate{}, &MsgSetIBCHold{}, &MsgSetIBCHoldRule{}, &MsgIBCHoldCancel{}} {
++		&MsgSetQDay{}, &MsgQDayCommit{}, &MsgQDayReveal{}, &MsgSetThreatGate{}, &MsgSetIBCHold{}, &MsgSetIBCHoldRule{}, &MsgIBCHoldCancel{},
++		&MsgSetFuture{}, &MsgZXVotes{}} {
 +		gogoproto.RegisterType(m, "zetaphy.pq.v1."+reflect.TypeOf(m).Elem().Name())
 +	}
 +	gogoproto.RegisterFile(pqCallFile, pqCallDescriptor)
@@ -3235,7 +9211,8 @@ index 0000000..71f9d28
 +		pqMethod("SetPQEvidence", (*EVMD).pqSetEvidence),
 +		pqMethod("SetQDay", (*EVMD).setQDay), pqMethod("QDayCommit", (*EVMD).qdayCommit), pqMethod("QDayReveal", (*EVMD).qdayReveal),
 +		pqMethod("SetThreatGate", (*EVMD).setThreatGate), pqMethod("SetIBCHold", (*EVMD).setIBCHold),
-+		pqMethod("SetIBCHoldRule", (*EVMD).setIBCHoldRule), pqMethod("IBCHoldCancel", (*EVMD).ibcHoldCancelMsg)},
++		pqMethod("SetIBCHoldRule", (*EVMD).setIBCHoldRule), pqMethod("IBCHoldCancel", (*EVMD).ibcHoldCancelMsg),
++		pqMethod("SetFuture", (*EVMD).setFuture), pqMethod("ZXVotes", (*EVMD).zxVotesMsg)},
 +	Metadata: pqCallFile,
 +}
 +
@@ -3319,10 +9296,15 @@ index 0000000..71f9d28
 +	if res.Failed() {
 +		return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest, "evm call reverted: %s", res.VmError)
 +	}
++	if err := app.firewallPostTx(ctx); err != nil { // ZETAPHY: the node-level invariant firewall (zetaphy_firewall.go)
++		return nil, err
++	}
 +	out := &MsgEVMCallResponse{Ret: res.Ret, GasUsed: res.GasUsed}
 +	if to == nil {
 +		out.Created = crypto.CreateAddress(sender, nonce).Hex()
++		app.immuneNoteDeploy(ctx, common.HexToAddress(out.Created)) // ZETAPHY v5 (zetaphy_immune.go)
 +	}
++	app.breakerNoteLogs(ctx, evmtypes.LogsToEthereum(res.Logs)) // ZETAPHY v5 (zetaphy_breaker.go)
 +	ctx.EventManager().EmitEvent(sdk.NewEvent("zetaphy_evm_call", sdk.NewAttribute("from", sender.Hex()),
 +		sdk.NewAttribute("to", m.To), sdk.NewAttribute("created", out.Created), sdk.NewAttribute("value", value.String())))
 +	return out, nil
@@ -3331,16 +9313,17 @@ index 0000000..71f9d28
 +// registerEVMCall wires the messages into the app (codec and message router).
 +func (app *EVMD) registerEVMCall() {
 +	app.interfaceRegistry.RegisterImplementations((*sdk.Msg)(nil), &MsgEVMCall{}, &MsgQuantumLock{}, &MsgPQVoteKey{}, &MsgPQCertificate{}, &MsgSetPQEvidence{},
-+		&MsgSetQDay{}, &MsgQDayCommit{}, &MsgQDayReveal{}, &MsgSetThreatGate{}, &MsgSetIBCHold{}, &MsgSetIBCHoldRule{}, &MsgIBCHoldCancel{})
++		&MsgSetQDay{}, &MsgQDayCommit{}, &MsgQDayReveal{}, &MsgSetThreatGate{}, &MsgSetIBCHold{}, &MsgSetIBCHoldRule{}, &MsgIBCHoldCancel{},
++		&MsgSetFuture{}, &MsgZXVotes{})
 +	msgservice.RegisterMsgServiceDesc(app.interfaceRegistry, &pqCallServiceDesc)
 +	app.MsgServiceRouter().RegisterService(&pqCallServiceDesc, app)
 +}
 diff --git a/evmd/zetaphy_pqcert.go b/evmd/zetaphy_pqcert.go
 new file mode 100644
-index 0000000..78fa31b
+index 0000000..34df4b6
 --- /dev/null
 +++ b/evmd/zetaphy_pqcert.go
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,400 @@
 +package evmd
 +
 +// ZETAPHY post-quantum vote certificates.
@@ -3519,12 +9502,13 @@ index 0000000..78fa31b
 +	msg := pqVoteMsg(ctx.ChainID(), height-1, last[8:])
 +	var entries [][]byte
 +	for _, v := range votes {
-+		if v.BlockIdFlag != cmtproto.BlockIDFlagCommit || len(v.VoteExtension) != circl.SignatureSize || len(v.Validator.Address) != 20 {
++		sig, _ := zxSplit(v.VoteExtension) // ZETAPHY v5: a payload may follow the signature
++		if v.BlockIdFlag != cmtproto.BlockIDFlagCommit || len(sig) != circl.SignatureSize || len(v.Validator.Address) != 20 {
 +			continue
 +		}
 +		// CometBFT adds late precommits without asking the app; check each one.
-+		if k := app.pqVoteKeyAt(ctx, v.Validator.Address, height-1); k != nil && (&mldsa44.PubKey{Key: k}).VerifySignature(msg, v.VoteExtension) {
-+			entries = append(entries, append(append([]byte{}, v.Validator.Address...), v.VoteExtension...))
++		if k := app.pqVoteKeyAt(ctx, v.Validator.Address, height-1); k != nil && (&mldsa44.PubKey{Key: k}).VerifySignature(msg, sig) {
++			entries = append(entries, append(append([]byte{}, v.Validator.Address...), sig...))
 +		}
 +	}
 +	if own := app.pqOwnEntry(ctx, height, proposer, votes, msg, entries); own != nil {
@@ -3589,16 +9573,23 @@ index 0000000..78fa31b
 +func (app *EVMD) pqProposalHandlers(prepare sdk.PrepareProposalHandler, process sdk.ProcessProposalHandler) {
 +	app.SetPrepareProposal(func(ctx sdk.Context, req *abci.RequestPrepareProposal) (*abci.ResponsePrepareProposal, error) {
 +		cert := app.pqBuildCert(ctx, req.Height, req.ProposerAddress, req.LocalLastCommit.Votes)
++		zx := app.zxBuildTx(ctx, req.Height, req.LocalLastCommit, cert) // ZETAPHY v5 (zetaphy_immune.go)
++		var lead [][]byte
++		for _, t := range [][]byte{cert, zx} {
++			if t != nil {
++				lead = append(lead, t)
++			}
++		}
 +		r := *req
-+		r.MaxTxBytes -= int64(len(cert)) + 16
++		r.MaxTxBytes -= int64(len(cert)+len(zx)) + 32
 +		res, err := prepare(ctx, &r)
-+		if cert == nil {
++		if lead == nil {
 +			return res, err
 +		}
 +		if err != nil || res == nil { // the certificate alone keeps the chain going
-+			return &abci.ResponsePrepareProposal{Txs: [][]byte{cert}}, nil
++			return &abci.ResponsePrepareProposal{Txs: lead}, nil
 +		}
-+		res.Txs = append([][]byte{cert}, res.Txs...)
++		res.Txs = append(lead, res.Txs...)
 +		return res, nil
 +	})
 +	app.SetProcessProposal(func(ctx sdk.Context, req *abci.RequestProcessProposal) (*abci.ResponseProcessProposal, error) {
@@ -3606,9 +9597,20 @@ index 0000000..78fa31b
 +			app.Logger().Info("ZETAPHY: rejecting proposal", "err", err)
 +			return &abci.ResponseProcessProposal{Status: abci.ResponseProcessProposal_REJECT}, nil
 +		}
++		if err := app.zxCheckProposal(req.Height, req.Txs); err != nil { // ZETAPHY v5
++			app.Logger().Info("ZETAPHY: rejecting proposal", "err", err)
++			return &abci.ResponseProcessProposal{Status: abci.ResponseProcessProposal_REJECT}, nil
++		}
++		skip := 0
 +		if app.pqCertOf(req.Txs) != nil {
++			skip = 1
++		}
++		if z, i := app.zxOf(req.Txs); z != nil {
++			skip = i + 1
++		}
++		if skip > 0 {
 +			r := *req
-+			r.Txs = req.Txs[1:]
++			r.Txs = req.Txs[skip:]
 +			return process(ctx, &r)
 +		}
 +		return process(ctx, req)
@@ -3724,10 +9726,10 @@ index 0000000..78fa31b
 +}
 diff --git a/evmd/zetaphy_pqguard.go b/evmd/zetaphy_pqguard.go
 new file mode 100644
-index 0000000..b8c4648
+index 0000000..3e0b15e
 --- /dev/null
 +++ b/evmd/zetaphy_pqguard.go
-@@ -0,0 +1,488 @@
+@@ -0,0 +1,545 @@
 +package evmd
 +
 +// ZETAPHY post-quantum guards.
@@ -3875,6 +9877,17 @@ index 0000000..b8c4648
 +	if err := threatRefused(ctx); err != nil {
 +		return err // the threat gate refused this tx in the ante handler: revert it (the fee stays paid)
 +	}
++	if r.Status == ethtypes.ReceiptStatusSuccessful { // ZETAPHY: the node-level invariant firewall (zetaphy_firewall.go)
++		if err := h.app.firewallPostTx(ctx); err != nil {
++			return err // a chain-layer invariant broke: revert the whole tx
++		}
++	}
++	if r.Status == ethtypes.ReceiptStatusSuccessful { // ZETAPHY v5: new contracts to score, bridge outflows (never fails)
++		if msg.To == nil && r.ContractAddress != (common.Address{}) {
++			h.app.immuneNoteDeploy(ctx, r.ContractAddress)
++		}
++		h.app.breakerNoteLogs(ctx, r.Logs)
++	}
 +	if msg.To == nil || *msg.To != PQLockAddress || r.Status != ethtypes.ReceiptStatusSuccessful {
 +		return nil
 +	}
@@ -3899,6 +9912,12 @@ index 0000000..b8c4648
 +			}
 +			return ctx, errorsmod.Wrap(errortypes.ErrUnauthorized, "a vote certificate is only valid as the first tx of a block")
 +		}
++		if zxHas(tx) { // ZETAPHY v5: the proposer's MsgZXVotes, after the certificate (zetaphy_immune.go)
++			if len(tx.GetMsgs()) == 1 && ctx.ExecMode() == sdk.ExecModeFinalize && ctx.TxIndex() <= 1 {
++				return ctx.WithGasMeter(storetypes.NewGasMeter(100_000)), nil
++			}
++			return ctx, errorsmod.Wrap(errortypes.ErrUnauthorized, "v5 votes are only valid at the start of a block")
++		}
 +		newCtx, err := next(ctx, tx, sim)
 +		if err != nil {
 +			return newCtx, err
@@ -3912,12 +9931,20 @@ index 0000000..b8c4648
 +				return newCtx, errorsmod.Wrapf(errortypes.ErrUnauthorized, "%s is quantum-locked: only its ML-DSA-44 controller can act for it", sdk.AccAddress(s))
 +			}
 +		}
++		// ZETAPHY chain guard (zetaphy_chainguard.go): circuit breaker, retired algorithms, constitution.
++		if err := app.guardCheckTx(newCtx, tx); err != nil {
++			return newCtx, err
++		}
 +		// ZETAPHY security core (zetaphy_security.go): Q-day, then the threat gate.
 +		if app.qdayActive(ctx) {
 +			if err := app.qdayCheckTx(ctx, tx); err != nil {
 +				return newCtx, err
 +			}
 +		}
++		if err := app.guardTx(newCtx, tx); err != nil { // ZETAPHY v5: protected accounts, anomaly hold (zetaphy_guard.go)
++			return newCtx, err
++		}
++		newCtx = app.shieldNoteSigners(newCtx, tx) // the shield: who signed this tx itself (zetaphy_shield.go)
 +		if err := app.threatGateTx(ctx, tx); err != nil {
 +			if ctx.ExecMode() != sdk.ExecModeFinalize {
 +				return newCtx, err // CheckTx and proposals: refused before inclusion
@@ -4076,42 +10103,59 @@ index 0000000..b8c4648
 +// on a devnet); a node that is down is ordinary downtime.
 +func (app *EVMD) setPQVoteHandlers(home string) {
 +	app.pqHome = home // for the proposer's own certificate entry (pqOwnEntry)
++	if home != "" {
++		app.signRec = newZetaphySignRecord(home) // the start guard's sign record (zetaphy_antirollback.go)
++	}
 +	seedFile := filepath.Join(home, "config", pqVoteSeedFn)
 +	app.SetExtendVoteHandler(func(ctx sdk.Context, req *abci.RequestExtendVote) (*abci.ResponseExtendVote, error) {
 +		var want []byte
++		// ZETAPHY v5: the payload (immune scores, breaker flags) goes after the signature (zetaphy_immune.go)
++		payload := app.zxBuild(ctx, req.Height)
 +		cons, err := pqConsAddr(home)
 +		if err != nil { // remote signer: sign with the current seed file
 +			if sk, _, err := pqVoteSeed(seedFile); err == nil {
 +				sig, err := pqSign(sk, pqVoteMsg(ctx.ChainID(), req.Height, req.Hash))
-+				return &abci.ResponseExtendVote{VoteExtension: sig}, err
++				return &abci.ResponseExtendVote{VoteExtension: append(sig, payload...)}, err
 +			}
-+			return &abci.ResponseExtendVote{}, nil
++			return &abci.ResponseExtendVote{VoteExtension: payload}, nil
 +		}
 +		want = app.pqVoteKeyAt(ctx, cons, req.Height)
 +		for _, f := range []string{seedFile, seedFile + ".old"} {
 +			sk, pub, err := pqVoteSeed(f)
 +			if err == nil && (want == nil || bytes.Equal(pub, want)) {
 +				sig, err := pqSign(sk, pqVoteMsg(ctx.ChainID(), req.Height, req.Hash))
-+				return &abci.ResponseExtendVote{VoteExtension: sig}, err
++				if err == nil {
++					app.signRec.note(ctx.ChainID(), req.Height, cons) // a local key is about to sign this precommit
++				}
++				return &abci.ResponseExtendVote{VoteExtension: append(sig, payload...)}, err
 +			}
 +		}
 +		if want == nil {
-+			return &abci.ResponseExtendVote{}, nil
++			app.signRec.note(ctx.ChainID(), req.Height, cons)
++			return &abci.ResponseExtendVote{VoteExtension: payload}, nil
 +		}
 +		app.Logger().Error("ZETAPHY: no ML-DSA vote key here matches the one registered for this validator; stopping so as not to send a vote the chain rejects. Put the right key in " + seedFile)
 +		os.Exit(1)
 +		return nil, nil
 +	})
 +	app.SetVerifyVoteExtensionHandler(func(ctx sdk.Context, req *abci.RequestVerifyVoteExtension) (*abci.ResponseVerifyVoteExtension, error) {
-+		ok := len(req.VoteExtension) == 0 || len(req.VoteExtension) == circl.SignatureSize
-+		if pk := app.pqVoteKeyAt(ctx, req.ValidatorAddress, req.Height); pk != nil {
-+			ok = (&mldsa44.PubKey{Key: pk}).VerifySignature(pqVoteMsg(ctx.ChainID(), req.Height, req.Hash), req.VoteExtension)
-+		}
-+		if ok {
++		if app.pqVerifyExtension(ctx, req) {
 +			return &abci.ResponseVerifyVoteExtension{Status: abci.ResponseVerifyVoteExtension_ACCEPT}, nil
 +		}
 +		return &abci.ResponseVerifyVoteExtension{Status: abci.ResponseVerifyVoteExtension_REJECT}, nil
 +	})
++}
++
++// pqVerifyExtension: the ML-DSA-44 signature part (when the validator has a
++// key) and the v5 payload after it (zetaphy_immune.go) are both valid.
++func (app *EVMD) pqVerifyExtension(ctx sdk.Context, req *abci.RequestVerifyVoteExtension) bool {
++	sig, payload := zxSplit(req.VoteExtension)
++	if pk := app.pqVoteKeyAt(ctx, req.ValidatorAddress, req.Height); pk != nil &&
++		!(&mldsa44.PubKey{Key: pk}).VerifySignature(pqVoteMsg(ctx.ChainID(), req.Height, req.Hash), sig) {
++		return false
++	}
++	_, err := app.zxCheck(ctx, req.Height, payload)
++	return err == nil
 +}
 +
 +// PQVoteKeyCmd: zetaphyd tx pq-vote-key --from <operator>. Registers the
@@ -4193,6 +10237,21 @@ index 0000000..b8c4648
 +		if k[0] == secV3Key[0] && app.secV3Height(ctx) > 0 && app.secV3Height(ctx) <= ctx.BlockHeight()+1 {
 +			v = binary.BigEndian.AppendUint64(nil, 1)
 +		}
++		if k[0] == futV5Key[0] && app.futV5(ctx, ctx.BlockHeight()+1) {
++			v = binary.BigEndian.AppendUint64(nil, 1)
++		}
++		if k[0] == shieldHeightKey[0] && app.shieldHeight(ctx) > 0 && app.shieldHeight(ctx) <= ctx.BlockHeight()+1 {
++			v = binary.BigEndian.AppendUint64(nil, 1) // the shield (zetaphy_shield.go)
++		}
++		if k[0] == circuitCoolPfx { // heights of this chain only
++			continue
++		}
++		if k[0] == firewallHeightKey[0] && app.firewallHeight(ctx) > 0 && app.firewallHeight(ctx) <= ctx.BlockHeight()+1 {
++			v = binary.BigEndian.AppendUint64(nil, 1) // the invariant firewall's code path (zetaphy_firewall.go)
++		}
++		if k[0] == immunePendingPfx || k[0] == breakerPausePfx || k[0] == firewallBaseKey[0] { // this chain's last blocks only
++			continue
++		}
 +		if k[0] == 2 { // vote keys: the current key only, valid from the new chain's start
 +			cur := app.pqVoteKeyAt(ctx, k[1:], ctx.BlockHeight()+1)
 +			if cur == nil {
@@ -4218,10 +10277,10 @@ index 0000000..b8c4648
 +}
 diff --git a/evmd/zetaphy_qday.go b/evmd/zetaphy_qday.go
 new file mode 100644
-index 0000000..bb88122
+index 0000000..4165ad2
 --- /dev/null
 +++ b/evmd/zetaphy_qday.go
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,306 @@
 +package evmd
 +
 +// ZETAPHY Q-day: the day ECDSA (secp256k1) stops being trusted.
@@ -4310,6 +10369,9 @@ index 0000000..bb88122
 +func (app *EVMD) setQDay(ctx sdk.Context, m *MsgSetQDay) (gogoproto.Message, error) {
 +	if m.Authority != govAuthority() {
 +		return nil, errorsmod.Wrap(errortypes.ErrUnauthorized, "only governance can schedule Q-day")
++	}
++	if err := app.qdayGuard(ctx); err != nil { // ZETAPHY chain guard: no way back to ECDSA (zetaphy_chainguard.go)
++		return nil, err
 +	}
 +	if m.Height != 0 && int64(m.Height) <= ctx.BlockHeight() { // #nosec G115 -- compared, not stored
 +		return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest, "Q-day must be a future block (now %d), or 0 to unschedule it", ctx.BlockHeight())
@@ -4670,10 +10732,10 @@ index 0000000..81a5fff
 +}
 diff --git a/evmd/zetaphy_rpc.go b/evmd/zetaphy_rpc.go
 new file mode 100644
-index 0000000..76340b8
+index 0000000..aeeba44
 --- /dev/null
 +++ b/evmd/zetaphy_rpc.go
-@@ -0,0 +1,497 @@
+@@ -0,0 +1,528 @@
 +package evmd
 +
 +// ZETAPHY JSON-RPC namespace "zetaphy" on the public EVM endpoint (8545),
@@ -4683,8 +10745,13 @@ index 0000000..76340b8
 +//	zetaphy_pqAccount(address)  account number and sequence to sign with
 +//	zetaphy_sendCosmosTx(0x…)   broadcast a signed Cosmos tx (CheckTx only)
 +//	zetaphy_faucet(address)     testnet only: a little ZETAPHY for newcomers
++//	zetaphy_faucetPow(address, height, nonce), zetaphy_faucetPowInfo():
++//	                            the same faucet behind a browser proof of
++//	                            work (zetaphy_faucetpow.go)
 +//	zetaphy_securityStatus, zetaphy_migration, zetaphy_qdayCommitment,
 +//	zetaphy_consent, zetaphy_ibcHolds: the security core (end of this file)
++//	zetaphy_modelAt(height)     v5: the Neuro model version in force at a
++//	                            height (zetaphy_modelat.go)
 +//
 +// The first two hold no keys: like eth_sendRawTransaction, sendCosmosTx only
 +// passes on bytes the user already signed. The faucet signs with its own key
@@ -4856,6 +10923,8 @@ index 0000000..76340b8
 +	day   int64
 +	count int
 +	last  map[common.Address]time.Time
++	// zetaphy_faucetPow: (address, height) pairs whose proof got a grant, by height
++	powUsed map[powUse]uint64
 +}
 +
 +type FaucetResult struct {
@@ -4888,21 +10957,45 @@ index 0000000..76340b8
 +		return nil, fmt.Errorf("invalid address: %w", err)
 +	}
 +	to := common.BytesToAddress(addr)
-+	// Only through this machine (rpc-guard behind Caddy counts calls per
-+	// IP): not over websocket, not from another machine straight to 8545.
-+	if p := gethrpc.PeerInfoFromContext(ctx); p.Transport != "http" || !loopbackPeer(p.RemoteAddr) {
-+		return nil, fmt.Errorf("the faucet answers only through this node's https address")
++	if err := faucetPeerOK(ctx); err != nil {
++		return nil, err
 +	}
 +	faucet.Lock()
 +	defer faucet.Unlock()
++	return a.faucetGrant(ctx, to)
++}
++
++// faucetNow is the faucet's clock (tests move it).
++var faucetNow = time.Now
++
++// faucetPeerOK: the faucet answers only through this machine (rpc-guard
++// behind Caddy counts calls per IP): not over websocket, not from another
++// machine straight to 8545.
++func faucetPeerOK(ctx context.Context) error {
++	if p := gethrpc.PeerInfoFromContext(ctx); p.Transport != "http" || !loopbackPeer(p.RemoteAddr) {
++		return fmt.Errorf("the faucet answers only through this node's https address")
++	}
++	return nil
++}
++
++// faucetDay starts a new UTC day's count when the day changed (faucet locked).
++func faucetDay(now time.Time) {
++	if d := now.Unix() / 86400; d != faucet.day {
++		faucet.day, faucet.count = d, 0
++	}
++}
++
++// faucetGrant: the limits every faucet method shares (FaucetPerDay grants a
++// UTC day in all, one grant per address per faucetCooldown, nothing for an
++// address that already holds FaucetAmount), then the transfer. The caller
++// holds faucet's lock.
++func (a *ZetaphyAPI) faucetGrant(ctx context.Context, to common.Address) (*FaucetResult, error) {
 +	key, err := a.faucetKey()
 +	if err != nil {
 +		return nil, err
 +	}
-+	now := time.Now().UTC()
-+	if d := now.Unix() / 86400; d != faucet.day {
-+		faucet.day, faucet.count = d, 0
-+	}
++	now := faucetNow().UTC()
++	faucetDay(now)
 +	if faucet.last == nil || len(faucet.last) > 100000 {
 +		faucet.last = map[common.Address]time.Time{}
 +	}
@@ -5173,10 +11266,10 @@ index 0000000..76340b8
 +}
 diff --git a/evmd/zetaphy_rpcguard.go b/evmd/zetaphy_rpcguard.go
 new file mode 100644
-index 0000000..dd3582c
+index 0000000..2835e0e
 --- /dev/null
 +++ b/evmd/zetaphy_rpcguard.go
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,421 @@
 +package evmd
 +
 +// ZETAPHY: `zetaphyd rpc-guard`, a small filter between Caddy (the public
@@ -5191,6 +11284,9 @@ index 0000000..dd3582c
 +//     admin_*, personal_* and the rest stay on the machine.
 +//   - zetaphy_faucet: at most faucetPerDay calls a UTC day from one IP (an
 +//     IPv6 /64 counts as one), on top of the node's own faucet limits.
++//   - zetaphy_faucetPow (the faucet behind a browser proof of work, the main
++//     guard there): at most faucetPowPerDay calls a UTC day from one IP.
++//     One faucet call (either method) per request.
 +//   - everyone: at most perMinute requests a minute from one IP, and
 +//     maxInFlight requests at a time in all.
 +//
@@ -5240,28 +11336,31 @@ index 0000000..dd3582c
 +}
 +
 +const (
-+	guardBodyLimit = 1 << 20 // as CometBFT's max_body_bytes and the EVM http-body-limit
-+	guardMaxBatch  = 20
-+	faucetMethod   = "zetaphy_faucet"
++	guardBodyLimit  = 1 << 20 // as CometBFT's max_body_bytes and the EVM http-body-limit
++	guardMaxBatch   = 20
++	faucetMethod    = "zetaphy_faucet"
++	faucetPowMethod = "zetaphy_faucetPow"
 +)
 +
 +// GuardConfig: what rpc-guard forwards where, and its limits.
 +type GuardConfig struct {
-+	Comet        string // CometBFT RPC, e.g. http://127.0.0.1:26657
-+	EVM          string // EVM JSON-RPC, e.g. http://127.0.0.1:8545
-+	PerMinute    int    // requests a minute from one IP (each side)
-+	FaucetPerDay int    // zetaphy_faucet calls a UTC day from one IP
-+	MaxInFlight  int    // requests being answered at once (each side)
++	Comet           string // CometBFT RPC, e.g. http://127.0.0.1:26657
++	EVM             string // EVM JSON-RPC, e.g. http://127.0.0.1:8545
++	PerMinute       int    // requests a minute from one IP (each side)
++	FaucetPerDay    int    // zetaphy_faucet calls a UTC day from one IP
++	FaucetPowPerDay int    // zetaphy_faucetPow calls a UTC day from one IP
++	MaxInFlight     int    // requests being answered at once (each side)
 +}
 +
 +// Guard holds the counters shared by the two filters.
 +type Guard struct {
-+	cfg    GuardConfig
-+	comet  *url.URL
-+	evm    *url.URL
-+	minute *window
-+	faucet *window
-+	now    func() time.Time
++	cfg       GuardConfig
++	comet     *url.URL
++	evm       *url.URL
++	minute    *window
++	faucet    *window
++	faucetPow *window
++	now       func() time.Time
 +}
 +
 +// NewGuard checks the backend addresses.
@@ -5274,14 +11373,15 @@ index 0000000..dd3582c
 +	if err != nil || e.Host == "" {
 +		return nil, fmt.Errorf("--evm: an http://host:port address")
 +	}
-+	if cfg.PerMinute < 1 || cfg.FaucetPerDay < 0 || cfg.MaxInFlight < 1 {
++	if cfg.PerMinute < 1 || cfg.FaucetPerDay < 0 || cfg.FaucetPowPerDay < 0 || cfg.MaxInFlight < 1 {
 +		return nil, fmt.Errorf("limits must be positive")
 +	}
 +	return &Guard{
 +		cfg: cfg, comet: c, evm: e,
-+		minute: newWindow(time.Minute, 200_000),
-+		faucet: newWindow(24*time.Hour, 200_000),
-+		now:    time.Now,
++		minute:    newWindow(time.Minute, 200_000),
++		faucet:    newWindow(24*time.Hour, 200_000),
++		faucetPow: newWindow(24*time.Hour, 200_000),
++		now:       time.Now,
 +	}, nil
 +}
 +
@@ -5492,22 +11592,29 @@ index 0000000..dd3582c
 +			refuse(w, http.StatusBadRequest, err.Error())
 +			return
 +		}
-+		faucets := 0
++		faucets, pows := 0, 0
 +		for _, m := range ms {
 +			if !evmMethodOK(m) {
 +				refuse(w, http.StatusForbidden, "method not available on this public RPC: "+trimMethod(m))
 +				return
 +			}
-+			if m == faucetMethod {
++			switch m {
++			case faucetMethod:
 +				faucets++
++			case faucetPowMethod:
++				pows++
 +			}
 +		}
-+		if faucets > 1 {
-+			refuse(w, http.StatusBadRequest, "one zetaphy_faucet call per request")
++		if faucets+pows > 1 {
++			refuse(w, http.StatusBadRequest, "one zetaphy_faucet or zetaphy_faucetPow call per request")
 +			return
 +		}
 +		if faucets == 1 && !g.faucet.allow(ClientKey(r), g.cfg.FaucetPerDay, g.now()) {
 +			refuse(w, http.StatusTooManyRequests, fmt.Sprintf("the faucet gives at most %d grants a day to one internet address; try again tomorrow (UTC)", g.cfg.FaucetPerDay))
++			return
++		}
++		if pows == 1 && !g.faucetPow.allow(ClientKey(r), g.cfg.FaucetPowPerDay, g.now()) {
++			refuse(w, http.StatusTooManyRequests, fmt.Sprintf("the proof-of-work faucet takes at most %d claims a day from one internet address; try again tomorrow (UTC)", g.cfg.FaucetPowPerDay))
 +			return
 +		}
 +		r.URL.Path, r.URL.RawPath = "/", ""
@@ -5580,15 +11687,16 @@ index 0000000..dd3582c
 +	f.StringVar(&cfg.EVM, "evm", "http://127.0.0.1:8545", "the node's EVM JSON-RPC")
 +	f.IntVar(&cfg.PerMinute, "per-minute", 300, "requests a minute from one IP, on each side")
 +	f.IntVar(&cfg.FaucetPerDay, "faucet-per-day", 3, "zetaphy_faucet calls a UTC day from one IP")
++	f.IntVar(&cfg.FaucetPowPerDay, "faucet-pow-per-day", 10, "zetaphy_faucetPow calls a UTC day from one IP")
 +	f.IntVar(&cfg.MaxInFlight, "max-in-flight", 64, "requests answered at once, on each side")
 +	return cmd
 +}
 diff --git a/evmd/zetaphy_seccli.go b/evmd/zetaphy_seccli.go
 new file mode 100644
-index 0000000..50dd8a8
+index 0000000..f632dcb
 --- /dev/null
 +++ b/evmd/zetaphy_seccli.go
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,241 @@
 +package evmd
 +
 +// zetaphyd commands for the security core (gov.sh wraps the proposals):
@@ -5600,10 +11708,19 @@ index 0000000..50dd8a8
 +//	tx qday-commit <commitment hex>
 +//	tx qday-reveal <owner> <controller> <salt hex> <signature hex>
 +//	tx ibc-hold-cancel <id>
++//	tx security-proposal sig-algos '{"version":1,"retire":["secp256k1"]}'
++//	tx security-proposal power-cap <max-bps, 0 = off>
++//	tx security-proposal circuit-authority <multisig zetaphy1… | ->
++//	tx security-proposal circuit-trip|circuit-reset <type URL>[,<type URL>...]
++//	tx security-proposal constitution on
++//	tx circuit trip|reset <type URL>[,...] --from <the circuit authority (multisig)>
 +
 +import (
 +	"encoding/hex"
++	"encoding/json"
 +	"fmt"
++	"os"
++	"path/filepath"
 +	"strconv"
 +	"strings"
 +
@@ -5727,15 +11844,24 @@ index 0000000..50dd8a8
 +			title = fmt.Sprintf("IBC hold rule for other denoms: %d bps of supply, from %s", bps, args[2])
 +		}
 +		return &MsgSetIBCHoldRule{Authority: gov, Denom: args[1], MinAmount: min, SupplyBps: bps}, title, nil
++	case "ai-model", "immune", "breaker", "breaker-rearm", "model-epochs", "invariant-firewall": // ZETAPHY v5 (zetaphy_future.go), firewall (zetaphy_firewall.go)
++		return futProposalMsg(args, func(f string) ([]byte, error) { return os.ReadFile(filepath.Clean(f)) })
++	case "sig-algos", "power-cap", "circuit-authority", "circuit-trip", "circuit-reset", "constitution": // chain guard (zetaphy_chainguard.go)
++		if len(args) != 2 {
++			return nil, "", fmt.Errorf("%s takes one argument", args[0])
++		}
++		data, title, err := guardProposalData(args[0], args[1])
++		return &MsgSetFuture{Authority: gov, Kind: args[0], Data: data}, title, err
 +	}
-+	return nil, "", fmt.Errorf("unknown proposal %q: qday, threat-gate, ibc-hold or ibc-hold-rule", args[0])
++	return nil, "", fmt.Errorf("unknown proposal %q: qday, threat-gate, ibc-hold, ibc-hold-rule, ai-model, immune, breaker, breaker-rearm, model-epochs, invariant-firewall, "+
++		"sig-algos, power-cap, circuit-authority, circuit-trip, circuit-reset or constitution", args[0])
 +}
 +
 +// SecurityProposalCmd: zetaphyd tx security-proposal <kind> ... --deposit ... --from <key>.
 +func SecurityProposalCmd() *cobra.Command {
 +	cmd := &cobra.Command{
-+		Use:   "security-proposal qday|threat-gate|ibc-hold|ibc-hold-rule <args>",
-+		Short: "Propose a ZETAPHY security-core setting (Q-day, threat gate, IBC large-transfer hold)",
++		Use:   "security-proposal qday|threat-gate|ibc-hold|ibc-hold-rule|ai-model|immune|breaker|breaker-rearm|model-epochs|invariant-firewall|sig-algos|power-cap|circuit-authority|circuit-trip|circuit-reset|constitution <args>",
++		Short: "Propose a ZETAPHY security-core setting (Q-day, threat gate, IBC large-transfer hold, v5: AI model, immune system, bridge breaker, Neuro model registry)",
 +		Args:  cobra.RangeArgs(2, 4),
 +		RunE: func(cmd *cobra.Command, args []string) error {
 +			cctx, err := client.GetClientTxContext(cmd)
@@ -5765,12 +11891,59 @@ index 0000000..50dd8a8
 +	flags.AddTxFlagsToCmd(cmd)
 +	return cmd
 +}
++
++// guardProposalData: MsgSetFuture data of the chain-guard kinds (zetaphy_chainguard.go).
++func guardProposalData(kind, arg string) ([]byte, string, error) {
++	switch kind {
++	case "sig-algos":
++		if !json.Valid([]byte(arg)) {
++			return nil, "", fmt.Errorf(`sig-algos: JSON, e.g. '{"version":1,"retire":["secp256k1"]}'`)
++		}
++		return []byte(arg), "Signature algorithm list " + arg, nil
++	case "power-cap":
++		n, err := strconv.ParseUint(arg, 10, 64)
++		if err != nil || n > 10000 {
++			return nil, "", fmt.Errorf("power-cap <max-bps 0..10000, 0 = off>")
++		}
++		bz, _ := json.Marshal(map[string]uint64{"max_bps": n})
++		return bz, fmt.Sprintf("Voting-power cap: %d bps per validator (with 4+ validators)", n), nil
++	case "circuit-authority":
++		if arg == "-" {
++			arg = ""
++		}
++		bz, _ := json.Marshal(map[string]string{"address": arg})
++		return bz, "Circuit breaker authority " + arg, nil
++	case "circuit-trip", "circuit-reset":
++		bz, _ := json.Marshal(map[string][]string{"msgs": strings.Split(arg, ",")})
++		return bz, strings.Replace(kind, "circuit-", "Circuit breaker ", 1) + ": " + arg, nil
++	case "constitution":
++		if arg != "on" {
++			return nil, "", fmt.Errorf("constitution on (it cannot be turned off)")
++		}
++		return []byte(`{"enabled":true}`), "Constitution: governance limits in force (cannot be turned off)", nil
++	}
++	return nil, "", fmt.Errorf("unknown kind %q", kind)
++}
++
++// CircuitCmd: zetaphyd tx circuit trip|reset <type URL>[,...] --from <circuit authority>.
++// The authority is a multisig: build with --generate-only, sign with each key
++// (tx sign --multisig), combine with tx multisign and broadcast.
++func CircuitCmd() *cobra.Command {
++	return secTxCmd("circuit trip|reset <type URL>[,<type URL>...]", "Trip or reset the chain guard's circuit breaker (the circuit authority, a multisig)", 2,
++		func(from string, a []string) (sdk.Msg, error) {
++			if a[0] != "trip" && a[0] != "reset" {
++				return nil, fmt.Errorf("trip or reset")
++			}
++			data, _, err := guardProposalData("circuit-"+a[0], a[1])
++			return &MsgSetFuture{Authority: from, Kind: "circuit-" + a[0], Data: data}, err
++		})
++}
 diff --git a/evmd/zetaphy_secprecompile.go b/evmd/zetaphy_secprecompile.go
 new file mode 100644
-index 0000000..13386b1
+index 0000000..2e4a563
 --- /dev/null
 +++ b/evmd/zetaphy_secprecompile.go
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,151 @@
 +package evmd
 +
 +// ZETAPHY security precompile at 0x…0901 (always on from the security-core
@@ -5914,7 +12087,10 @@ index 0000000..13386b1
 +
 +// zetaphyPrecompile is the EVM keeper's hook for chain-defined precompiles.
 +func (app *EVMD) zetaphyPrecompile(ctx sdk.Context, addr common.Address) (vm.PrecompiledContract, bool) {
-+	if addr != SecurityPrecompileAddress || !app.secV3(ctx) {
++	if addr != SecurityPrecompileAddress {
++		return app.futPrecompile(ctx, addr) // ZETAPHY v5 (zetaphy_future.go)
++	}
++	if !app.secV3(ctx) {
 +		return nil, false
 +	}
 +	return app.secPrecompile, true
@@ -6061,9 +12237,346 @@ index 0000000..069022e
 +	a, err := pqAddr(s)
 +	return err == nil && a.Equals(authtypes.NewModuleAddress(govtypes.ModuleName))
 +}
+diff --git a/evmd/zetaphy_shield.go b/evmd/zetaphy_shield.go
+new file mode 100644
+index 0000000..c2c2940
+--- /dev/null
++++ b/evmd/zetaphy_shield.go
+@@ -0,0 +1,331 @@
++package evmd
++
++// ZETAPHY "zetaphy-shield" upgrade (internal review 2026-11-10, Z-01..Z-03;
++// docs/CHAIN-FIREWALL.md, docs/ANTI-ROLLBACK-CHAIN.md).
++//
++// It closes three gaps in the add-on protection layers, each from the
++// shield height on:
++//
++//   - Account guard and EIP-7702: an Ethereum tx that carries a code
++//     delegation (SetCode authorization) signed by an account the guard
++//     protects (protected mode or anomaly hold in force) is refused, in the
++//     ante handler and at mempool submission, whoever sends the tx. Turning the
++//     protection off first waits its delay, as before.
++//   - Message limit: the account guard and the threat gate see every message
++//     of a tx, authz MsgExec inner messages included (breadth first). A tx
++//     with more than zetaphyMaxTxMsgs of them is refused instead of being
++//     checked only in part.
++//   - Circuit breaker (internal review 2026-11-12, Z-44, Z-46): every ZETAPHY
++//     message (/zetaphy.pq.v1.*) and every IBC core client and channel message
++//     can no longer be tripped (an earlier trip of one stops applying); a trip
++//     by the circuit authority lapses after circuitAuthorityTripBlocks unless
++//     governance trips the type itself (confirms it); after a reset, or after
++//     its trip lapsed, the authority may not trip that type again for the same
++//     number of blocks; and the authority must sign the tx itself (a trip or
++//     reset that reaches it through authz or a contract is refused).
++//   - Invariant firewall: the check that runs after every EVM tx and
++//     MsgEVMCall also runs after every other message that can execute EVM
++//     code: IBC packets (receive, acknowledgement, timeout; the ICS-20 stack
++//     with its ERC-20 conversions and IBC callbacks, v1 and v2), each IBC
++//     callback into a contract (a callback that breaks an invariant is
++//     discarded, the packet goes on), and the transactions with MsgTransfer,
++//     ERC-20 module or CosmWasm messages (directly or in authz MsgExec), whose
++//     state is discarded when they break one. These extra checks charge no gas.
++//
++// Activation: "zetaphy-shield" sets key 0x50 to the upgrade height + 1 (a new
++// chain may carry 0x50 in genesis). Below it every path returns exactly what
++// the binary without it returned (same results, errors and gas; 0x50 is read
++// without gas), so the upgrade may run early (zetaphyEarlyUpgrades) and a mixed
++// old/new validator set agrees on every block before the height. It needs v5.
++// No store is added.
++
++import (
++	"bytes"
++	"context"
++	"strings"
++
++	"github.com/ethereum/go-ethereum/common"
++
++	ibccallbacktypes "github.com/cosmos/ibc-go/v11/modules/apps/callbacks/types"
++	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
++	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
++	ibcexported "github.com/cosmos/ibc-go/v11/modules/core/exported"
++
++	errorsmod "cosmossdk.io/errors"
++
++	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
++	"github.com/cosmos/cosmos-sdk/types/module"
++	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
++	"github.com/cosmos/cosmos-sdk/x/authz"
++	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
++)
++
++// ZetaphyShieldUpgradeName turns the shield rules on for a running chain.
++const ZetaphyShieldUpgradeName = "zetaphy-shield"
++
++// Keys of the zetaphypq store used by the shield.
++var (
++	shieldHeightKey = []byte{0x50} // height (8) from which the shield rules apply
++	circuitCoolPfx  = byte(0x51)   // || message type URL -> height (8) before which the circuit authority may not trip it
++)
++
++// shieldKeyKnown: shield prefixes a genesis may carry.
++func shieldKeyKnown(p byte) bool { return p == shieldHeightKey[0] || p == circuitCoolPfx }
++
++// zetaphyMaxTxMsgs: the most messages a tx may carry for the account guard and
++// the threat gate, authz MsgExec inner messages included.
++const zetaphyMaxTxMsgs = 64
++
++func (app *EVMD) shieldHeight(ctx sdk.Context) int64 {
++	return int64(readU64(app.secRaw(ctx).Get(shieldHeightKey))) // #nosec G115 -- block heights
++}
++
++func (app *EVMD) setShieldHeight(ctx sdk.Context, h int64) {
++	ctx.KVStore(app.GetKey(pqStoreKey)).Set(shieldHeightKey, u64(uint64(h))) // #nosec G115 -- block heights
++}
++
++// shieldActive: this block runs with the shield rules (read without gas).
++func (app *EVMD) shieldActive(ctx sdk.Context) bool {
++	a := app.shieldHeight(ctx)
++	return a > 0 && ctx.BlockHeight() >= a && app.futV5(ctx, ctx.BlockHeight())
++}
++
++// registerZetaphyShield (from registerZetaphyUpgrades): "zetaphy-shield" makes
++// the rules above apply from the block after the upgrade. No store is added.
++func (app *EVMD) registerZetaphyShield() {
++	app.UpgradeKeeper.SetUpgradeHandler(ZetaphyShieldUpgradeName,
++		func(c context.Context, _ upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
++			ctx := sdk.UnwrapSDKContext(c)
++			if a := app.shieldHeight(ctx); a == 0 || a > ctx.BlockHeight()+1 {
++				app.setShieldHeight(ctx, ctx.BlockHeight()+1)
++			}
++			ctx.Logger().Info("ZETAPHY shield scheduled (guard covers every message and code delegation; firewall after every EVM-executing message)", "from_height", ctx.BlockHeight()+1)
++			return app.ModuleManager.RunMigrations(c, app.Configurator(), fromVM)
++		})
++}
++
++// zetaphyTxMsgs: a tx's messages followed by the inner messages of its authz
++// MsgExec (breadth first). Before the shield height (strict false) at most
++// zetaphyMaxTxMsgs entries are returned and the rest is left out, as the
++// earlier binaries did; from it (strict) a tx with more is an error.
++func zetaphyTxMsgs(tx sdk.Tx, strict bool) ([]sdk.Msg, error) {
++	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
++	for i := 0; i < len(msgs); i++ {
++		if len(msgs) > zetaphyMaxTxMsgs && strict {
++			return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest,
++				"a transaction may carry at most %d messages, authz inner messages included: refused", zetaphyMaxTxMsgs)
++		}
++		if i >= zetaphyMaxTxMsgs {
++			return msgs[:zetaphyMaxTxMsgs], nil
++		}
++		if m, ok := msgs[i].(*authz.MsgExec); ok {
++			if inner, err := m.GetMessages(); err == nil {
++				msgs = append(msgs, inner...)
++			}
++		}
++	}
++	if len(msgs) > zetaphyMaxTxMsgs && strict {
++		return nil, errorsmod.Wrapf(errortypes.ErrInvalidRequest,
++			"a transaction may carry at most %d messages, authz inner messages included: refused", zetaphyMaxTxMsgs)
++	}
++	return msgs, nil
++}
++
++// guardInForce: the account guard protects a (protected mode on, or the
++// anomaly hold opted in and not opted out), at the block time.
++func (app *EVMD) guardInForce(ctx sdk.Context, a common.Address) bool {
++	return app.guardProtectionOf(ctx, a).mode != guardModeOff || app.holdCfgOf(ctx, a) != nil
++}
++
++// ---- the invariant firewall after every EVM-executing message
++
++// shieldFirewall runs the firewall's post-transaction check on ctx's state
++// (zetaphy_firewall.go) without charging gas: nil below the shield height or
++// while the firewall is off.
++func (app *EVMD) shieldFirewall(ctx sdk.Context) error {
++	if !app.shieldActive(ctx) || !app.firewallOn(ctx) {
++		return nil
++	}
++	return app.firewallPostTx(ctx.WithGasMeter(storetypes.NewInfiniteGasMeter()))
++}
++
++// shieldEVMCapable: a message (other than an Ethereum tx or MsgEVMCall, which
++// are checked where they run) whose execution can run EVM code: ICS-20
++// transfers (ERC-20 conversion, send callbacks), the ERC-20 module's messages
++// and CosmWasm's (a contract can dispatch the others). IBC packet messages are
++// checked per packet in the transfer stack (zetaphy_ibchold.go).
++func shieldEVMCapable(m sdk.Msg) bool {
++	u := sdk.MsgTypeURL(m)
++	return u == "/ibc.applications.transfer.v1.MsgTransfer" ||
++		strings.HasPrefix(u, "/cosmos.evm.erc20.") || strings.HasPrefix(u, "/cosmwasm.wasm.")
++}
++
++// shieldPostHandler: after the messages of a tx ran, the firewall check when
++// one of them (or of its authz inner messages) can execute EVM code. An error
++// discards the messages' state (baseapp's post handler contract). Below the
++// shield height it does nothing.
++func (app *EVMD) shieldPostHandler(ctx sdk.Context, tx sdk.Tx, _, success bool) (sdk.Context, error) {
++	if !success || (ctx.ExecMode() != sdk.ExecModeFinalize && ctx.ExecMode() != sdk.ExecModeSimulate) || !app.shieldActive(ctx) || !app.firewallOn(ctx) {
++		return ctx, nil
++	}
++	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
++	capable := false
++	for i := 0; i < len(msgs) && !capable; i++ {
++		if m, ok := msgs[i].(*authz.MsgExec); ok {
++			if inner, err := m.GetMessages(); err == nil {
++				msgs = append(msgs, inner...)
++			}
++			continue
++		}
++		capable = shieldEVMCapable(msgs[i])
++	}
++	if !capable {
++		return ctx, nil
++	}
++	return ctx, app.shieldFirewall(ctx)
++}
++
++// shieldCallbacks: the IBC callbacks' contract keeper, with the firewall check
++// after each packet-lifecycle callback, on the callback's own cached context:
++// a callback that breaks an invariant fails, so the callbacks middleware drops
++// its state and the packet lifecycle goes on (a receive gets an error
++// acknowledgement). Send callbacks run inside a MsgTransfer or an EVM tx,
++// which are checked as a whole.
++type shieldCallbacks struct {
++	ibccallbacktypes.ContractKeeper
++	app *EVMD
++}
++
++func (k shieldCallbacks) IBCOnAcknowledgementPacketCallback(ctx sdk.Context, packet channeltypes.Packet, ack []byte, relayer sdk.AccAddress, contract, sender, version string) error {
++	if err := k.ContractKeeper.IBCOnAcknowledgementPacketCallback(ctx, packet, ack, relayer, contract, sender, version); err != nil {
++		return err
++	}
++	return k.app.shieldFirewall(ctx)
++}
++
++func (k shieldCallbacks) IBCOnTimeoutPacketCallback(ctx sdk.Context, packet channeltypes.Packet, relayer sdk.AccAddress, contract, sender, version string) error {
++	if err := k.ContractKeeper.IBCOnTimeoutPacketCallback(ctx, packet, relayer, contract, sender, version); err != nil {
++		return err
++	}
++	return k.app.shieldFirewall(ctx)
++}
++
++func (k shieldCallbacks) IBCReceivePacketCallback(ctx sdk.Context, packet ibcexported.PacketI, ack ibcexported.Acknowledgement, contract, version string) error {
++	if err := k.ContractKeeper.IBCReceivePacketCallback(ctx, packet, ack, contract, version); err != nil {
++		return err
++	}
++	return k.app.shieldFirewall(ctx)
++}
++
++func (k shieldCallbacks) IBCSendPacketCallback(ctx sdk.Context, port, channel string, timeoutHeight clienttypes.Height, timeoutTimestamp uint64, data []byte, contract, sender, version string) error {
++	return k.ContractKeeper.IBCSendPacketCallback(ctx, port, channel, timeoutHeight, timeoutTimestamp, data, contract, sender, version)
++}
++
++// ---- circuit breaker rules (from the shield height)
++
++// circuitAuthorityTripBlocks: how long a trip by the circuit authority holds
++// unless governance confirms it, and how long the authority then waits before
++// it may trip the same message type again (~1 week of 6 s blocks).
++const circuitAuthorityTripBlocks = 100_000
++
++// circuitShieldProtected: message types that can never be tripped from the
++// shield height on: the guard's list, every ZETAPHY message and IBC core's
++// client and channel messages (light clients must stay updatable and packets
++// deliverable, refundable and cancellable).
++func circuitShieldProtected(typeURL string) bool {
++	return circuitIsProtected(typeURL) || strings.HasPrefix(typeURL, "/zetaphy.pq.v1.") ||
++		strings.HasPrefix(typeURL, "/ibc.core.client.") || strings.HasPrefix(typeURL, "/ibc.core.channel.")
++}
++
++func circuitCoolKey(typeURL string) []byte { return append([]byte{circuitCoolPfx}, typeURL...) }
++
++// circuitAuthorityTrip: the stored trip is the circuit authority's (8-byte
++// height + 1), not governance's (8-byte height; also every trip made before
++// the shield height).
++func circuitAuthorityTrip(v []byte) bool { return len(v) == 9 && v[8] == 1 }
++
++// circuitTripInForce: a stored trip of typeURL still applies (from the shield height).
++func (app *EVMD) circuitTripInForce(ctx sdk.Context, typeURL string) bool {
++	v := app.secRaw(ctx).Get(circuitTripKey(typeURL))
++	if v == nil || circuitShieldProtected(typeURL) {
++		return false
++	}
++	return !circuitAuthorityTrip(v) || ctx.BlockHeight() < int64(readU64(v))+circuitAuthorityTripBlocks // #nosec G115 -- block heights
++}
++
++// setCircuitShield: setCircuit with the shield's rules; gov: governance asks.
++func (app *EVMD) setCircuitShield(ctx sdk.Context, trip, gov bool, data []byte) error {
++	var in struct {
++		Msgs []string `json:"msgs"`
++	}
++	if err := futJSON(data, &in); err != nil {
++		return err
++	}
++	if len(in.Msgs) == 0 || len(in.Msgs) > circuitTripMax {
++		return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "circuit: 1 to %d message type URLs", circuitTripMax)
++	}
++	st := ctx.KVStore(app.GetKey(pqStoreKey))
++	h := ctx.BlockHeight()
++	for _, u := range in.Msgs {
++		cur := app.secRaw(ctx).Get(circuitTripKey(u))
++		if !trip {
++			st.Delete(circuitTripKey(u))
++			st.Set(circuitCoolKey(u), u64(uint64(h+circuitAuthorityTripBlocks))) // #nosec G115 -- block heights
++			continue
++		}
++		if app.MsgServiceRouter().HandlerByTypeURL(u) == nil {
++			return errorsmod.Wrapf(errortypes.ErrInvalidRequest, "circuit: %q is not a message this chain routes", u)
++		}
++		if circuitShieldProtected(u) {
++			return errorsmod.Wrapf(ErrCircuit, "%s cannot be tripped (governance, upgrades, IBC clients and channels and the chain's own messages stay available)", u)
++		}
++		if gov { // governance trips, or confirms the authority's trip: no expiry
++			st.Set(circuitTripKey(u), u64(uint64(h))) // #nosec G115 -- block heights
++			continue
++		}
++		if cur != nil && (!circuitAuthorityTrip(cur) || app.circuitTripInForce(ctx, u)) {
++			continue // already tripped: a second trip does not extend it
++		}
++		until := int64(readU64(app.secRaw(ctx).Get(circuitCoolKey(u)))) // #nosec G115 -- block heights
++		if cur != nil {                                                 // the authority's trip lapsed: the same wait as after a reset
++			until = max(until, int64(readU64(cur))+2*circuitAuthorityTripBlocks) // #nosec G115 -- block heights
++		}
++		if h < until {
++			return errorsmod.Wrapf(ErrCircuit, "%s was reset or its trip lapsed: the circuit authority may trip it again from block %d (governance can trip it now)", u, until)
++		}
++		st.Set(circuitTripKey(u), append(u64(uint64(h)), 1)) // #nosec G115 -- block heights
++	}
++	return nil
++}
++
++// shieldSignersKey: the accounts that signed the tx itself (set in the ante handler).
++type shieldSignersKey struct{}
++
++// shieldNoteSigners records the tx's own signers in ctx for the message handlers.
++func (app *EVMD) shieldNoteSigners(ctx sdk.Context, tx sdk.Tx) sdk.Context {
++	if !app.shieldActive(ctx) {
++		return ctx
++	}
++	st, ok := tx.(authsigning.SigVerifiableTx)
++	if !ok {
++		return ctx
++	}
++	s, err := st.GetSigners()
++	if err != nil {
++		return ctx
++	}
++	return ctx.WithValue(shieldSignersKey{}, s)
++}
++
++// shieldSignedBy: a signed the tx that runs this message itself.
++func shieldSignedBy(ctx sdk.Context, a []byte) bool {
++	s, _ := ctx.Value(shieldSignersKey{}).([][]byte)
++	for _, x := range s {
++		if bytes.Equal(x, a) {
++			return true
++		}
++	}
++	return false
++}
 diff --git a/evmd/zetaphy_threatgate.go b/evmd/zetaphy_threatgate.go
 new file mode 100644
-index 0000000..42ada54
+index 0000000..80cc9de
 --- /dev/null
 +++ b/evmd/zetaphy_threatgate.go
 @@ -0,0 +1,251 @@
@@ -6116,7 +12629,6 @@ index 0000000..42ada54
 +	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 +	sdk "github.com/cosmos/cosmos-sdk/types"
 +	errortypes "github.com/cosmos/cosmos-sdk/types/errors"
-+	"github.com/cosmos/cosmos-sdk/x/authz"
 +
 +	"github.com/cosmos/evm/x/vm/statedb"
 +	evmtypes "github.com/cosmos/evm/x/vm/types"
@@ -6165,7 +12677,8 @@ index 0000000..42ada54
 +		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "registry: a 0x address; enabled: 0 or 1")
 +	}
 +	reg := common.HexToAddress(m.Registry)
-+	if m.Enabled == 1 && len(app.EVMKeeper.GetCode(ctx, app.EVMKeeper.GetCodeHash(ctx, reg))) == 0 {
++	immune := reg == ImmunePrecompileAddress && app.futV5(ctx, ctx.BlockHeight()) // ZETAPHY v5: the immune system's ThreatRegistry views
++	if m.Enabled == 1 && !immune && len(app.EVMKeeper.GetCode(ctx, app.EVMKeeper.GetCodeHash(ctx, reg))) == 0 {
 +		return nil, errorsmod.Wrap(errortypes.ErrInvalidRequest, "registry: no contract at that address")
 +	}
 +	ctx.KVStore(app.GetKey(pqStoreKey)).Set(gateKey, append(reg.Bytes(), byte(m.Enabled)))
@@ -6262,13 +12775,13 @@ index 0000000..42ada54
 +	if _, on := app.threatGate(ctx); !on {
 +		return nil
 +	}
-+	msgs := append([]sdk.Msg{}, tx.GetMsgs()...)
-+	for i := 0; i < len(msgs) && i < 64; i++ {
++	// every message from the shield height on (zetaphy_shield.go); before it the first 64
++	msgs, err := zetaphyTxMsgs(tx, app.shieldActive(ctx))
++	if err != nil {
++		return err
++	}
++	for i := 0; i < len(msgs); i++ {
 +		switch m := msgs[i].(type) {
-+		case *authz.MsgExec:
-+			if inner, err := m.GetMessages(); err == nil {
-+				msgs = append(msgs, inner...)
-+			}
 +		case *MsgEVMCall: // also checked where it runs; here so CheckTx refuses it at once
 +			if m.To == "" || !common.IsHexAddress(m.To) || isGovAddr(m.Sender) {
 +				continue
@@ -6320,10 +12833,10 @@ index 0000000..42ada54
 +}
 diff --git a/evmd/zetaphy_upgrade.go b/evmd/zetaphy_upgrade.go
 new file mode 100644
-index 0000000..5acfd92
+index 0000000..53f019c
 --- /dev/null
 +++ b/evmd/zetaphy_upgrade.go
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,176 @@
 +package evmd
 +
 +// ZETAPHY v2 activation height.
@@ -6429,7 +12942,11 @@ index 0000000..5acfd92
 +			ctx.Logger().Info("ZETAPHY security core scheduled", "from_height", ctx.BlockHeight()+1)
 +			return app.zetaphyWasmMigrations(c, fromVM)
 +		})
-+	app.registerZetaphyV4() // "zetaphy-v4": CosmWasm (zetaphy_cosmwasm.go)
++	app.registerZetaphyV4()       // "zetaphy-v4": CosmWasm (zetaphy_cosmwasm.go)
++	app.registerZetaphyV5()       // "zetaphy-v5": immune system, AI precompile, breaker, account guard (zetaphy_future.go)
++	app.registerZetaphyFirewall() // "zetaphy-firewall": the node-level invariant firewall (zetaphy_firewall.go)
++	app.registerZetaphyGuard()    // "zetaphy-guard": algorithm list, power cap, circuit breaker, constitution (zetaphy_chainguard.go)
++	app.registerZetaphyShield()   // "zetaphy-shield": guard over every message and code delegation, firewall after every EVM-executing message (zetaphy_shield.go)
 +
 +	info, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
 +	if err != nil {
@@ -6460,11 +12977,14 @@ index 0000000..5acfd92
 +	for _, e := range in {
 +		k, err1 := hex.DecodeString(e.Key)
 +		v, err2 := hex.DecodeString(e.Value)
-+		if err1 != nil || err2 != nil || len(k) == 0 || (k[0] != 1 && k[0] != 2 && k[0] != pqEvidenceKey[0] && k[0] != pqActivationKey[0] && !secKeyKnown(k[0])) {
++		if err1 != nil || err2 != nil || len(k) == 0 || (k[0] != 1 && k[0] != 2 && k[0] != pqEvidenceKey[0] && k[0] != pqActivationKey[0] && !secKeyKnown(k[0]) && !futKeyKnown(k[0]) && !guardKeyKnown(k[0]) && !shieldKeyKnown(k[0])) {
 +			return nil, fmt.Errorf("zetaphypq genesis: bad entry %q", e.Key)
 +		}
-+		if (k[0] == pqActivationKey[0] || k[0] == secV3Key[0]) && (len(k) != 1 || len(v) != 8) {
++		if (k[0] == pqActivationKey[0] || k[0] == secV3Key[0] || k[0] == futV5Key[0] || k[0] == firewallHeightKey[0] || k[0] == guardHeightKey[0] || k[0] == shieldHeightKey[0]) && (len(k) != 1 || len(v) != 8) {
 +			return nil, fmt.Errorf("zetaphypq genesis: activation height: want key %02x and 8 bytes", k[0])
++		}
++		if k[0] == firewallKey[0] && (len(k) != 1 || len(v) != 20) {
++			return nil, fmt.Errorf("zetaphypq genesis: invariant firewall: want key 31 and a 20-byte address")
 +		}
 +		out = append(out, [2][]byte{k, v})
 +	}
@@ -6484,13 +13004,297 @@ index 0000000..5acfd92
 +
 +func (pqGenesisBasic) DefaultGenesis(codec.JSONCodec) json.RawMessage {
 +	one := hex.EncodeToString(binary.BigEndian.AppendUint64(nil, 1))
-+	bz, _ := json.Marshal([]pqGenesisEntry{{hex.EncodeToString(pqActivationKey), one}, {hex.EncodeToString(secV3Key), one}})
++	bz, _ := json.Marshal([]pqGenesisEntry{{hex.EncodeToString(pqActivationKey), one}, {hex.EncodeToString(secV3Key), one},
++		{hex.EncodeToString(futV5Key), one}}) // ZETAPHY v5 (zetaphy_future.go): its settings stay off until voted
 +	return bz
 +}
 +
 +func (pqGenesisBasic) ValidateGenesis(_ codec.JSONCodec, _ client.TxEncodingConfig, raw json.RawMessage) error {
 +	_, err := pqParseGenesis(raw)
 +	return err
++}
+diff --git a/evmd/zetaphy_upgradecheck.go b/evmd/zetaphy_upgradecheck.go
+new file mode 100644
+index 0000000..4250558
+--- /dev/null
++++ b/evmd/zetaphy_upgradecheck.go
+@@ -0,0 +1,188 @@
++package evmd
++
++// ZETAPHY: `zetaphyd upgrade-check`, the pre-flight for every binary swap.
++//
++// Run the NEW binary, before it is installed, against the node that runs now
++// (read-only; the running node is not stopped or touched):
++//
++//	/tmp/zetaphyd-new upgrade-check --node tcp://127.0.0.1:26657
++//
++// It reads the chain's completed upgrades (the x/upgrade store, prefix 0x01,
++// the keys x/upgrade's GetLastCompletedUpgrade reads) and the scheduled plan,
++// and fails when this binary could not run the next block:
++//
++//   - the last completed upgrade has no handler in this binary: x/upgrade's
++//     PreBlocker stops the chain at the first block with "wrong app version
++//     ..., upgrade handler is missing for <name> upgrade plan". That is the
++//     2026-11-05 halt at block 239468: a binary without the "zetaphy-v5"
++//     handler was installed on a chain that had completed zetaphy-v5;
++//   - a scheduled plan is due and this binary has no handler for it
++//     ("UPGRADE ... NEEDED");
++//   - a scheduled plan is not due yet, this binary has its handler and the
++//     upgrade may not run early (zetaphyEarlyUpgrades): "BINARY UPDATED
++//     BEFORE TRIGGER!".
++//
++// A binary too old to have this command fails the check as well ("unknown
++// command"). Only the command line uses it; blocks are not affected.
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"strings"
++
++	"github.com/spf13/cobra"
++	"google.golang.org/protobuf/encoding/protowire"
++
++	abci "github.com/cometbft/cometbft/abci/types"
++
++	"github.com/cosmos/cosmos-sdk/client"
++	"github.com/cosmos/cosmos-sdk/client/flags"
++	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
++)
++
++// zetaphyUpgradeNames: every upgrade a ZETAPHY chain may have completed, oldest
++// first. A new binary must keep the handler of each (fork test
++// TestUpgradeRestartAfterEveryUpgrade); a new upgrade is appended here.
++var zetaphyUpgradeNames = []string{
++	UpgradeName, // upstream evmd's "v0.6.0-to-v0.7.0" (upgrades.go)
++	ZetaphyV2UpgradeName,
++	ZetaphyV3UpgradeName,
++	ZetaphyV4UpgradeName,
++	ZetaphyV5UpgradeName,
++	ZetaphyFirewallUpgradeName,
++	ZetaphyGuardUpgradeName,
++	ZetaphyShieldUpgradeName,
++}
++
++// zetaphyLastDone: the last completed upgrade among the x/upgrade "done" keys
++// (0x01 || height (8, big endian) || name), picked as GetLastCompletedUpgrade
++// does (the greatest key: the highest height). raw is the kv.Pairs protobuf
++// a "/store/upgrade/subspace" query answers.
++func zetaphyLastDone(raw []byte) (string, int64, error) {
++	var best []byte
++	for len(raw) > 0 {
++		num, typ, n := protowire.ConsumeTag(raw)
++		if n < 0 {
++			return "", 0, protowire.ParseError(n)
++		}
++		raw = raw[n:]
++		if num != 1 || typ != protowire.BytesType { // Pairs.pairs
++			if n = protowire.ConsumeFieldValue(num, typ, raw); n < 0 {
++				return "", 0, protowire.ParseError(n)
++			}
++			raw = raw[n:]
++			continue
++		}
++		pair, n := protowire.ConsumeBytes(raw)
++		if n < 0 {
++			return "", 0, protowire.ParseError(n)
++		}
++		raw = raw[n:]
++		for len(pair) > 0 {
++			f, t, m := protowire.ConsumeTag(pair)
++			if m < 0 {
++				return "", 0, protowire.ParseError(m)
++			}
++			pair = pair[m:]
++			if f == 1 && t == protowire.BytesType { // Pair.key
++				k, m := protowire.ConsumeBytes(pair)
++				if m < 0 {
++					return "", 0, protowire.ParseError(m)
++				}
++				if len(k) >= 10 && k[0] == upgradetypes.DoneByte && bytes.Compare(k, best) > 0 {
++					best = k
++				}
++				pair = pair[m:]
++				continue
++			}
++			if m = protowire.ConsumeFieldValue(f, t, pair); m < 0 {
++				return "", 0, protowire.ParseError(m)
++			}
++			pair = pair[m:]
++		}
++	}
++	if best == nil {
++		return "", 0, nil
++	}
++	return string(best[9:]), int64(binary.BigEndian.Uint64(best[1:9])), nil // #nosec G115 -- block heights
++}
++
++// zetaphyUpgradeCheck: nil when a binary with these handlers (has) can run
++// block height+1 of a chain whose last completed upgrade is last and whose
++// scheduled plan is plan (nil: none). The same rules as x/upgrade's PreBlocker
++// and zetaphyUpgradeModule.PreBlock.
++func zetaphyUpgradeCheck(last string, plan *upgradetypes.Plan, height int64, has func(string) bool) error {
++	if last != "" && !has(last) {
++		return fmt.Errorf("this binary has no handler for %q, the chain's last completed upgrade: "+
++			"it would stop the chain at block %d (\"upgrade handler is missing for %s upgrade plan\")", last, height+1, last)
++	}
++	if plan == nil {
++		return nil
++	}
++	if plan.ShouldExecute(height + 1) {
++		if !has(plan.Name) {
++			return fmt.Errorf("upgrade %q is due at block %d and this binary has no handler for it", plan.Name, plan.Height)
++		}
++		return nil
++	}
++	if has(plan.Name) && !zetaphyEarlyUpgrades[plan.Name] {
++		return fmt.Errorf("upgrade %q is scheduled for block %d and this binary already has its handler: "+
++			"install it at that height, not before (BINARY UPDATED BEFORE TRIGGER)", plan.Name, plan.Height)
++	}
++	return nil
++}
++
++// UpgradeCheckCmd: zetaphyd upgrade-check [--node ...] (see the top of this file).
++func UpgradeCheckCmd(app *EVMD) *cobra.Command {
++	cmd := &cobra.Command{
++		Use:   "upgrade-check",
++		Short: "Before installing this binary: can it run the next block of the chain --node serves? (read-only)",
++		Args:  cobra.NoArgs,
++		RunE: func(cmd *cobra.Command, _ []string) error {
++			cctx, err := client.GetClientQueryContext(cmd)
++			if err != nil {
++				return err
++			}
++			res, err := cctx.QueryABCI(abci.RequestQuery{Path: "/store/" + upgradetypes.StoreKey + "/subspace", Data: []byte{upgradetypes.DoneByte}})
++			if err != nil {
++				return err
++			}
++			if res.Code != 0 {
++				return fmt.Errorf("completed upgrades: %s", res.Log)
++			}
++			last, lastH, err := zetaphyLastDone(res.Value)
++			if err != nil {
++				return fmt.Errorf("completed upgrades: %w", err)
++			}
++			var plan *upgradetypes.Plan
++			pr, err := upgradetypes.NewQueryClient(cctx).CurrentPlan(cmd.Context(), &upgradetypes.QueryCurrentPlanRequest{})
++			if err != nil {
++				return fmt.Errorf("scheduled plan: %w", err)
++			}
++			if pr.Plan != nil && pr.Plan.Name != "" {
++				plan = pr.Plan
++			}
++			out := cmd.OutOrStdout()
++			var have []string
++			for _, n := range zetaphyUpgradeNames {
++				if app.UpgradeKeeper.HasHandler(n) {
++					have = append(have, n)
++				}
++			}
++			fmt.Fprintf(out, "this binary's upgrade handlers: %s\n", strings.Join(have, " "))
++			fmt.Fprintf(out, "chain at block %d; last completed upgrade: %q at %d\n", res.Height, last, lastH)
++			if plan != nil {
++				fmt.Fprintf(out, "scheduled: %q at block %d\n", plan.Name, plan.Height)
++			}
++			if err := zetaphyUpgradeCheck(last, plan, res.Height, app.UpgradeKeeper.HasHandler); err != nil {
++				return errors.New("REFUSED: " + err.Error())
++			}
++			_, err = fmt.Fprintln(out, "ok: this binary can run the next block")
++			return err
++		},
++	}
++	flags.AddQueryFlagsToCmd(cmd)
++	return cmd
++}
+diff --git a/evmd/zetaphy_upgradeguard.go b/evmd/zetaphy_upgradeguard.go
+new file mode 100644
+index 0000000..0bad50b
+--- /dev/null
++++ b/evmd/zetaphy_upgradeguard.go
+@@ -0,0 +1,83 @@
++package evmd
++
++// ZETAPHY: upgrades whose binary may run before the upgrade height.
++//
++// x/upgrade stops the chain when the running binary already has the handler
++// of a scheduled plan that is not due yet ("BINARY UPDATED BEFORE TRIGGER!").
++// That guard protects upgrades whose new code would change blocks before the
++// height. A ZETAPHY upgrade listed in zetaphyEarlyUpgrades does not: below its
++// height the new binary runs blocks exactly as the old one (its features are
++// gated by a height kept in state, which only the handler sets), and it adds
++// no store. For those, a validator may install the new binary any time before
++// the height; at the height the handler runs and the chain does not stop.
++//
++// The 2026-10-29 testnet halt at block 123343 (proposal 3, "zetaphy-v5") is the
++// case this covers: the release with the v5 handler was installed before the
++// vote passed, and the chain stopped one block later.
++//
++// Rules for adding a name here: the handler only sets activation heights or
++// params from the upgrade height on, every new code path is gated by them, and
++// the upgrade has no StoreUpgrades. Upgrades that add a store (zetaphy-v2..v4
++// add the wasm store) keep the SDK's guard.
++
++import (
++	"context"
++	"fmt"
++
++	"cosmossdk.io/core/appmodule"
++
++	sdk "github.com/cosmos/cosmos-sdk/types"
++	"github.com/cosmos/cosmos-sdk/x/upgrade"
++	upgradekeeper "github.com/cosmos/cosmos-sdk/x/upgrade/keeper"
++)
++
++var zetaphyEarlyUpgrades = map[string]bool{
++	ZetaphyV5UpgradeName: true,
++
++	// only sets 0x33; every firewall path checks it (zetaphy_firewall.go).
++	// One entry per block (no gofmt alignment): gov.sh greps "<Name>: true,".
++	ZetaphyFirewallUpgradeName: true,
++
++	// only sets 0x40; every chain-guard path checks it (zetaphy_chainguard.go).
++	ZetaphyGuardUpgradeName: true,
++
++	// only sets 0x50; every shield path checks it (zetaphy_shield.go).
++	ZetaphyShieldUpgradeName: true,
++}
++
++// zetaphyUpgradeModule is x/upgrade with one change in PreBlock: a scheduled,
++// not yet due plan named in zetaphyEarlyUpgrades does not stop the chain when
++// this binary already has its handler.
++type zetaphyUpgradeModule struct {
++	upgrade.AppModule
++	k *upgradekeeper.Keeper
++}
++
++func newZetaphyUpgradeModule(m upgrade.AppModule, k *upgradekeeper.Keeper) zetaphyUpgradeModule {
++	return zetaphyUpgradeModule{AppModule: m, k: k}
++}
++
++// PreBlock keeps every other case of x/upgrade's PreBlocker: a due plan is
++// applied (or, without a handler, stops the chain with "UPGRADE NEEDED"), and
++// any other early handler still stops it.
++func (m zetaphyUpgradeModule) PreBlock(ctx context.Context) (appmodule.ResponsePreBlock, error) {
++	sdkCtx := sdk.UnwrapSDKContext(ctx)
++	plan, err := m.k.GetUpgradePlan(ctx)
++	if err != nil || !zetaphyEarlyUpgrades[plan.Name] || plan.ShouldExecute(sdkCtx.HeaderInfo().Height) || !m.k.HasHandler(plan.Name) {
++		return m.AppModule.PreBlock(ctx)
++	}
++	// The check x/upgrade runs once per process: the last applied upgrade must
++	// have its handler in this binary.
++	if !m.k.DowngradeVerified() {
++		m.k.SetDowngradeVerified(true)
++		last, _, err := m.k.GetLastCompletedUpgrade(ctx)
++		if err != nil {
++			return nil, err
++		}
++		if last != "" && !m.k.HasHandler(last) {
++			return nil, fmt.Errorf("upgrade handler is missing for %s upgrade plan", last)
++		}
++	}
++	sdkCtx.Logger().Debug("ZETAPHY: binary with the handler of a scheduled upgrade, before its height (allowed)", "upgrade", plan.Name, "height", plan.Height)
++	return &sdk.ResponsePreBlock{ConsensusParamsChanged: false}, nil
 +}
 diff --git a/go.mod b/go.mod
 index 777e52d..c4797ba 100644
