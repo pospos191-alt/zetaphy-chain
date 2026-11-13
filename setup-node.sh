@@ -150,11 +150,116 @@ if [ "${1:-}" = "--preinstalls" ]; then zetaphy_preinstalls; exit 0; fi
 #   GENESIS_FILE=<final genesis.json> GENESIS_SHA256=<its published sha256> GENESIS_EVM_CHAIN_ID=<n>
 #   ZETAPHYD_BIN=<zetaphyd of the verified release>  [PUBLIC_RPC=1 on the public RPC host, never on the validator]
 #   [PEERS=<node id>@<ip>:26656: the one node to dial, e.g. the validator's sentry]
+#   [MAINNET_FAUCET=1 on the public RPC host only (with PUBLIC_RPC=1): the owner's faucet, below]
 # installs a node of that genesis only (chain id, coin and minimum gas price read from it): no testnet genesis, no
-# faucet, no keys (the validator's key is made beforehand, in a file keyring), no automatic vote-key tx, and no
-# https/RPC proxy unless PUBLIC_RPC=1. The choice is kept in $PINNED, so every later run (zetaphy-validator update,
-# upgrade-watch) stays on that chain and refuses any other genesis. Unset (and no $PINNED): the testnet, unchanged.
+# faucet unless MAINNET_FAUCET=1, no keys (the validator's key is made beforehand, in a file keyring; the only key
+# made here is MAINNET_FAUCET's), no automatic vote-key tx, and no https/RPC proxy unless PUBLIC_RPC=1. The choice is
+# kept in $PINNED, so every later run (zetaphy-validator update, upgrade-watch) stays on that chain and refuses any
+# other genesis. Unset (and no $PINNED): the testnet, unchanged.
 PINNED=/etc/zetaphy/pinned-chain.env
+# ---- mainnet faucet (MAINNET_FAUCET=1, owner decision 2026-11-13) ----------
+# A pinned chain has no faucet unless the owner opts in on the PUBLIC SENTRY: MAINNET_FAUCET=1 with PUBLIC_RPC=1
+# (refused on a node without a public RPC, i.e. the validator, and on any machine that signs as a validator). It
+# makes a fresh key on that machine, $NODE_HOME/config/faucet.key (mode 600, the node user's; never derived from
+# genesis accounts as on the testnet; never replaced once made), and the node's limits, read by zetaphyd on every
+# call (evmd/zetaphy_faucetlimits.go, RPC only): config/faucet-amount (ZTPHY per zetaphy_faucet grant, default 1),
+# config/faucet-pow-amount (per zetaphy_faucetPow proof, default 5), config/faucet-day-budget (ZTPHY per UTC day for
+# both, default 200). FAUCET_AMOUNT= / FAUCET_POW_AMOUNT= / FAUCET_DAY_BUDGET= set them; a later run without them
+# keeps the files as they are. The choice and the key's fingerprint are kept in $PINNED, so later runs keep the
+# faucet. The owner funds the printed address (the pool); the key's balance is all it can lose.
+# docs/ZETAPHY-MAINNET-PROCEDURE.md, "Mainnet faucet on the sentry".
+FAUCET_MAX_AMOUNT=100; FAUCET_MAX_DAY_BUDGET=100000   # as FaucetMaxAmount / FaucetMaxDayBudget in the patch
+VALIDATOR_KEYRING_DIR="/home/$NODE_USER/.zetaphy-keys"   # the validator's file keyring (procedure step 3)
+# validator_signer: prints why this machine signs as a validator (and succeeds), or fails if it does not: its consensus
+# key is a validator's in the genesis (gentx), the running node has voting power, it signs through a remote signer
+# (Horcrux: priv_validator_laddr), or it holds the validator's file keyring (~/.zetaphy-keys, procedure step 3).
+validator_signer() {
+  local pv="$NODE_HOME/config/priv_validator_key.json" k port st
+  k=$(jq -r '.pub_key.value // empty' "$pv" 2>/dev/null || true)
+  if [ -n "$k" ] && jq -e --arg k "$k" '[.app_state.genutil.gen_txs[]?.body.messages[]? | .pubkey.key? // empty] | any(. == $k)' \
+    "$GENESIS_FILE" >/dev/null 2>&1; then echo "its consensus key $pv is a genesis validator's"; return 0; fi
+  port=$(sed -n '/^\[rpc\]/,/^\[/ s/^laddr = "tcp:\/\/[^:]*:\([0-9]*\)"$/\1/p' "$NODE_HOME/config/config.toml" 2>/dev/null | head -1 || true)
+  if st=$(curl -fsS -m 5 "http://127.0.0.1:${port:-26657}/status" 2>/dev/null) \
+    && [ "$(jq -r '.result.validator_info.voting_power // "0"' <<<"$st" 2>/dev/null || echo 0)" != 0 ]; then
+    echo "the node on this machine has voting power"; return 0
+  fi
+  if grep -Eq '^priv_validator_laddr = "[^"]+"' "$NODE_HOME/config/config.toml" 2>/dev/null; then
+    echo "it signs through a remote signer (priv_validator_laddr in config.toml)"; return 0
+  fi
+  if [ -n "$(ls -A "$VALIDATOR_KEYRING_DIR" 2>/dev/null)" ]; then
+    echo "it holds a key ring ($VALIDATOR_KEYRING_DIR)"; return 0
+  fi
+  return 1
+}
+# faucet_ztphy <name> <value> <max>: a decimal number of ZTPHY above 0 and at most max (as the node reads it).
+faucet_ztphy() {
+  [[ "$2" =~ ^[0-9]{1,15}(\.[0-9]{1,18})?$ ]] \
+    && python3 -I -c 'import decimal,sys; v=decimal.Decimal(sys.argv[1]); sys.exit(0 if 0 < v <= decimal.Decimal(sys.argv[2]) else 1)' "$2" "$3" \
+    || { echo "refused: $1=$2: a number of ZTPHY above 0 and at most $3 (e.g. 1 or 0.5)"; exit 1; }
+}
+# mainnet_faucet_check: before anything changes (pinned mode only). Sets MAINNET_FAUCET and the three amounts.
+mainnet_faucet_check() {
+  local fk="$NODE_HOME/config/faucet.key" c="$NODE_HOME/config" why want
+  MAINNET_FAUCET=${MAINNET_FAUCET:-$(pinned MAINNET_FAUCET || true)}; MAINNET_FAUCET=${MAINNET_FAUCET:-0}
+  [[ "$MAINNET_FAUCET" =~ ^[01]$ ]] || { echo "MAINNET_FAUCET: 0 or 1"; exit 1; }
+  if [ "$MAINNET_FAUCET" = 0 ]; then
+    [ -e "$fk" ] || return 0
+    if [ "$(pinned MAINNET_FAUCET || true)" = 1 ]; then
+      echo "refused: MAINNET_FAUCET=0, but this sentry's faucet key $fk is still there: move its funds out, delete it"
+      echo "(and config/faucet-amount, faucet-pow-amount, faucet-day-budget), then run again"; exit 1
+    fi
+    echo "refused: $fk exists (a testnet faucet): use a clean machine"; exit 1
+  fi
+  [ "$PUBLIC_RPC" = 1 ] || { echo "refused: MAINNET_FAUCET=1 needs PUBLIC_RPC=1: the faucet runs only on the public sentry, never on the validator"; exit 1; }
+  if why=$(validator_signer); then echo "refused: MAINNET_FAUCET=1 on a machine that signs as a validator ($why): the faucet key must never be on the validator"; exit 1; fi
+  if [ -e "$fk" ]; then
+    want=$(pinned FAUCET_KEY_SHA256 || true)
+    [ -n "$want" ] && [ "$(sha256sum < "$fk" | cut -d' ' -f1)" = "$want" ] \
+      || { echo "refused: $fk is not the faucet key MAINNET_FAUCET=1 made on this machine ($PINNED): use a clean machine"; exit 1; }
+  fi
+  # the amounts in force after this run: given, else the node's file, else the owner's default
+  FAUCET_AMOUNT=${FAUCET_AMOUNT:-$(cat "$c/faucet-amount" 2>/dev/null || echo 1)}
+  FAUCET_POW_AMOUNT=${FAUCET_POW_AMOUNT:-$(cat "$c/faucet-pow-amount" 2>/dev/null || echo 5)}
+  FAUCET_DAY_BUDGET=${FAUCET_DAY_BUDGET:-$(cat "$c/faucet-day-budget" 2>/dev/null || echo 200)}
+  faucet_ztphy FAUCET_AMOUNT "$FAUCET_AMOUNT" "$FAUCET_MAX_AMOUNT"
+  faucet_ztphy FAUCET_POW_AMOUNT "$FAUCET_POW_AMOUNT" "$FAUCET_MAX_AMOUNT"
+  faucet_ztphy FAUCET_DAY_BUDGET "$FAUCET_DAY_BUDGET" "$FAUCET_MAX_DAY_BUDGET"
+  python3 -I -c 'import decimal as d,sys; sys.exit(0 if d.Decimal(sys.argv[3]) >= max(d.Decimal(sys.argv[1]), d.Decimal(sys.argv[2])) else 1)' \
+    "$FAUCET_AMOUNT" "$FAUCET_POW_AMOUNT" "$FAUCET_DAY_BUDGET" \
+    || { echo "refused: FAUCET_DAY_BUDGET=$FAUCET_DAY_BUDGET is below one grant ($FAUCET_AMOUNT / $FAUCET_POW_AMOUNT)"; exit 1; }
+}
+# mainnet_faucet_setup: after the pinned genesis is in place, before $PINNED is written. Sets FAUCET_KEY_SHA256.
+mainnet_faucet_setup() {
+  local c="$NODE_HOME/config" fk="$NODE_HOME/config/faucet.key" kd a hex why f v
+  FAUCET_KEY_SHA256=""
+  [ "$MAINNET_FAUCET" = 1 ] || return 0
+  # again: z init has just made this machine's consensus key
+  if why=$(validator_signer); then echo "refused: MAINNET_FAUCET=1 on a machine that signs as a validator ($why): the faucet key must never be on the validator"; exit 1; fi
+  if [ ! -e "$fk" ]; then
+    # a throwaway test keyring makes the key (secp256k1, from /dev/urandom) and is deleted; faucet.key is its only copy
+    kd=$(as_node "mktemp -d")
+    if ! { z keys add faucet --keyring-backend test --keyring-dir "$kd" --algo eth_secp256k1 --home "$NODE_HOME" >/dev/null 2>&1 \
+        && z keys unsafe-export-eth-key faucet --keyring-backend test --keyring-dir "$kd" --home "$NODE_HOME" 2>/dev/null \
+          | as_node "umask 077 && cat > '$fk.new'" \
+        && a=$(z keys show faucet -a --keyring-backend test --keyring-dir "$kd" --home "$NODE_HOME") \
+        && hex=$(z debug addr "$a" --home "$NODE_HOME" | awk '/Address hex/ {print $3}') \
+        && [[ "$a" =~ ^zetaphy1[02-9ac-hj-np-z]{38}$ ]] && [[ "$hex" =~ ^0x[0-9a-fA-F]{40}$ ]] \
+        && as_node "grep -Eqx '(0x)?[0-9a-fA-F]{64}' '$fk.new'"; }; then
+      as_node "rm -rf '$kd' '$fk.new'"; echo "refused: the faucet key could not be made; nothing was kept"; exit 1
+    fi
+    as_node "rm -rf '$kd'"
+    printf '%s\n%s\n' "$hex" "$a" | as_node "umask 022 && cat > '$c/faucet.address'"
+    as_node "mv -f '$fk.new' '$fk'"
+    echo "mainnet faucet: a new key made on this machine ($fk)"
+  fi
+  chown "$NODE_USER:$NODE_USER" "$fk" && chmod 600 "$fk"
+  FAUCET_KEY_SHA256=$(sha256sum < "$fk" | cut -d' ' -f1)
+  for f in faucet-amount:$FAUCET_AMOUNT faucet-pow-amount:$FAUCET_POW_AMOUNT faucet-day-budget:$FAUCET_DAY_BUDGET; do
+    v=${f#*:}; f=${f%%:*}
+    [ "$(cat "$c/$f" 2>/dev/null || true)" = "$v" ] || printf '%s\n' "$v" | as_node "umask 022 && cat > '$c/$f.new' && mv -f '$c/$f.new' '$c/$f'"
+  done
+}
+# ---- end of the mainnet faucet ----------------------------------------------
 GENESIS_FILE="${GENESIS_FILE:-}"; GENESIS_SHA256="${GENESIS_SHA256:-}"; GENESIS_EVM_CHAIN_ID="${GENESIS_EVM_CHAIN_ID:-}"
 NET_NAME="testnet"; NET_TITLE="ZETAPHY Testnet"; IS_TESTNET=true; KEPLR_COIN="ZETAPHY"; EVM_SYMBOL="ZTPHY"
 MIN_GAS=1000000000; SERVE_PUBLIC=1
@@ -173,9 +278,10 @@ if [ -n "$GENESIS_FILE$GENESIS_SHA256$GENESIS_EVM_CHAIN_ID" ] || [ -f "$PINNED" 
   [ -f "$GENESIS_FILE" ] && echo "$GENESIS_SHA256  $GENESIS_FILE" | sha256sum -c --quiet - 2>/dev/null \
     || { echo "refused: $GENESIS_FILE is not the genesis with sha256 $GENESIS_SHA256"; exit 1; }
   [ -n "$ZETAPHYD_BIN" ] || [ -x "$BIN" ] || { echo "a pinned chain installs the verified release: ZETAPHYD_BIN=<zetaphyd> (verify-release.sh)"; exit 1; }
-  [ ! -e "$NODE_HOME/config/faucet.key" ] || { echo "refused: $NODE_HOME/config/faucet.key exists (a testnet faucet): use a clean machine"; exit 1; }
   PUBLIC_RPC=${PUBLIC_RPC:-0}; [[ "$PUBLIC_RPC" =~ ^[01]$ ]] || { echo "PUBLIC_RPC: 0 or 1"; exit 1; }
   PEERS="${PEERS:-}"; [ -z "$PEERS" ] || [[ "$PEERS" =~ ^[0-9a-f]{40}@[0-9.]+:[0-9]+$ ]] || { echo "PEERS: <node id>@<ip>:<port>"; exit 1; }
+  # A faucet key on the machine is refused (a testnet faucet), except the one MAINNET_FAUCET=1 made on this sentry.
+  mainnet_faucet_check
   g=$(python3 -I -c 'import decimal,json,sys; g=json.load(open(sys.argv[1])); a=g["app_state"]; d=a["staking"]["params"]["bond_denom"]
 m=[x for x in a["bank"]["denom_metadata"] if x["base"]==d]; print(g["chain_id"], d, m[0]["symbol"] if m else "", int(decimal.Decimal(a["feemarket"]["params"]["min_gas_price"])))' "$GENESIS_FILE") \
     || { echo "refused: $GENESIS_FILE: cannot read chain id, bond denom and fee params"; exit 1; }
@@ -404,8 +510,10 @@ if [ -n "$GENESIS_FILE" ]; then
   z genesis validate-genesis --home "$NODE_HOME"
   z config set client chain-id "$CHAIN_ID" --home "$NODE_HOME"
   [ -z "$PEERS" ] || echo "$PEERS" | as_node "cat > '$NODE_HOME/config/seed-peer'"
+  mainnet_faucet_setup
   install -d -m 755 /etc/zetaphy
-  printf 'GENESIS_SHA256=%s\nGENESIS_EVM_CHAIN_ID=%s\nPUBLIC_RPC=%s\n' "$GENESIS_SHA256" "$EVM_CHAIN_ID" "$PUBLIC_RPC" > "$PINNED.tmp"
+  { printf 'GENESIS_SHA256=%s\nGENESIS_EVM_CHAIN_ID=%s\nPUBLIC_RPC=%s\nMAINNET_FAUCET=%s\n' "$GENESIS_SHA256" "$EVM_CHAIN_ID" "$PUBLIC_RPC" "$MAINNET_FAUCET"
+    [ -z "$FAUCET_KEY_SHA256" ] || printf 'FAUCET_KEY_SHA256=%s\n' "$FAUCET_KEY_SHA256"; } > "$PINNED.tmp"
   chmod 644 "$PINNED.tmp" && mv -f "$PINNED.tmp" "$PINNED"
 fi
 if [ -z "$GENESIS_FILE" ] && [ -f "$NODE_HOME/config/genesis.json" ] && [ ! -d "$NODE_HOME/data/blockstore.db" ] \
@@ -860,6 +968,14 @@ if [ -n "$JOIN" ]; then
     --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"zetaphy_faucet\",\"params\":[\"$me\"]}" || true
 fi
 if [ -n "$GENESIS_FILE" ]; then
+  if [ "$MAINNET_FAUCET" = 1 ]; then
+    { read -r f_hex; read -r f_bech; } < "$NODE_HOME/config/faucet.address" || true
+    keys_line="Faucet (MAINNET_FAUCET=1): ${f_hex:-?}  ${f_bech:-?}
+                       $(cat "$NODE_HOME/config/faucet-amount") ZTPHY a grant, $(cat "$NODE_HOME/config/faucet-pow-amount") a proof, at most $(cat "$NODE_HOME/config/faucet-day-budget") a UTC day
+  Fund the faucet:     send the pool (the owner's decision: 10000 ZTPHY) from the owner's wallet to ${f_hex:-?}; a hot key on a public host: it can lose only that balance"
+  else
+    keys_line="No faucet, no keys made here."
+  fi
   cat <<INFO | tee "/home/$NODE_USER/NODE-INFO.txt"
 
 ZETAPHY node of $CHAIN_ID is starting (genesis sha256 $GENESIS_SHA256, kept in $PINNED).
@@ -867,7 +983,8 @@ ZETAPHY node of $CHAIN_ID is starting (genesis sha256 $GENESIS_SHA256, kept in $
   Minimum gas price:   $MIN_GAS$DENOM
   Public RPC:          $([ "$SERVE_PUBLIC" = 1 ] && echo "https://$pubhost (rpc-guard)" || echo "none on this machine (PUBLIC_RPC=0)")
   P2P:                 $(cat $pub/peer)
-  No faucet, no keys made here. A validator registers its vote key with its own key:
+  $keys_line
+  A validator registers its vote key with its own key:
                        zetaphyd tx pq-vote-key --from <key> --keyring-backend file ... (the procedure, step 9)
   Back up:             $NODE_HOME/config/priv_validator_key.json and pq_vote_key.seed, offline
   Logs:                journalctl -u zetaphyd -f
@@ -4905,12 +5022,159 @@ index 0000000..a786a35
 +		panic(fmt.Sprintf("failed to initialize pinned wasm codes: %s", err))
 +	}
 +}
+diff --git a/evmd/zetaphy_faucetlimits.go b/evmd/zetaphy_faucetlimits.go
+new file mode 100644
+index 0000000..46f3903
+--- /dev/null
++++ b/evmd/zetaphy_faucetlimits.go
+@@ -0,0 +1,141 @@
++package evmd
++
++// Per-node amounts and a daily budget for the faucet (zetaphy_faucet and
++// zetaphy_faucetPow), so a node can run a faucet with other limits than the
++// testnet's: the mainnet sentry's faucet (owner decision 2026-11-13) gives
++// 1 ZTPHY a grant, 5 ZTPHY a proof of work and at most 200 ZTPHY a UTC day.
++//
++// RPC only. Like the rest of the faucet (zetaphy_rpc.go, zetaphy_faucetpow.go)
++// this runs in the node's JSON-RPC server and ends in an ordinary transfer
++// signed with the faucet's own key (<home>/config/faucet.key), sent like any
++// eth_sendRawTransaction. It is not part of the state machine: no module,
++// keeper, ante handler, store, genesis or consensus parameter reads these files
++// or this code, nothing in app.go refers to it, and nodes with different files
++// (or none) agree on every block. Keep it that way: no faucet code in the app's
++// modules.
++//
++// Optional files in <home>/config, read on every call (a change needs no restart):
++//
++//	faucet-amount      ZTPHY per zetaphy_faucet grant        (default FaucetAmount)
++//	faucet-pow-amount  ZTPHY per accepted zetaphy_faucetPow  (default FaucetAmount)
++//	faucet-day-budget  ZTPHY per UTC day, both methods together (default: no budget;
++//	                   the grant count FaucetPerDay applies either way)
++//
++// Each holds one decimal number of ZTPHY (at most 18 decimals), e.g. "1", "0.5"
++// or "200". An amount must be above 0 and at most FaucetMaxAmount, a budget above
++// 0 and at most FaucetMaxDayBudget. A file that is there but not such a number
++// turns the faucet off (both methods) until it is fixed: a typo never falls back
++// to the larger default.
++
++import (
++	"errors"
++	"fmt"
++	"math/big"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strings"
++)
++
++const (
++	faucetAmountFile    = "faucet-amount"
++	faucetPowAmountFile = "faucet-pow-amount"
++	faucetDayBudgetFile = "faucet-day-budget"
++)
++
++var (
++	// FaucetMaxAmount: the most one grant may be (100 ZTPHY).
++	FaucetMaxAmount = ztphy(100)
++	// FaucetMaxDayBudget: the most a daily budget may be (100,000 ZTPHY).
++	FaucetMaxDayBudget = ztphy(100_000)
++
++	ztphyDecimal = regexp.MustCompile(`^[0-9]{1,15}(\.[0-9]{1,18})?$`)
++	oneZTPHY     = big.NewInt(1e18)
++)
++
++func ztphy(n int64) *big.Int { return new(big.Int).Mul(big.NewInt(n), oneZTPHY) }
++
++// parseZTPHY: a decimal number of ZTPHY ("1", "0.25") in azetaphy.
++func parseZTPHY(s string) (*big.Int, error) {
++	if !ztphyDecimal.MatchString(s) {
++		return nil, fmt.Errorf("%q is not a decimal number of ZTPHY", s)
++	}
++	whole, frac, _ := strings.Cut(s, ".")
++	v, ok := new(big.Int).SetString(whole+frac+strings.Repeat("0", 18-len(frac)), 10)
++	if !ok {
++		return nil, fmt.Errorf("%q is not a decimal number of ZTPHY", s)
++	}
++	return v, nil
++}
++
++// formatZTPHY: azetaphy as a decimal number of ZTPHY, for messages.
++func formatZTPHY(v *big.Int) string {
++	q, r := new(big.Int).QuoRem(v, oneZTPHY, new(big.Int))
++	if r.Sign() == 0 {
++		return q.String()
++	}
++	f := r.String()
++	return q.String() + "." + strings.TrimRight(strings.Repeat("0", 18-len(f))+f, "0")
++}
++
++// faucetLimits: the amounts (azetaphy) and the daily budget (nil: none) in force.
++type faucetLimits struct {
++	amount    *big.Int // zetaphy_faucet
++	powAmount *big.Int // zetaphy_faucetPow
++	budget    *big.Int // both, per UTC day; nil: no budget
++}
++
++// grant: the amount of one grant of the given method.
++func (l faucetLimits) grant(pow bool) *big.Int {
++	if pow {
++		return l.powAmount
++	}
++	return l.amount
++}
++
++// faucetLimits reads the operator's files (see the top of this file).
++func (a *ZetaphyAPI) faucetLimits() (faucetLimits, error) {
++	l := faucetLimits{amount: FaucetAmount, powAmount: FaucetAmount}
++	for _, f := range []struct {
++		name string
++		max  *big.Int
++		dst  **big.Int
++	}{
++		{faucetAmountFile, FaucetMaxAmount, &l.amount},
++		{faucetPowAmountFile, FaucetMaxAmount, &l.powAmount},
++		{faucetDayBudgetFile, FaucetMaxDayBudget, &l.budget},
++	} {
++		raw, err := os.ReadFile(filepath.Join(a.clientCtx.HomeDir, "config", f.name)) // #nosec G304 -- one of three fixed names in the node's own config directory
++		if errors.Is(err, os.ErrNotExist) {
++			continue
++		}
++		if err != nil {
++			return l, fmt.Errorf("config/%s is unreadable", f.name)
++		}
++		v, err := parseZTPHY(strings.TrimSpace(string(raw)))
++		if err != nil {
++			return l, fmt.Errorf("config/%s: %w", f.name, err)
++		}
++		if v.Sign() <= 0 || v.Cmp(f.max) > 0 {
++			return l, fmt.Errorf("config/%s: %s ZTPHY is out of range (above 0, at most %s)", f.name, formatZTPHY(v), formatZTPHY(f.max))
++		}
++		*f.dst = v
++	}
++	return l, nil
++}
++
++// faucetBudgetLeft: what today's budget still allows (faucet locked; after
++// faucetDay), or nil without a budget.
++func faucetBudgetLeft(l faucetLimits) *big.Int {
++	if l.budget == nil {
++		return nil
++	}
++	left := new(big.Int).Set(l.budget)
++	if faucet.spent != nil {
++		left.Sub(left, faucet.spent)
++	}
++	if left.Sign() < 0 {
++		left.SetInt64(0)
++	}
++	return left
++}
 diff --git a/evmd/zetaphy_faucetpow.go b/evmd/zetaphy_faucetpow.go
 new file mode 100644
-index 0000000..796f884
+index 0000000..04e78e7
 --- /dev/null
 +++ b/evmd/zetaphy_faucetpow.go
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,205 @@
 +package evmd
 +
 +// ZETAPHY testnet faucet behind a proof of work: zetaphy_faucetPow, for the
@@ -4919,9 +5183,11 @@ index 0000000..796f884
 +// captcha a browser solves so one person cannot drain the faucet with many
 +// addresses or internet addresses: every grant costs minutes of a computer.
 +// The grant itself is zetaphy_faucet's (faucetGrant in zetaphy_rpc.go): the
-+// same key and amount, the same daily cap and per-address cooldown, nothing
-+// for an address that already has funds, and only through this machine's
-+// https address (rpc-guard counts calls per IP).
++// same key, the same daily cap, daily ZTPHY budget and per-address cooldown,
++// nothing for an address that already has funds, and only through this
++// machine's https address (rpc-guard counts calls per IP). The reward is
++// FaucetAmount, or the node's config/faucet-pow-amount (zetaphy_faucetlimits.go:
++// RPC only, no consensus rule).
 +//
 +// A proof for address A at block height h is an 8-byte nonce such that
 +//
@@ -4941,6 +5207,7 @@ index 0000000..796f884
 +	"crypto/sha256"
 +	"encoding/binary"
 +	"fmt"
++	"math/big"
 +	"math/bits"
 +	"os"
 +	"path/filepath"
@@ -4949,6 +5216,7 @@ index 0000000..796f884
 +
 +	"github.com/ethereum/go-ethereum/common"
 +	"github.com/ethereum/go-ethereum/common/hexutil"
++	"github.com/ethereum/go-ethereum/crypto"
 +
 +	rpctypes "github.com/cosmos/evm/rpc/types"
 +)
@@ -5004,41 +5272,62 @@ index 0000000..796f884
 +
 +// FaucetPowInfo: what a miner needs before it starts.
 +type FaucetPowInfo struct {
-+	Enabled         bool         `json:"enabled"` // the faucet has its key on this node
-+	Bits            int          `json:"bits"`
-+	Reward          *hexutil.Big `json:"reward"`
-+	ChainID         uint64       `json:"chainId"`
-+	LatestHeight    uint64       `json:"latestHeight"`
-+	MaxAgeBlocks    uint64       `json:"maxAgeBlocks"`
-+	RemainingToday  int          `json:"remainingToday"` // grants left today (UTC), all addresses together
-+	PerDay          int          `json:"perDay"`
-+	CooldownSeconds int64        `json:"cooldownSeconds"` // per address, shared with zetaphy_faucet
-+	Proof           string       `json:"proof"`
++	Enabled         bool           `json:"enabled"` // the faucet has its key on this node (and valid limits)
++	Bits            int            `json:"bits"`
++	Reward          *hexutil.Big   `json:"reward"`       // per accepted proof (azetaphy): config/faucet-pow-amount or FaucetAmount
++	FaucetReward    *hexutil.Big   `json:"faucetReward"` // per zetaphy_faucet grant: config/faucet-amount or FaucetAmount
++	ChainID         uint64         `json:"chainId"`
++	LatestHeight    uint64         `json:"latestHeight"`
++	MaxAgeBlocks    uint64         `json:"maxAgeBlocks"`
++	RemainingToday  int            `json:"remainingToday"` // proof grants left today (UTC), all addresses together: the grant count and the budget
++	PerDay          int            `json:"perDay"`
++	DayBudget       *hexutil.Big   `json:"dayBudget,omitempty"`       // azetaphy per UTC day, both methods (config/faucet-day-budget); absent: none
++	RemainingBudget *hexutil.Big   `json:"remainingBudget,omitempty"` // what is left of it today
++	Address         common.Address `json:"address"`                   // the faucet's account (zero when off)
++	CooldownSeconds int64          `json:"cooldownSeconds"`           // per address, shared with zetaphy_faucet
++	Proof           string         `json:"proof"`
++	Problem         string         `json:"problem,omitempty"` // why the faucet is off, if its limits files are invalid
 +}
 +
-+// FaucetPowInfo (zetaphy_faucetPowInfo): the difficulty, the reward, how old
-+// a proof's block may be, and today's remaining grants.
++// FaucetPowInfo (zetaphy_faucetPowInfo): the difficulty, the reward in force,
++// how old a proof's block may be, and today's remaining grants and budget.
 +func (a *ZetaphyAPI) FaucetPowInfo(ctx context.Context) (*FaucetPowInfo, error) {
 +	latest, err := a.backend.BlockNumber(ctx)
 +	if err != nil {
 +		return nil, err
 +	}
 +	out := &FaucetPowInfo{
-+		Bits: a.faucetPowBits(), Reward: (*hexutil.Big)(FaucetAmount), ChainID: a.backend.ChainConfig().ChainID.Uint64(),
++		Bits: a.faucetPowBits(), ChainID: a.backend.ChainConfig().ChainID.Uint64(),
 +		LatestHeight: uint64(latest), MaxAgeBlocks: FaucetPowMaxAge, PerDay: FaucetPerDay,
 +		CooldownSeconds: int64(faucetCooldown.Seconds()), Proof: faucetPowProof,
 +	}
 +	faucet.Lock()
 +	defer faucet.Unlock()
-+	_, err = a.faucetKey()
++	key, err := a.faucetKey()
 +	out.Enabled = err == nil
++	if key != nil {
++		out.Address = crypto.PubkeyToAddress(key.PublicKey)
++	}
 +	faucetDay(faucetNow().UTC())
++	lim, err := a.faucetLimits()
++	if err != nil {
++		out.Enabled, out.Problem = false, err.Error()
++		out.Reward, out.FaucetReward = (*hexutil.Big)(new(big.Int)), (*hexutil.Big)(new(big.Int))
++		return out, nil
++	}
++	out.Reward, out.FaucetReward = (*hexutil.Big)(lim.powAmount), (*hexutil.Big)(lim.amount)
 +	out.RemainingToday = max(0, FaucetPerDay-faucet.count)
++	if left := faucetBudgetLeft(lim); left != nil {
++		out.DayBudget, out.RemainingBudget = (*hexutil.Big)(lim.budget), (*hexutil.Big)(left)
++		if n := new(big.Int).Quo(left, lim.powAmount); n.Cmp(big.NewInt(int64(out.RemainingToday))) < 0 {
++			out.RemainingToday = int(n.Int64()) // #nosec G115 -- below RemainingToday, an int
++		}
++	}
 +	return out, nil
 +}
 +
-+// FaucetPow (zetaphy_faucetPow) sends FaucetAmount to address for a proof of
-+// work at a recent block (see the top of this file).
++// FaucetPow (zetaphy_faucetPow) sends FaucetAmount (or config/faucet-pow-amount)
++// to address for a proof of work at a recent block (see the top of this file).
 +func (a *ZetaphyAPI) FaucetPow(ctx context.Context, address string, height hexutil.Uint64, nonce hexutil.Bytes) (*FaucetResult, error) {
 +	addr, err := parseAccount(address)
 +	if err != nil {
@@ -5084,7 +5373,7 @@ index 0000000..796f884
 +	if _, used := faucet.powUsed[use]; used {
 +		return nil, fmt.Errorf("this proof was used already; mine a new one")
 +	}
-+	res, err := a.faucetGrant(ctx, to)
++	res, err := a.faucetGrant(ctx, to, true)
 +	if err != nil {
 +		return nil, err
 +	}
@@ -10808,10 +11097,10 @@ index 0000000..81a5fff
 +}
 diff --git a/evmd/zetaphy_rpc.go b/evmd/zetaphy_rpc.go
 new file mode 100644
-index 0000000..aeeba44
+index 0000000..7431313
 --- /dev/null
 +++ b/evmd/zetaphy_rpc.go
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,556 @@
 +package evmd
 +
 +// ZETAPHY JSON-RPC namespace "zetaphy" on the public EVM endpoint (8545),
@@ -10820,10 +11109,14 @@ index 0000000..aeeba44
 +//
 +//	zetaphy_pqAccount(address)  account number and sequence to sign with
 +//	zetaphy_sendCosmosTx(0x…)   broadcast a signed Cosmos tx (CheckTx only)
-+//	zetaphy_faucet(address)     testnet only: a little ZETAPHY for newcomers
++//	zetaphy_faucet(address)     a little ZETAPHY for newcomers, on a node
++//	                            that holds a faucet key (the testnet's
++//	                            nodes; on the mainnet only the public sentry,
++//	                            by the owner's opt-in, MAINNET_FAUCET=1)
 +//	zetaphy_faucetPow(address, height, nonce), zetaphy_faucetPowInfo():
 +//	                            the same faucet behind a browser proof of
-+//	                            work (zetaphy_faucetpow.go)
++//	                            work (zetaphy_faucetpow.go); amounts and a
++//	                            daily budget per node (zetaphy_faucetlimits.go)
 +//	zetaphy_securityStatus, zetaphy_migration, zetaphy_qdayCommitment,
 +//	zetaphy_consent, zetaphy_ibcHolds: the security core (end of this file)
 +//	zetaphy_modelAt(height)     v5: the Neuro model version in force at a
@@ -10831,7 +11124,9 @@ index 0000000..aeeba44
 +//
 +// The first two hold no keys: like eth_sendRawTransaction, sendCosmosTx only
 +// passes on bytes the user already signed. The faucet signs with its own key
-+// (<home>/config/faucet.key, a capped testnet balance) and is off without it.
++// (<home>/config/faucet.key, a capped balance) and is off without it. The
++// faucet is RPC only: it is not part of the state machine and changes no
++// consensus rule (zetaphy_faucetlimits.go).
 +
 +import (
 +	"context"
@@ -10981,14 +11276,16 @@ index 0000000..aeeba44
 +	return &CosmosTxResult{TxHash: res.TxHash, Code: res.Code, Log: res.RawLog}, nil
 +}
 +
-+// ---- faucet (testnet) ----------------------------------------------------
++// ---- faucet (RPC only, not consensus; see zetaphy_faucetlimits.go) --------
 +
 +const (
 +	FaucetPerDay   = 200 // grants per UTC day, all addresses together
 +	faucetCooldown = 24 * time.Hour
 +)
 +
-+// FaucetAmount is 10 ZETAPHY: gas for many txs and a node runner's bond.
++// FaucetAmount is 10 ZETAPHY: gas for many txs and a node runner's bond. It is
++// the default of both methods; a node's config/faucet-amount and
++// config/faucet-pow-amount replace it (zetaphy_faucetlimits.go).
 +var FaucetAmount = new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18))
 +
 +// One faucet per process (the HTTP and WebSocket servers share it).
@@ -10998,6 +11295,7 @@ index 0000000..aeeba44
 +	nonce uint64 // next nonce; the node's pending count can lag a just-sent tx
 +	day   int64
 +	count int
++	spent *big.Int // azetaphy given out today (UTC), both methods; against config/faucet-day-budget
 +	last  map[common.Address]time.Time
 +	// zetaphy_faucetPow: (address, height) pairs whose proof got a grant, by height
 +	powUsed map[powUse]uint64
@@ -11008,24 +11306,30 @@ index 0000000..aeeba44
 +	Amount *hexutil.Big `json:"amount"`
 +}
 +
++// faucetKey: the key in <home>/config/faucet.key, read on every call (faucet
++// locked), so deleting the file turns the faucet off at once, without a
++// restart (the mainnet sentry's off switch), and a new key starts its own
++// nonce count.
 +func (a *ZetaphyAPI) faucetKey() (*ecdsa.PrivateKey, error) {
-+	if faucet.key != nil {
-+		return faucet.key, nil
-+	}
 +	raw, err := os.ReadFile(filepath.Join(a.clientCtx.HomeDir, "config", "faucet.key"))
 +	if err != nil {
++		faucet.key = nil
 +		return nil, fmt.Errorf("the faucet is off on this node")
 +	}
 +	key, err := crypto.HexToECDSA(strings.TrimPrefix(strings.TrimSpace(string(raw)), "0x"))
 +	if err != nil {
++		faucet.key = nil
 +		return nil, fmt.Errorf("the faucet key is unreadable")
 +	}
-+	faucet.key = key
-+	return key, nil
++	if faucet.key == nil || !faucet.key.Equal(key) {
++		faucet.key, faucet.nonce = key, 0
++	}
++	return faucet.key, nil
 +}
 +
-+// Faucet (zetaphy_faucet) sends FaucetAmount to a new address (zetaphy1… or
-+// 0x…): once per address per day, FaucetPerDay times per day in all, and
++// Faucet (zetaphy_faucet) sends FaucetAmount (or config/faucet-amount) to a
++// new address (zetaphy1… or 0x…): once per address per day, FaucetPerDay
++// times per day in all, within the daily budget if the node has one, and
 +// never to an address that already holds that much.
 +func (a *ZetaphyAPI) Faucet(ctx context.Context, address string) (*FaucetResult, error) {
 +	addr, err := parseAccount(address)
@@ -11038,7 +11342,7 @@ index 0000000..aeeba44
 +	}
 +	faucet.Lock()
 +	defer faucet.Unlock()
-+	return a.faucetGrant(ctx, to)
++	return a.faucetGrant(ctx, to, false)
 +}
 +
 +// faucetNow is the faucet's clock (tests move it).
@@ -11057,31 +11361,43 @@ index 0000000..aeeba44
 +// faucetDay starts a new UTC day's count when the day changed (faucet locked).
 +func faucetDay(now time.Time) {
 +	if d := now.Unix() / 86400; d != faucet.day {
-+		faucet.day, faucet.count = d, 0
++		faucet.day, faucet.count, faucet.spent = d, 0, new(big.Int)
 +	}
 +}
 +
 +// faucetGrant: the limits every faucet method shares (FaucetPerDay grants a
-+// UTC day in all, one grant per address per faucetCooldown, nothing for an
-+// address that already holds FaucetAmount), then the transfer. The caller
-+// holds faucet's lock.
-+func (a *ZetaphyAPI) faucetGrant(ctx context.Context, to common.Address) (*FaucetResult, error) {
++// UTC day in all, the node's daily ZTPHY budget if it has one, one grant per
++// address per faucetCooldown, nothing for an address that already holds the
++// grant's amount), then the transfer of the method's amount (pow: the
++// zetaphy_faucetPow amount). The caller holds faucet's lock.
++func (a *ZetaphyAPI) faucetGrant(ctx context.Context, to common.Address, pow bool) (*FaucetResult, error) {
 +	key, err := a.faucetKey()
 +	if err != nil {
 +		return nil, err
 +	}
++	lim, err := a.faucetLimits()
++	if err != nil {
++		return nil, fmt.Errorf("the faucet is off on this node (%v)", err)
++	}
++	amount := lim.grant(pow)
 +	now := faucetNow().UTC()
 +	faucetDay(now)
 +	if faucet.last == nil || len(faucet.last) > 100000 {
 +		faucet.last = map[common.Address]time.Time{}
 +	}
++	if faucet.spent == nil {
++		faucet.spent = new(big.Int)
++	}
 +	if faucet.count >= FaucetPerDay {
 +		return nil, fmt.Errorf("the faucet has given out today's %d grants; try again tomorrow (UTC)", FaucetPerDay)
++	}
++	if left := faucetBudgetLeft(lim); left != nil && left.Cmp(amount) < 0 {
++		return nil, fmt.Errorf("the faucet has given out today's budget of %s ZTPHY; try again tomorrow (UTC)", formatZTPHY(lim.budget))
 +	}
 +	if t, ok := faucet.last[to]; ok && now.Sub(t) < faucetCooldown {
 +		return nil, fmt.Errorf("this address got ZETAPHY less than a day ago")
 +	}
-+	if bal, err := a.backend.GetBalance(ctx, to, rpctypes.BlockNumberOrHash{BlockNumber: ptr(rpctypes.EthLatestBlockNumber)}); err == nil && bal.ToInt().Cmp(FaucetAmount) >= 0 {
++	if bal, err := a.backend.GetBalance(ctx, to, rpctypes.BlockNumberOrHash{BlockNumber: ptr(rpctypes.EthLatestBlockNumber)}); err == nil && bal.ToInt().Cmp(amount) >= 0 {
 +		return nil, fmt.Errorf("this address already has ZETAPHY")
 +	}
 +	from := crypto.PubkeyToAddress(key.PublicKey)
@@ -11095,7 +11411,7 @@ index 0000000..aeeba44
 +		return nil, err
 +	}
 +	gasPrice := new(big.Int).Mul(price.ToInt(), big.NewInt(2))
-+	tx := ethtypes.NewTransaction(nonce, to, FaucetAmount, 21000, gasPrice, nil)
++	tx := ethtypes.NewTransaction(nonce, to, amount, 21000, gasPrice, nil)
 +	signed, err := ethtypes.SignTx(tx, ethtypes.LatestSignerForChainID(a.backend.ChainConfig().ChainID), key)
 +	if err != nil {
 +		return nil, err
@@ -11111,8 +11427,9 @@ index 0000000..aeeba44
 +	}
 +	faucet.nonce = nonce + 1
 +	faucet.count++
++	faucet.spent.Add(faucet.spent, amount)
 +	faucet.last[to] = now
-+	return &FaucetResult{TxHash: hash.Hex(), Amount: (*hexutil.Big)(FaucetAmount)}, nil
++	return &FaucetResult{TxHash: hash.Hex(), Amount: (*hexutil.Big)(new(big.Int).Set(amount))}, nil
 +}
 +
 +func ptr[T any](v T) *T { return &v }
