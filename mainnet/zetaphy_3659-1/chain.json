@@ -1,0 +1,9 @@
+{
+  "chain_id": "zetaphy_3659-1",
+  "evm_chain_id": 3659,
+  "genesis_sha256": "ca0efb15f6ca80f57e157b32837e012a15f3dc3597531b18747629c8f0a94667",
+  "genesis_time": "2026-11-13T14:00:00Z",
+  "denom": "azetaphy",
+  "symbol": "ZTPHY",
+  "min_gas_price": "1000000000azetaphy"
+}
