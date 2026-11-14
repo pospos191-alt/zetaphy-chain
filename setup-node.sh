@@ -279,6 +279,18 @@ if [ -n "$GENESIS_FILE$GENESIS_SHA256$GENESIS_EVM_CHAIN_ID" ] || [ -f "$PINNED" 
     || { echo "refused: $GENESIS_FILE is not the genesis with sha256 $GENESIS_SHA256"; exit 1; }
   [ -n "$ZETAPHYD_BIN" ] || [ -x "$BIN" ] || { echo "a pinned chain installs the verified release: ZETAPHYD_BIN=<zetaphyd> (verify-release.sh)"; exit 1; }
   PUBLIC_RPC=${PUBLIC_RPC:-0}; [[ "$PUBLIC_RPC" =~ ^[01]$ ]] || { echo "PUBLIC_RPC: 0 or 1"; exit 1; }
+  # VALIDATOR_NODE=1 (join-validator.sh sets it): this machine is, or will be, a validator. Kept in $PINNED for good:
+  # no public RPC, no plain-http RPC and no faucet on it, on this run or any later one.
+  VALIDATOR_NODE=${VALIDATOR_NODE:-$(pinned VALIDATOR_NODE || true)}; VALIDATOR_NODE=${VALIDATOR_NODE:-0}
+  [[ "$VALIDATOR_NODE" =~ ^[01]$ ]] || { echo "VALIDATOR_NODE: 0 or 1"; exit 1; }
+  [ "$VALIDATOR_NODE" = 1 ] || [ "$(pinned VALIDATOR_NODE || true)" != 1 ] \
+    || { echo "refused: VALIDATOR_NODE=0, but this machine was set up as a validator ($PINNED): it stays one"; exit 1; }
+  if [ "$VALIDATOR_NODE" = 1 ] && { [ "$PUBLIC_RPC" = 1 ] || [ "$PUBLIC_HTTP_RPC" = 1 ] || [ "${MAINNET_FAUCET:-0}" = 1 ]; }; then
+    echo "refused: a validator node never serves a public RPC or a faucet (PUBLIC_RPC, PUBLIC_HTTP_RPC, MAINNET_FAUCET must be 0)"; exit 1
+  fi
+  if [ "$PUBLIC_RPC" = 1 ] && why=$(validator_signer); then
+    echo "refused: PUBLIC_RPC=1 on a machine that signs as a validator ($why): the public RPC runs on the sentry only"; exit 1
+  fi
   PEERS="${PEERS:-}"; [ -z "$PEERS" ] || [[ "$PEERS" =~ ^[0-9a-f]{40}@[0-9.]+:[0-9]+$ ]] || { echo "PEERS: <node id>@<ip>:<port>"; exit 1; }
   # A faucet key on the machine is refused (a testnet faucet), except the one MAINNET_FAUCET=1 made on this sentry.
   mainnet_faucet_check
@@ -512,7 +524,7 @@ if [ -n "$GENESIS_FILE" ]; then
   [ -z "$PEERS" ] || echo "$PEERS" | as_node "cat > '$NODE_HOME/config/seed-peer'"
   mainnet_faucet_setup
   install -d -m 755 /etc/zetaphy
-  { printf 'GENESIS_SHA256=%s\nGENESIS_EVM_CHAIN_ID=%s\nPUBLIC_RPC=%s\nMAINNET_FAUCET=%s\n' "$GENESIS_SHA256" "$EVM_CHAIN_ID" "$PUBLIC_RPC" "$MAINNET_FAUCET"
+  { printf 'GENESIS_SHA256=%s\nGENESIS_EVM_CHAIN_ID=%s\nPUBLIC_RPC=%s\nMAINNET_FAUCET=%s\nVALIDATOR_NODE=%s\n' "$GENESIS_SHA256" "$EVM_CHAIN_ID" "$PUBLIC_RPC" "$MAINNET_FAUCET" "$VALIDATOR_NODE"
     [ -z "$FAUCET_KEY_SHA256" ] || printf 'FAUCET_KEY_SHA256=%s\n' "$FAUCET_KEY_SHA256"; } > "$PINNED.tmp"
   chmod 644 "$PINNED.tmp" && mv -f "$PINNED.tmp" "$PINNED"
 fi
@@ -655,6 +667,9 @@ if [ "$LOW_EGRESS" = 1 ]; then
   # Few peers and a 256 KB/s ceiling per peer: other nodes still sync, slowly.
   as_node "sed -i -E 's/^max_num_inbound_peers = .*/max_num_inbound_peers = 4/; s/^max_num_outbound_peers = .*/max_num_outbound_peers = 2/; s/^send_rate = .*/send_rate = 262144/' '$C'"
 fi
+# The CometBFT websocket (public through rpc-guard: wss://<host>/rpc/websocket): at most 20 subscribing
+# connections, 5 subscriptions each (rpc-guard also caps connections per IP and in all).
+as_node "sed -i -E 's/^max_subscription_clients = .*/max_subscription_clients = 20/; s/^max_subscriptions_per_client = .*/max_subscriptions_per_client = 5/' '$C'"
 # A joined node dials the node it joined.
 if [ -f "$NODE_HOME/config/seed-peer" ]; then
   peer=$(tr -cd 'a-f0-9@.:' < "$NODE_HOME/config/seed-peer")
@@ -831,9 +846,13 @@ if [ -z "$NO_SYSTEMD" ] && [ -d /run/systemd/system ] && [[ "$ip" =~ ^[0-9.]+$ ]
   # https://$host/rpc/    CometBFT RPC   } Keplr, Leap, Cosmostation
   # https://$host/rest/   Cosmos REST    }
   # wss://$host/ws        EVM JSON-RPC over WebSocket (eth_subscribe: new blocks, logs)
+  # wss://$host/rpc/websocket  CometBFT websocket (subscribe: Keplr's registry check, explorers)
   # https://$host/zetaphy/  files: genesis, peer, setup script, wallet configs
   # The two RPCs go through rpc-guard (zetaphyd rpc-guard): allowed methods
-  # only (no websocket on /rpc), requests per minute and faucet grants per IP.
+  # only, requests per minute and faucet grants per IP. The CometBFT websocket
+  # has a listener of its own there (127.0.0.1:26668): every frame is checked
+  # against the same methods plus subscribe/unsubscribe/unsubscribe_all,
+  # with connections per IP and in all, frame size and idle time capped.
   cat > /etc/systemd/system/zetaphy-rpc-guard.service <<UNIT
 [Unit]
 Description=ZETAPHY public RPC filter (Caddy -> rpc-guard -> node)
@@ -842,7 +861,7 @@ After=zetaphyd.service
 [Service]
 User=$NODE_USER
 WorkingDirectory=/home/$NODE_USER
-ExecStart=$BIN rpc-guard --comet-listen 127.0.0.1:26667 --evm-listen 127.0.0.1:8547 --comet http://127.0.0.1:26657 --evm http://127.0.0.1:8545
+ExecStart=$BIN rpc-guard --comet-listen 127.0.0.1:26667 --evm-listen 127.0.0.1:8547 --comet-ws-listen 127.0.0.1:26668 --comet http://127.0.0.1:26657 --evm http://127.0.0.1:8545
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -887,6 +906,10 @@ $tls_block
 		}
 		handle_path /rest/* {
 			reverse_proxy 127.0.0.1:1317
+		}
+		handle /rpc/websocket {
+			rewrite * /websocket
+			reverse_proxy 127.0.0.1:26668
 		}
 		handle_path /rpc/* {
 			reverse_proxy 127.0.0.1:26667
@@ -981,7 +1004,7 @@ if [ -n "$GENESIS_FILE" ]; then
 ZETAPHY node of $CHAIN_ID is starting (genesis sha256 $GENESIS_SHA256, kept in $PINNED).
   Chain ID (EVM):      $EVM_CHAIN_ID
   Minimum gas price:   $MIN_GAS$DENOM
-  Public RPC:          $([ "$SERVE_PUBLIC" = 1 ] && echo "https://$pubhost (rpc-guard)" || echo "none on this machine (PUBLIC_RPC=0)")
+  Public RPC:          $([ "$SERVE_PUBLIC" = 1 ] && echo "https://$pubhost (rpc-guard), CometBFT websocket wss://$pubhost/rpc/websocket" || echo "none on this machine (PUBLIC_RPC=0)")
   P2P:                 $(cat $pub/peer)
   $keys_line
   A validator registers its vote key with its own key:
@@ -997,7 +1020,7 @@ ZETAPHY testnet node is starting.
   Chain ID (Cosmos):   $CHAIN_ID
   Chain ID (EVM):      $EVM_CHAIN_ID
   MetaMask RPC URL:    https://$pubhost  (needs ports 80 and 443 open)
-  WebSocket RPC:       wss://$pubhost/ws  (eth_subscribe)
+  WebSocket RPC:       wss://$pubhost/ws  (eth_subscribe); CometBFT: wss://$pubhost/rpc/websocket
   Keplr / Leap:        RPC https://$pubhost/rpc  REST https://$pubhost/rest
                        (chain settings: https://$pubhost/zetaphy/keplr.json)
   Others join with:    JOIN=$host in setup-node.sh, then --become-validator 9
@@ -11659,10 +11682,10 @@ index 0000000..7431313
 +}
 diff --git a/evmd/zetaphy_rpcguard.go b/evmd/zetaphy_rpcguard.go
 new file mode 100644
-index 0000000..2835e0e
+index 0000000..d0d4613
 --- /dev/null
 +++ b/evmd/zetaphy_rpcguard.go
-@@ -0,0 +1,421 @@
+@@ -0,0 +1,441 @@
 +package evmd
 +
 +// ZETAPHY: `zetaphyd rpc-guard`, a small filter between Caddy (the public
@@ -11671,8 +11694,11 @@ index 0000000..2835e0e
 +//
 +//   - CometBFT RPC (Keplr, Leap, the explorer): the methods in cometMethods,
 +//     asked as GET /<method>?… or as JSON-RPC POST (batches too). No
-+//     websocket, no dump_consensus_state, net_info (peer IPs),
-+//     unconfirmed_txs, genesis, unsafe_*.
++//     dump_consensus_state, net_info (peer IPs), unconfirmed_txs, genesis,
++//     unsafe_*. The CometBFT websocket (wss://<host>/rpc/websocket) has a
++//     listener of its own, which checks every frame against the same list
++//     plus subscribe / unsubscribe / unsubscribe_all
++//     (zetaphy_rpcguard_ws.go); the HTTP side refuses websocket upgrades.
 +//   - EVM JSON-RPC: eth_*, net_*, web3_* and zetaphy_*. txpool_*, debug_*,
 +//     admin_*, personal_* and the rest stay on the machine.
 +//   - zetaphy_faucet: at most faucetPerDay calls a UTC day from one IP (an
@@ -11743,6 +11769,11 @@ index 0000000..2835e0e
 +	FaucetPerDay    int    // zetaphy_faucet calls a UTC day from one IP
 +	FaucetPowPerDay int    // zetaphy_faucetPow calls a UTC day from one IP
 +	MaxInFlight     int    // requests being answered at once (each side)
++	// CometBFT websocket (0: the default)
++	WSPerIP      int           // websocket connections at once from one IP (wsDefaultPerIP)
++	WSMaxConns   int           // websocket connections at once in all (wsDefaultMaxConns)
++	WSFrameLimit int64         // bytes in one frame from a caller (wsDefaultFrameLimit)
++	WSIdle       time.Duration // closed after this long with no frame either way (wsDefaultIdle)
 +}
 +
 +// Guard holds the counters shared by the two filters.
@@ -11754,6 +11785,7 @@ index 0000000..2835e0e
 +	faucet    *window
 +	faucetPow *window
 +	now       func() time.Time
++	ws        wsConns
 +}
 +
 +// NewGuard checks the backend addresses.
@@ -11768,6 +11800,9 @@ index 0000000..2835e0e
 +	}
 +	if cfg.PerMinute < 1 || cfg.FaucetPerDay < 0 || cfg.FaucetPowPerDay < 0 || cfg.MaxInFlight < 1 {
 +		return nil, fmt.Errorf("limits must be positive")
++	}
++	if err := wsDefaults(&cfg); err != nil {
++		return nil, err
 +	}
 +	return &Guard{
 +		cfg: cfg, comet: c, evm: e,
@@ -12052,12 +12087,13 @@ index 0000000..2835e0e
 +func RPCGuardCmd() *cobra.Command {
 +	var cfg GuardConfig
 +	var cometListen, evmListen string
++	var wsListen string
 +	cmd := &cobra.Command{
 +		Use:   "rpc-guard",
 +		Short: "Public RPC filter for Caddy: allowed methods only, per-IP limits, faucet limit per IP",
 +		Args:  cobra.NoArgs,
 +		RunE: func(cmd *cobra.Command, _ []string) error {
-+			for _, a := range []string{cometListen, evmListen} {
++			for _, a := range []string{cometListen, evmListen, wsListen} {
 +				if err := loopbackAddr(a); err != nil {
 +					return err
 +				}
@@ -12066,10 +12102,12 @@ index 0000000..2835e0e
 +			if err != nil {
 +				return err
 +			}
-+			errc := make(chan error, 2)
++			errc := make(chan error, 3)
 +			go func() { errc <- guardServer(cometListen, g.CometHandler()).ListenAndServe() }()
 +			go func() { errc <- guardServer(evmListen, g.EVMHandler()).ListenAndServe() }()
-+			cmd.Printf("rpc-guard: CometBFT %s -> %s, EVM %s -> %s\n", cometListen, cfg.Comet, evmListen, cfg.EVM)
++			go func() { errc <- wsServer(wsListen, g.CometWSHandler()).ListenAndServe() }()
++			cmd.Printf("rpc-guard: CometBFT %s -> %s, EVM %s -> %s, CometBFT websocket %s -> %s\n",
++				cometListen, cfg.Comet, evmListen, cfg.EVM, wsListen, g.cometWSURL())
 +			return <-errc
 +		},
 +	}
@@ -12082,7 +12120,331 @@ index 0000000..2835e0e
 +	f.IntVar(&cfg.FaucetPerDay, "faucet-per-day", 3, "zetaphy_faucet calls a UTC day from one IP")
 +	f.IntVar(&cfg.FaucetPowPerDay, "faucet-pow-per-day", 10, "zetaphy_faucetPow calls a UTC day from one IP")
 +	f.IntVar(&cfg.MaxInFlight, "max-in-flight", 64, "requests answered at once, on each side")
++	f.StringVar(&wsListen, "comet-ws-listen", "127.0.0.1:26668", "where Caddy sends /rpc/websocket (CometBFT websocket)")
++	f.IntVar(&cfg.WSPerIP, "ws-per-ip", wsDefaultPerIP, "CometBFT websocket connections at once from one IP")
++	f.IntVar(&cfg.WSMaxConns, "ws-max-conns", wsDefaultMaxConns, "CometBFT websocket connections at once in all")
++	f.Int64Var(&cfg.WSFrameLimit, "ws-frame-limit", wsDefaultFrameLimit, "bytes in one websocket frame from a caller")
++	f.DurationVar(&cfg.WSIdle, "ws-idle", wsDefaultIdle, "close a websocket with no frame either way for this long")
 +	return cmd
++}
+diff --git a/evmd/zetaphy_rpcguard_ws.go b/evmd/zetaphy_rpcguard_ws.go
+new file mode 100644
+index 0000000..3d0514b
+--- /dev/null
++++ b/evmd/zetaphy_rpcguard_ws.go
+@@ -0,0 +1,313 @@
++package evmd
++
++// ZETAPHY: rpc-guard's public CometBFT websocket, wss://<host>/rpc/websocket
++// (Keplr's chain-registry check, wallets and explorers that follow new
++// blocks). Caddy sends /rpc/websocket to its own listener here; for each
++// caller this opens one websocket to the node's /websocket and passes frames
++// both ways. Every frame from the caller is decoded first, with
++// encoding/json as CometBFT decodes it, and must be one JSON-RPC call (no
++// batch) of an allowed method: cometMethods plus subscribe, unsubscribe and
++// unsubscribe_all. Anything else gets a JSON-RPC error and the connection is
++// closed (1008, policy violation) before the frame reaches the node; binary
++// frames are closed with 1003.
++//
++// Limits: WSPerIP connections at once from one IP (an IPv6 /64 counts as
++// one) and WSMaxConns in all, frames of at most WSFrameLimit bytes from the
++// caller (1009), every frame counted against the per-minute request limit
++// of the HTTP side, and a connection with no frame either way for WSIdle is
++// closed (1001). The node's own config.toml limits stay underneath
++// (max_subscription_clients, max_subscriptions_per_client: setup-node.sh).
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/gorilla/websocket"
++)
++
++// CometBFT websocket-only methods open to the public, next to cometMethods.
++var cometWSMethods = map[string]bool{"subscribe": true, "unsubscribe": true, "unsubscribe_all": true}
++
++func cometWSMethodOK(m string) bool { return cometMethods[m] || cometWSMethods[m] }
++
++const (
++	wsDefaultPerIP      = 4
++	wsDefaultMaxConns   = 20 // as max_subscription_clients in the node's config.toml
++	wsDefaultFrameLimit = 64 << 10
++	wsDefaultIdle       = 2 * time.Minute
++	wsWriteWait         = 10 * time.Second
++	wsPath              = "/websocket"
++)
++
++func wsDefaults(cfg *GuardConfig) error {
++	if cfg.WSPerIP < 0 || cfg.WSMaxConns < 0 || cfg.WSFrameLimit < 0 || cfg.WSIdle < 0 {
++		return fmt.Errorf("websocket limits must be positive")
++	}
++	if cfg.WSPerIP == 0 {
++		cfg.WSPerIP = wsDefaultPerIP
++	}
++	if cfg.WSMaxConns == 0 {
++		cfg.WSMaxConns = wsDefaultMaxConns
++	}
++	if cfg.WSFrameLimit == 0 {
++		cfg.WSFrameLimit = wsDefaultFrameLimit
++	}
++	if cfg.WSFrameLimit > guardBodyLimit {
++		return fmt.Errorf("--ws-frame-limit: at most %d bytes", guardBodyLimit)
++	}
++	if cfg.WSIdle == 0 {
++		cfg.WSIdle = wsDefaultIdle
++	}
++	return nil
++}
++
++// wsConns counts the open websocket connections, per IP and in all.
++type wsConns struct {
++	mu    sync.Mutex
++	total int
++	perIP map[string]int
++}
++
++// acquire takes a connection slot for key; ok false says why not (and the
++// HTTP status to answer with).
++func (c *wsConns) acquire(key string, perIP, max int) (release func(), status int, why string) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.perIP == nil {
++		c.perIP = map[string]int{}
++	}
++	if c.perIP[key] >= perIP {
++		return nil, http.StatusTooManyRequests, fmt.Sprintf("at most %d websocket connections at once from one address", perIP)
++	}
++	if c.total >= max {
++		return nil, http.StatusServiceUnavailable, "too many websocket connections; try again shortly"
++	}
++	c.perIP[key]++
++	c.total++
++	var once sync.Once
++	return func() {
++		once.Do(func() {
++			c.mu.Lock()
++			defer c.mu.Unlock()
++			c.total--
++			if c.perIP[key]--; c.perIP[key] <= 0 {
++				delete(c.perIP, key)
++			}
++		})
++	}, 0, ""
++}
++
++// open: websocket connections open now (tests).
++func (c *wsConns) open() int { c.mu.Lock(); defer c.mu.Unlock(); return c.total }
++
++// cometWSURL: the node's websocket, ws://<the --comet host>/websocket.
++func (g *Guard) cometWSURL() string {
++	u := *g.comet
++	if u.Scheme == "https" {
++		u.Scheme = "wss"
++	} else {
++		u.Scheme = "ws"
++	}
++	u.Path, u.RawPath, u.RawQuery, u.Fragment, u.User = wsPath, "", "", "", nil
++	return u.String()
++}
++
++type wsRPCCall struct {
++	Method string          `json:"method"`
++	ID     json.RawMessage `json:"id"`
++}
++
++// wsFrameCall: the method of the one JSON-RPC call in a frame, decoded the
++// way CometBFT's websocket decodes it (encoding/json). A batch, a frame that
++// is not one JSON object, or anything after it is refused.
++func wsFrameCall(frame []byte) (method string, id json.RawMessage, err error) {
++	t := bytes.TrimLeft(frame, " \t\r\n")
++	if len(t) == 0 || t[0] != '{' {
++		return "", nil, fmt.Errorf("one JSON-RPC call per websocket frame (no batch)")
++	}
++	var c wsRPCCall
++	if err := json.Unmarshal(frame, &c); err != nil {
++		return "", nil, fmt.Errorf("invalid JSON-RPC request")
++	}
++	return c.Method, c.ID, nil
++}
++
++// wsError: a JSON-RPC error reply for a refused frame.
++func wsError(id json.RawMessage, msg string) []byte {
++	var v any
++	if len(id) == 0 || json.Unmarshal(id, &v) != nil {
++		v = nil
++	}
++	b, _ := json.Marshal(map[string]any{
++		"jsonrpc": "2.0", "id": v,
++		"error": map[string]any{"code": -32601, "message": msg},
++	})
++	return b
++}
++
++// CometWSHandler serves the CometBFT websocket at /websocket (Caddy rewrites
++// /rpc/websocket to it).
++func (g *Guard) CometWSHandler() http.Handler {
++	target := g.cometWSURL()
++	upgrader := websocket.Upgrader{
++		HandshakeTimeout: wsWriteWait,
++		// a public read API, as CometBFT's own websocket: any web page may use it
++		CheckOrigin: func(*http.Request) bool { return true },
++	}
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != wsPath || r.URL.RawPath != "" {
++			refuse(w, http.StatusForbidden, "only the websocket is served here (wss://<host>/rpc/websocket)")
++			return
++		}
++		if r.Method != http.MethodGet || !websocket.IsWebSocketUpgrade(r) {
++			refuse(w, http.StatusBadRequest, "a websocket connection, please (wss://<host>/rpc/websocket)")
++			return
++		}
++		key := ClientKey(r)
++		if !g.minute.allow(key, g.cfg.PerMinute, g.now()) {
++			w.Header().Set("Retry-After", "60")
++			refuse(w, http.StatusTooManyRequests, "too many requests from this address; try again in a minute")
++			return
++		}
++		release, status, why := g.ws.acquire(key, g.cfg.WSPerIP, g.cfg.WSMaxConns)
++		if release == nil {
++			if status == http.StatusTooManyRequests {
++				w.Header().Set("Retry-After", "60")
++			}
++			refuse(w, status, why)
++			return
++		}
++		defer release()
++		dialer := websocket.Dialer{HandshakeTimeout: wsWriteWait}
++		up, resp, err := dialer.DialContext(r.Context(), target, nil)
++		if resp != nil && resp.Body != nil {
++			_ = resp.Body.Close()
++		}
++		if err != nil {
++			refuse(w, http.StatusBadGateway, "the node is not answering")
++			return
++		}
++		defer func() { _ = up.Close() }()
++		c, err := upgrader.Upgrade(w, r, nil)
++		if err != nil {
++			return // Upgrade has answered the caller
++		}
++		g.wsRelay(key, c, up)
++	})
++}
++
++// wsRelay passes frames between the caller (c) and the node (up) until
++// either side closes, a frame is refused, or the connection is idle.
++func (g *Guard) wsRelay(key string, c, up *websocket.Conn) {
++	_ = c.NetConn().SetDeadline(time.Time{}) // a hijacked connection keeps the server's deadlines
++	c.SetReadLimit(g.cfg.WSFrameLimit)
++	var last atomic.Int64
++	touch := func() { last.Store(time.Now().UnixNano()) }
++	touch()
++	var wmu sync.Mutex // one writer at a time on c
++	send := func(mt int, b []byte) error {
++		wmu.Lock()
++		defer wmu.Unlock()
++		_ = c.SetWriteDeadline(time.Now().Add(wsWriteWait))
++		return c.WriteMessage(mt, b)
++	}
++	bye := func(code int, msg string) {
++		_ = c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, msg), time.Now().Add(time.Second))
++	}
++	done := make(chan struct{})
++	var once sync.Once
++	stop := func() {
++		once.Do(func() {
++			close(done)
++			_ = c.Close()
++			_ = up.Close()
++		})
++	}
++	defer stop()
++
++	// node -> caller: as it comes (replies and subscription events)
++	go func() {
++		defer stop()
++		for {
++			mt, b, err := up.ReadMessage()
++			if err != nil {
++				bye(websocket.CloseGoingAway, "the node closed the connection")
++				return
++			}
++			touch()
++			if err := send(mt, b); err != nil {
++				return
++			}
++		}
++	}()
++	// idle: no frame either way for WSIdle
++	go func() {
++		tick := g.cfg.WSIdle / 4
++		if tick < 10*time.Millisecond {
++			tick = 10 * time.Millisecond
++		}
++		t := time.NewTicker(tick)
++		defer t.Stop()
++		for {
++			select {
++			case <-done:
++				return
++			case <-t.C:
++				if time.Since(time.Unix(0, last.Load())) >= g.cfg.WSIdle {
++					bye(websocket.CloseGoingAway, "idle")
++					stop()
++					return
++				}
++			}
++		}
++	}()
++
++	// caller -> node: one allowed call per frame
++	for {
++		mt, b, err := c.ReadMessage()
++		if err != nil {
++			return // closed, or too large (gorilla has sent 1009)
++		}
++		touch()
++		if mt != websocket.TextMessage {
++			bye(websocket.CloseUnsupportedData, "text frames only")
++			return
++		}
++		if !g.minute.allow(key, g.cfg.PerMinute, g.now()) {
++			_ = send(websocket.TextMessage, wsError(nil, "too many requests from this address; try again in a minute"))
++			bye(websocket.ClosePolicyViolation, "too many requests")
++			return
++		}
++		m, id, err := wsFrameCall(b)
++		if err == nil && !cometWSMethodOK(m) {
++			err = fmt.Errorf("method not available on this public RPC: %s", trimMethod(m))
++		}
++		if err != nil {
++			_ = send(websocket.TextMessage, wsError(id, err.Error()))
++			bye(websocket.ClosePolicyViolation, trimMethod(err.Error()))
++			return
++		}
++		_ = up.SetWriteDeadline(time.Now().Add(wsWriteWait))
++		if err := up.WriteMessage(websocket.TextMessage, b); err != nil {
++			bye(websocket.CloseGoingAway, "the node is not answering")
++			return
++		}
++	}
++}
++
++// wsServer: the websocket listener. No read or write timeout for the whole
++// connection (it stays open; the relay has its own idle timeout and write
++// deadlines), only for the request headers.
++func wsServer(addr string, h http.Handler) *http.Server {
++	return &http.Server{
++		Addr: addr, Handler: h,
++		ReadHeaderTimeout: 10 * time.Second,
++		IdleTimeout:       120 * time.Second,
++		MaxHeaderBytes:    16 << 10,
++	}
 +}
 diff --git a/evmd/zetaphy_seccli.go b/evmd/zetaphy_seccli.go
 new file mode 100644
